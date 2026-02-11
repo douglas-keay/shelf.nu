@@ -9,8 +9,8 @@ swap_size_mb = 512      # Essential for Prisma build memory spikes
 
 [deploy]
   strategy = "rolling"
-  # '&& exit 0' forces the release machine to signal completion to Fly immediately
-  release_command = "npx prisma migrate deploy --schema=app/database/schema.prisma && exit 0"
+  # This runs migrations, then kills all Node processes to force the machine to stop
+  release_command = "npx prisma migrate deploy --schema=app/database/schema.prisma && pkill -9 node || true"
   release_command_timeout = "15m"
 
 [env]
