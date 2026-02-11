@@ -1,47 +1,38 @@
 app = "1stcheltenham-inventory"
 primary_region = "lhr"
-kill_signal = "SIGINT"
-kill_timeout = "5s"
-swap_size_mb = 512
+kill_signal = "SIGTERM" # Changed from SIGINT for cleaner Prisma 7 shutdown
+kill_timeout = "15s"   # More time for the app to finish tasks
+swap_size_mb = 512      # Essential for Prisma build memory spikes
 
 [experimental]
-auto_rollback = true
+  auto_rollback = true
 
 [deploy]
-strategy = "rolling"
-release_command = "npx prisma migrate deploy --schema=app/database/schema.prisma"
-release_command_timeout = "15m"
+  strategy = "rolling"
+  # '&& exit 0' forces the release machine to signal completion to Fly immediately
+  release_command = "npx prisma migrate deploy --schema=app/database/schema.prisma && exit 0"
+  release_command_timeout = "15m"
 
 [env]
-NODE_ENV = "production"
-PORT = "8080"
-
-[[services.ports]]
-handlers = ["http"]
-port = 80
-force_https = true
-
-[[services.ports]]
-handlers = ["tls", "http"]
-port = 443
+  NODE_ENV = "production"
+  PORT = "8080"
 
 [http_service]
-internal_port = 8080
-force_https = true
-auto_stop_machines = "off"
-auto_start_machines = false
-min_machines_running = 1
-processes = ["app"]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off" # Keep at least 1 machine running to avoid cold starts
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
 
-[http_service.concurrency]
-type = "requests"
-soft_limit = 100
-hard_limit = 125
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 100
+    hard_limit = 125
 
-[[http_service.checks]]
-grace_period = "5s"
-interval = "10s"
-method = "GET"
-timeout = "2s"
-path = "/healthcheck"
-protocol = "http"
+  [[http_service.checks]]
+    grace_period = "30s" # Shelf.nu takes time to boot; 5s was too short
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthcheck"
