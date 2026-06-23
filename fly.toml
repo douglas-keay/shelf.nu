@@ -1,0 +1,35 @@
+app = "1stcheltenham-inventory"
+primary_region = "lhr"
+kill_signal = "SIGTERM" # Changed from SIGINT for cleaner Prisma 7 shutdown
+kill_timeout = "15s"   # More time for the app to finish tasks
+swap_size_mb = 512      # Essential for Prisma build memory spikes
+
+[experimental]
+  auto_rollback = true
+
+[deploy]
+  strategy = "rolling"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off" # Keep at least 1 machine running to avoid cold starts
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 100
+    hard_limit = 125
+
+  [[http_service.checks]]
+    grace_period = "30s" # Shelf.nu takes time to boot; 5s was too short
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthcheck"
