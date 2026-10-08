@@ -9,7 +9,11 @@ swap_size_mb = 512      # Essential for Prisma build memory spikes
 
 [deploy]
   strategy = "rolling"
-  release_command = "npx prisma migrate deploy"
+  # Runs the Prisma CLI bundled in the image (a production dependency of
+  # @shelf/webapp), so migrations always use the same Prisma version as the app.
+  # Never `npx prisma`: if the binary is missing, npx downloads the latest
+  # Prisma from npm instead of failing.
+  release_command = "/src/apps/webapp/node_modules/.bin/prisma migrate deploy"
 
 [env]
   NODE_ENV = "production"
