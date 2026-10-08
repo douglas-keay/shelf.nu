@@ -13,10 +13,12 @@ import useFetcherWithReset from "~/hooks/use-fetcher-with-reset";
 import type { DuplicateBarcode } from "~/modules/barcode/service.server";
 import type { QRCodePerImportedAsset } from "~/modules/qr/service.server";
 import type { action } from "~/routes/_layout+/assets.import";
+import { readImportRowErrors } from "~/utils/import-row-errors";
 import { useBarcodePermissions } from "~/utils/permissions/use-barcode-permissions";
 import Input from "../forms/input";
 import Icon from "../icons/icon";
 import { Button } from "../shared/button";
+import { ImportRowErrorsTable } from "../shared/import-row-errors-table";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -111,6 +113,11 @@ export const ImportContent = () => {
               <li>
                 Each row creates a <b>new</b> asset — existing assets will not
                 be merged or overwritten
+              </li>
+              <li>
+                To onboard stock-room consumables (boxes, batteries, fasteners),
+                or to link items to a reusable asset model, see{" "}
+                <b>"Quantity-tracked assets"</b> below
               </li>
             </ul>
           </div>
@@ -232,6 +239,68 @@ export const ImportContent = () => {
           </div>
         </When>
 
+        {/* Quantity-tracked assets + asset model columns */}
+        <div className="flex gap-3">
+          <Icon
+            icon="asset"
+            size="xs"
+            className="mt-0.5 shrink-0 text-gray-500"
+          />
+          <div>
+            <h5 className="font-semibold">Quantity-tracked assets</h5>
+            <p className="text-[14px] text-gray-600">
+              Six optional columns let you onboard stock-room consumables
+              (boxes, batteries, fasteners) and link individually-tracked assets
+              to a reusable asset model:
+            </p>
+            <ul className="list-inside list-disc pl-2 text-[14px] text-gray-600">
+              <li>
+                <b>type</b> — <code>INDIVIDUAL</code> (the default if the column
+                is missing or the cell is blank) or{" "}
+                <code>QUANTITY_TRACKED</code>. On <b>update</b> imports, the
+                cell is silently ignored — type cannot be changed once an asset
+                exists.
+              </li>
+              <li>
+                <b>quantity</b> — required, must be a positive integer when{" "}
+                <code>type = QUANTITY_TRACKED</code>. Ignored on{" "}
+                <code>INDIVIDUAL</code> rows.
+              </li>
+              <li>
+                <b>minQuantity</b> — optional non-negative integer; sets the
+                low-stock alert threshold. Ignored on <code>INDIVIDUAL</code>{" "}
+                rows.
+              </li>
+              <li>
+                <b>unitOfMeasure</b> — optional free-text label (e.g.{" "}
+                <code>boxes</code>, <code>liters</code>, <code>kg</code>).
+                Markdoc injection characters (<code>{"{"}</code>, <code>%</code>
+                , <code>{"}"}</code>) are stripped.
+              </li>
+              <li>
+                <b>consumptionType</b> — required when{" "}
+                <code>type = QUANTITY_TRACKED</code>. <code>ONE_WAY</code>{" "}
+                (consumed on checkout, no return) or <code>TWO_WAY</code>{" "}
+                (returned with a consumption report). Ignored on{" "}
+                <code>INDIVIDUAL</code> rows.
+              </li>
+              <li>
+                <b>assetModel</b> — optional asset model name; created
+                automatically (case-insensitive lookup) if it doesn't exist yet.{" "}
+                <b>INDIVIDUAL rows only</b> — on a <code>QUANTITY_TRACKED</code>{" "}
+                row during update, the cell is skipped with a warning and the
+                rest of the row still applies.
+              </li>
+            </ul>
+            <p className="mt-1 text-[14px] text-gray-600">
+              <b>Tip:</b> the downloaded template above already contains one{" "}
+              <code>INDIVIDUAL</code> example with an <code>assetModel</code>{" "}
+              and one <code>QUANTITY_TRACKED</code> example with{" "}
+              <code>quantity</code> and <code>consumptionType</code> filled in.
+            </p>
+          </div>
+        </div>
+
         {/* Extra considerations */}
         <div className="flex gap-3">
           <Icon
@@ -246,7 +315,9 @@ export const ImportContent = () => {
                 The first row is used as column headers — it won't be imported
               </li>
               <li>
-                If any data in the file is invalid, the whole import will fail
+                Your file is checked before anything is imported. If any row is
+                invalid, nothing is created and you'll get a list of every
+                problem to fix
               </li>
             </ul>
           </div>
@@ -290,6 +361,11 @@ export const FileForm = ({ intent, url }: { intent: string; url?: string }) => {
   const isSubmitting = useDisabled(fetcher);
   const disabled = isSubmitting || agreed !== "I AGREE";
   const isSuccessful = data && !data.error;
+
+  /** Row-level import problems, narrowed out of the error payload. */
+  const { rowErrors, totalRowErrors } = readImportRowErrors(
+    data?.error?.additionalData
+  );
   //
 
   // Focus the "I AGREE" confirmation input when the dialog opens (replaces
@@ -503,6 +579,13 @@ export const FileForm = ({ intent, url }: { intent: string; url?: string }) => {
                     )}
                   </tbody>
                 </table>
+              ) : null}
+
+              {rowErrors ? (
+                <ImportRowErrorsTable
+                  rowErrors={rowErrors}
+                  totalRowErrors={totalRowErrors}
+                />
               ) : null}
 
               <p className="mt-2">

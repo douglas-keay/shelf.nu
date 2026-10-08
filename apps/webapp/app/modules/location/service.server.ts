@@ -1,5 +1,4 @@
 import type {
-  Prisma,
   User,
   Location,
   Organization,
@@ -7,10 +6,21 @@ import type {
   Asset,
   Kit,
 } from "@prisma/client";
-import { BookingStatus } from "@prisma/client";
+import { AssetType, BookingStatus, Prisma } from "@prisma/client";
 import invariant from "tiny-invariant";
 import { db } from "~/database/db.server";
 import { getSupabaseAdmin } from "~/integrations/supabase/client";
+import type { CustodyRehomeResult } from "~/modules/asset/custody-source.server";
+import {
+  createCustodyRehomeNote,
+  custodyFromLocationWhere,
+  getMultiSourcePoolIdsAtLocation,
+  loadCustodySourcesForAssets,
+  rehomeCustodyForPlacementChanges,
+} from "~/modules/asset/custody-source.server";
+import { ASSET_MODEL_IMAGE_SELECT } from "~/modules/asset/image-select";
+import { lockAssetsForQuantityUpdate } from "~/modules/consumption-log/quantity-lock.server";
+import { assetQtyMeta } from "~/utils/asset-quantity";
 import {
   DEFAULT_MAX_IMAGE_UPLOAD_SIZE,
   PUBLIC_BUCKET,
@@ -21,12 +31,17 @@ import {
   isLikeShelfError,
   isNotFoundError,
   maybeUniqueConstraintViolation,
+  throwIfAssetQuantityOverAllocation,
+  throwIfIndividualAssetAlreadyPlaced,
 } from "~/utils/error";
 import { geolocate } from "~/utils/geolocate.server";
 import { getRedirectUrlFromRequest } from "~/utils/http";
 import { getCurrentSearchParams } from "~/utils/http.server";
 import { id } from "~/utils/id/id.server";
+import { assertUploadedImageContentType } from "~/utils/image-upload.server";
 import { ALL_SELECTED_KEY } from "~/utils/list";
+import { Logger } from "~/utils/logger";
+import { stripMarkdocDelimiters } from "~/utils/markdoc-sanitize";
 import {
   wrapDescriptionForNote,
   wrapLinkForNote,
@@ -34,8 +49,10 @@ import {
 } from "~/utils/markdoc-wrappers";
 import {
   getFileUploadPath,
+  MAX_PUBLIC_FILES_PER_REMOVE,
   parseFileFormData,
   removePublicFile,
+  removePublicFiles,
 } from "~/utils/storage.server";
 import {
   formatLocationLink,
@@ -43,8 +60,13 @@ import {
   buildKitListMarkup,
   LOCATION_SORTING_OPTIONS,
 } from "./utils";
+import {
+  getLocationKitsWhereInput,
+  getLocationsWhereInput,
+} from "./utils.server";
 import { recordEvent, recordEvents } from "../activity-event/service.server";
 import type { CreateAssetFromContentImportPayload } from "../asset/types";
+import { getPrimaryLocation } from "../asset/utils";
 import {
   getAssetsWhereInput,
   getLocationUpdateNoteContent,
@@ -186,37 +208,65 @@ export async function getLocation(
       };
     }
 
+    /**
+     * Custody that counts as "at this location": for a pool placed at two
+     * or more locations only custody taken from HERE, for every other asset
+     * all of it (see `custodyFromLocationWhere`). Used by the custody
+     * filters and the custodian column alike.
+     */
+    const custodyFromHere = custodyFromLocationWhere({
+      locationId: id,
+      multiSourcePoolIds: await getMultiSourcePoolIdsAtLocation({
+        locationId: id,
+        organizationIds: [organizationId, ...(otherOrganizationIds ?? [])],
+      }),
+    });
+
     if (teamMemberIds && teamMemberIds.length) {
       assetsWhere.OR = [
         ...(assetsWhere.OR ?? []),
         {
-          custody: { teamMemberId: { in: teamMemberIds } },
-        },
-        {
-          custody: { custodian: { userId: { in: teamMemberIds } } },
-        },
-        {
-          bookings: {
+          custody: {
             some: {
-              custodianTeamMemberId: { in: teamMemberIds },
-              status: {
-                in: [BookingStatus.ONGOING, BookingStatus.OVERDUE],
+              teamMemberId: { in: teamMemberIds },
+              ...custodyFromHere,
+            },
+          },
+        },
+        {
+          custody: {
+            some: {
+              custodian: { userId: { in: teamMemberIds } },
+              ...custodyFromHere,
+            },
+          },
+        },
+        {
+          bookingAssets: {
+            some: {
+              booking: {
+                custodianTeamMemberId: { in: teamMemberIds },
+                status: {
+                  in: [BookingStatus.ONGOING, BookingStatus.OVERDUE],
+                },
               },
             },
           },
         },
         {
-          bookings: {
+          bookingAssets: {
             some: {
-              custodianUserId: { in: teamMemberIds },
-              status: {
-                in: [BookingStatus.ONGOING, BookingStatus.OVERDUE],
+              booking: {
+                custodianUserId: { in: teamMemberIds },
+                status: {
+                  in: [BookingStatus.ONGOING, BookingStatus.OVERDUE],
+                },
               },
             },
           },
         },
         ...(teamMemberIds.includes("without-custody")
-          ? [{ custody: null }]
+          ? [{ custody: { none: custodyFromHere } }]
           : []),
       ];
     }
@@ -230,11 +280,65 @@ export async function getLocation(
       },
     } satisfies Prisma.LocationInclude["parent"];
 
+    /**
+     * Assets at a location are queried via the `AssetLocation` pivot —
+     * there is no `Location.assets` relation. We run a separate
+     * `db.asset.findMany` filtered by
+     * `assetLocations: { some: { locationId: id } }` and synthesize the
+     * `assets` array onto the wrapper return below. Consumers that read
+     * `location.assets` from the old shape must read `assets` from the
+     * wrapper return value (e.g.
+     * `app/routes/_layout+/locations.$locationId.assets.tsx`).
+     */
     const locationInclude: Prisma.LocationInclude = include
       ? { ...include, parent: parentInclude }
-      : {
-          assets: {
+      : { parent: parentInclude };
+
+    // Scope the assets query to the location via the AssetLocation
+    // pivot. Search/teamMember filters are added on top.
+    const assetsWhereForLocation: Prisma.AssetWhereInput = {
+      assetLocations: { some: { locationId: id } },
+      ...assetsWhere,
+    };
+
+    const [location, totalAssetsWithinLocation, assets] = await Promise.all([
+      /** Get the items */
+      db.location.findFirstOrThrow({
+        where: {
+          OR: [
+            { id, organizationId },
+            ...(userOrganizations?.length
+              ? [{ id, organizationId: { in: otherOrganizationIds } }]
+              : []),
+          ],
+        },
+        include: locationInclude,
+      }),
+
+      /** Count them */
+      db.asset.count({
+        where: {
+          assetLocations: { some: { locationId: id } },
+        },
+      }),
+
+      /**
+       * Paginated assets placed at this location. Returned alongside
+       * the location so consumers can keep using the existing
+       * `{ location, assets, totalAssetsWithinLocation }` contract
+       * without depending on a `Location.assets` relation (which no
+       * longer exists — placement lives on the `AssetLocation` pivot).
+       */
+      include
+        ? Promise.resolve([] as Awaited<ReturnType<typeof db.asset.findMany>>)
+        : db.asset.findMany({
+            skip,
+            take,
+            where: assetsWhereForLocation,
+            orderBy: { [orderBy]: orderDirection },
             include: {
+              // Model cover image for assets with no image of their own
+              ...ASSET_MODEL_IMAGE_SELECT,
               category: {
                 select: {
                   id: true,
@@ -248,6 +352,29 @@ export async function getLocation(
                   name: true,
                 },
               },
+              /**
+               * Pull the pivot rows for THIS location only. An asset
+               * can have both a manual row AND one or more kit-driven
+               * rows at the same location (`(assetId, locationId)` is
+               * not unique), so the renderer aggregates `quantity`
+               * across rows and reads `assetKitId` / `assetKit.kit`
+               * to surface the "via kit" badge when any row at this
+               * location is kit-driven.
+               */
+              assetLocations: {
+                where: { locationId: id },
+                select: {
+                  locationId: true,
+                  quantity: true,
+                  assetKitId: true,
+                  assetKit: {
+                    select: {
+                      id: true,
+                      kit: { select: { id: true, name: true } },
+                    },
+                  },
+                },
+              },
               // Asset-code resolution relations — see
               // `app/modules/barcode/display.ts`. Scalar fields
               // (sequentialId, preferredBarcodeId) are automatically included
@@ -255,7 +382,17 @@ export async function getLocation(
               qrCodes: { take: 1, select: { id: true } },
               barcodes: { select: { id: true, type: true, value: true } },
               custody: {
+                // Only custody taken from this location (see
+                // `custodyFromHere`). The list column shows ONE custodian,
+                // chosen as `custody[0]` by `getPrimaryCustody`. Without an
+                // order the database is free to return the rows differently
+                // between requests, so a multi-custodian asset would show a
+                // different holder on refresh. `id` breaks ties on identical
+                // timestamps.
+                where: custodyFromHere,
+                orderBy: [{ createdAt: "asc" }, { id: "asc" }],
                 select: {
+                  quantity: true,
                   custodian: {
                     select: {
                       id: true,
@@ -275,34 +412,7 @@ export async function getLocation(
                 },
               },
             },
-            skip,
-            take,
-            where: assetsWhere,
-            orderBy: { [orderBy]: orderDirection },
-          },
-          parent: parentInclude,
-        };
-
-    const [location, totalAssetsWithinLocation] = await Promise.all([
-      /** Get the items */
-      db.location.findFirstOrThrow({
-        where: {
-          OR: [
-            { id, organizationId },
-            ...(userOrganizations?.length
-              ? [{ id, organizationId: { in: otherOrganizationIds } }]
-              : []),
-          ],
-        },
-        include: locationInclude,
-      }),
-
-      /** Count them */
-      db.asset.count({
-        where: {
-          locationId: id,
-        },
-      }),
+          }),
     ]);
 
     /* User is accessing the location in the wrong organization. In that case we need special 404 handling. */
@@ -333,7 +443,15 @@ export async function getLocation(
       });
     }
 
-    return { location, totalAssetsWithinLocation };
+    /**
+     * Contract: `assets` is a sibling of `location` on the return
+     * value (synthesized from a separate `db.asset.findMany` filtered
+     * by the `AssetLocation` pivot). The `location.assets` relation
+     * does not exist — placement lives on the pivot. Route consumers
+     * (e.g. `app/routes/_layout+/locations.$locationId.assets.tsx`)
+     * must read `assets` from this wrapper, not from `location.assets`.
+     */
+    return { location, totalAssetsWithinLocation, assets };
   } catch (cause) {
     const isShelfError = isLikeShelfError(cause);
 
@@ -502,7 +620,9 @@ export async function getLocationSubtreeDepth(params: {
 }
 
 export const LOCATION_LIST_INCLUDE = {
-  _count: { select: { kits: true, assets: true, children: true } },
+  // Asset count comes from the `AssetLocation` pivot rather than a
+  // direct `Location.assets` relation (which doesn't exist).
+  _count: { select: { kits: true, assetLocations: true, children: true } },
   parent: {
     select: {
       id: true,
@@ -539,17 +659,12 @@ export async function getLocations(params: {
     const skip = page > 1 ? (page - 1) * perPage : 0;
     const take = perPage >= 1 ? perPage : 8; // min 1 and max 25 per page
 
-    /** Default value of where. Takes the items belonging to current org */
-    const where: Prisma.LocationWhereInput = { organizationId };
-
-    /** If the search string exists, match it across the text fields */
-    if (search) {
-      where.OR = [
-        { name: { contains: search, mode: "insensitive" } },
-        { description: { contains: search, mode: "insensitive" } },
-        { address: { contains: search, mode: "insensitive" } },
-      ];
-    }
+    /**
+     * Org scope plus the search predicate, from the builder a bulk "select all"
+     * also uses — so the set this list shows and the set a bulk action resolves
+     * cannot search different fields.
+     */
+    const where = getLocationsWhereInput({ organizationId, search });
 
     /**
      * orderBy is user-supplied via the URL. Guard against arbitrary values
@@ -574,11 +689,13 @@ export async function getLocations(params: {
 
     /**
      * "Number of assets" sorts on a relation count, which requires the
-     * _count shape rather than a scalar field.
+     * _count shape rather than a scalar field. Post-pivot, asset placement
+     * lives on the `AssetLocation` pivot — sort on its row count instead of
+     * the removed implicit `assets` relation.
      */
     const orderByClause: Prisma.LocationOrderByWithRelationInput =
       safeOrderBy === "assets"
-        ? { assets: { _count: safeOrderDirection } }
+        ? { assetLocations: { _count: safeOrderDirection } }
         : { [safeOrderBy]: safeOrderDirection };
 
     const [locations, totalLocations] = await Promise.all([
@@ -611,12 +728,24 @@ export async function getLocationTotalValuation({
 }: {
   locationId: Location["id"];
 }) {
-  const result = await db.asset.aggregate({
-    _sum: { valuation: true },
-    where: { locationId },
-  });
+  // QT-aware: multiplies value × quantity so qty-tracked assets are not silently underreported.
+  // Filter via the `AssetLocation` pivot — there is no `Asset.locationId`.
+  // Prisma's `aggregate({_sum})` cannot express the multiplication, so we drop
+  // to `$queryRaw` and keep the same scope (assets joined to the pivot).
+  // Column is `value` (Asset.valuation is `@map("value")`). COALESCE
+  // mirrors `getAssetTotalValue`. No `::bigint` cast — truncated floats.
+  const rows = await db.$queryRaw<{ total: number | null }[]>(
+    Prisma.sql`
+      SELECT COALESCE(SUM(COALESCE(a.value, 0) * COALESCE(a.quantity, 1)), 0) AS total
+      FROM "Asset" a
+      WHERE a.id IN (
+        SELECT al."assetId" FROM "AssetLocation" al
+        WHERE al."locationId" = ${locationId}
+      )
+    `
+  );
 
-  return result._sum.valuation ?? 0;
+  return Number(rows[0]?.total ?? 0);
 }
 
 /**
@@ -792,20 +921,114 @@ export async function createLocation({
   }
 }
 
+/** A location's id and the public URLs of its stored image files. */
+type LocationImageFiles = Pick<Location, "id" | "imageUrl" | "thumbnailUrl">;
+
+/**
+ * Removes the image and thumbnail files of deleted locations from the public
+ * storage bucket.
+ *
+ * Call this only after the location rows are deleted. Files are removed in one
+ * storage request per chunk of locations, one request after another, so even a select-all delete makes only a handful of
+ * requests. Best effort: a failed request is logged and the next one still
+ * runs, because a stale storage object can be cleaned up later, while failing
+ * would report a delete that already happened as an error. Never rejects.
+ *
+ * @param locations - The deleted locations and their stored image URLs
+ */
+async function safeRemoveImageFilesOfLocations(
+  locations: LocationImageFiles[]
+): Promise<void> {
+  /**
+   * Each location has at most two files, so a chunk of this size stays within
+   * the storage API's per-request limit. Read at call time rather than module
+   * load, so tests that mock the storage module without it can still import
+   * this service.
+   */
+  const LOCATIONS_PER_STORAGE_REMOVE = MAX_PUBLIC_FILES_PER_REMOVE / 2;
+  const locationsWithFiles = locations.filter(
+    (location) => !!location.imageUrl || !!location.thumbnailUrl
+  );
+
+  for (
+    let i = 0;
+    i < locationsWithFiles.length;
+    i += LOCATIONS_PER_STORAGE_REMOVE
+  ) {
+    const chunk = locationsWithFiles.slice(i, i + LOCATIONS_PER_STORAGE_REMOVE);
+    const publicUrls = chunk.flatMap((location) =>
+      [location.imageUrl, location.thumbnailUrl].filter(
+        (url): url is string => !!url
+      )
+    );
+    // The raw URLs stay out of the logs: they contain the storage object
+    // keys. The location ids are enough to trace the files.
+    const locationIds = chunk.map((location) => location.id);
+
+    try {
+      const { invalidUrlCount } = await removePublicFiles({ publicUrls });
+
+      if (invalidUrlCount > 0) {
+        Logger.error(
+          new ShelfError({
+            cause: null,
+            message:
+              "Skipped location image files outside the public bucket during delete",
+            additionalData: { locationIds, invalidUrlCount },
+            label,
+          })
+        );
+      }
+    } catch (cause) {
+      Logger.error(
+        new ShelfError({
+          cause,
+          message:
+            "Failed to remove location images from storage during delete",
+          additionalData: { locationIds },
+          label,
+        })
+      );
+    }
+  }
+}
+
+/**
+ * Deletes a location, its legacy `Image` row, and its stored image files.
+ *
+ * The location and its `Image` row are deleted in one transaction. The image
+ * and thumbnail files are removed after it commits, see
+ * {@link safeRemoveImageFilesOfLocations}.
+ *
+ * @param id - ID of the location to delete
+ * @param organizationId - Organization the location must belong to
+ * @returns The deleted location
+ * @throws {ShelfError} When the database delete fails
+ */
 export async function deleteLocation({
   id,
   organizationId,
 }: Pick<Location, "id" | "organizationId">) {
   try {
-    const location = await db.location.delete({
-      where: { id, organizationId },
+    /**
+     * Both deletes commit together, so the cleanup below always runs once the
+     * location is gone. Its URLs cannot be read back after the row is deleted.
+     */
+    const location = await db.$transaction(async (tx) => {
+      const deleted = await tx.location.delete({
+        where: { id, organizationId },
+      });
+
+      if (deleted.imageId) {
+        await tx.image.delete({
+          where: { id: deleted.imageId },
+        });
+      }
+
+      return deleted;
     });
 
-    if (location.imageId) {
-      await db.image.delete({
-        where: { id: location.imageId },
-      });
-    }
+    await safeRemoveImageFilesOfLocations([location]);
 
     return location;
   } catch (cause) {
@@ -961,7 +1184,11 @@ async function createLocationEditNotes({
     parentId?: string | null;
   };
 }) {
-  const escape = (v: string) => `**${v.replace(/([*_`~])/g, "\\$1")}**`;
+  // Strips Markdoc delimiters BEFORE escaping markdown emphasis: location name
+  // and address are free-form user input rendered through Markdoc, so escaping
+  // `*_~` alone still lets `{% … %}` through as a live tag.
+  const escape = (v: string) =>
+    `**${stripMarkdocDelimiters(v).replace(/([*_`~])/g, "\\$1")}**`;
   const changes: string[] = [];
 
   // Name change
@@ -1020,9 +1247,8 @@ async function createLocationEditNotes({
     select: { firstName: true, lastName: true, displayName: true },
   });
   const userLink = wrapUserLinkForNote({
+    ...(user ?? { displayName: null }),
     id: userId,
-    firstName: user?.firstName,
-    lastName: user?.lastName,
   });
 
   const content = `${userLink} updated the location:\n\n${changes.join("\n")}`;
@@ -1099,6 +1325,20 @@ export async function createLocationsIfNotExists({
   }
 }
 
+/**
+ * Deletes the selected locations of an organization, their legacy `Image`
+ * rows, and their stored image files.
+ *
+ * The locations and `Image` rows are deleted in one transaction. The image and
+ * thumbnail files are removed in the background after it commits, so this
+ * resolves without waiting on storage, see
+ * {@link safeRemoveImageFilesOfLocations}.
+ *
+ * @param locationIds - IDs to delete, or `ALL_SELECTED_KEY` for every location
+ *   in the organization
+ * @param organizationId - Organization the locations must belong to
+ * @throws {ShelfError} When the database delete fails
+ */
 export async function bulkDeleteLocations({
   locationIds,
   organizationId,
@@ -1107,18 +1347,21 @@ export async function bulkDeleteLocations({
   organizationId: Organization["id"];
 }) {
   try {
-    /** We have to delete the images of locations if any */
+    /**
+     * Read before the delete: the `Image` row ids and the storage URLs are
+     * gone once the location rows are deleted.
+     */
     const locations = await db.location.findMany({
       where: locationIds.includes(ALL_SELECTED_KEY)
         ? { organizationId }
         : { id: { in: locationIds }, organizationId },
-      select: { id: true, imageId: true },
+      select: { id: true, imageId: true, imageUrl: true, thumbnailUrl: true },
     });
 
-    return await db.$transaction(async (tx) => {
+    await db.$transaction(async (tx) => {
       /** Deleting all locations */
       await tx.location.deleteMany({
-        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: ids come from `locations` fetched above with `organizationId` in the where clause (lines 1062-1067), so they are already org-proven before this delete
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: ids come from `locations` fetched above with `organizationId` in the where clause, so they are already org-proven before this delete
         where: { id: { in: locations.map((location) => location.id) } },
       });
 
@@ -1137,6 +1380,14 @@ export async function bulkDeleteLocations({
         },
       });
     });
+
+    /**
+     * Not awaited: the transaction has committed, so the response does not wait
+     * on storage. A select-all delete can mean thousands of files. Cleanup is
+     * best effort either way: a run cut short leaves an orphaned file, the same
+     * outcome as a storage failure.
+     */
+    void safeRemoveImageFilesOfLocations(locations);
   } catch (cause) {
     throw new ShelfError({
       cause,
@@ -1251,11 +1502,23 @@ export async function generateLocationWithImages({
   image: File;
 }) {
   try {
+    // Every generated location shares the one uploaded file, so the bytes are
+    // read and validated once rather than per iteration.
+    const blob = Buffer.from(await image.arrayBuffer());
+    // Derived from the bytes, never from the caller's `File.type`: these rows
+    // are served back inline by `api+/image.$imageId`, so the stored content
+    // type decides how a browser renders them.
+    const contentType = assertUploadedImageContentType(blob, {
+      userId,
+      organizationId,
+      field: "image",
+    });
+
     for (let i = 1; i <= numberOfLocations; i++) {
       const imageCreated = await db.image.create({
         data: {
-          blob: Buffer.from(await image.arrayBuffer()),
-          contentType: image.type,
+          blob,
+          contentType,
           ownerOrg: { connect: { id: organizationId } },
           user: { connect: { id: userId } },
         },
@@ -1327,66 +1590,27 @@ export async function getLocationKits(
     const skip = page > 1 ? (page - 1) * perPage : 0;
     const take = perPage >= 1 ? perPage : 8; // min 1 and max 25 per page
 
-    const kitWhere: Prisma.KitWhereInput = {
+    // Shared with `resolveLocationKitIds` so a "select all" removal resolves
+    // exactly the rows this list renders.
+    const kitWhere = getLocationKitsWhereInput({
       organizationId,
       locationId: id,
-    };
-
-    if (teamMemberIds && teamMemberIds.length) {
-      kitWhere.OR = [
-        ...(kitWhere.OR ?? []),
-        {
-          custody: { custodianId: { in: teamMemberIds } },
-        },
-        {
-          custody: { custodian: { userId: { in: teamMemberIds } } },
-        },
-        {
-          assets: {
-            some: {
-              bookings: {
-                some: {
-                  custodianTeamMemberId: { in: teamMemberIds },
-                  status: {
-                    in: [BookingStatus.ONGOING, BookingStatus.OVERDUE],
-                  },
-                },
-              },
-            },
-          },
-        },
-        {
-          assets: {
-            some: {
-              bookings: {
-                some: {
-                  custodianUserId: { in: teamMemberIds },
-                  status: {
-                    in: [BookingStatus.ONGOING, BookingStatus.OVERDUE],
-                  },
-                },
-              },
-            },
-          },
-        },
-        ...(teamMemberIds.includes("without-custody")
-          ? [{ custody: null }]
-          : []),
-      ];
-    }
-
-    if (search) {
-      kitWhere.name = {
-        contains: search,
-        mode: "insensitive",
-      };
-    }
+      search,
+      teamMemberIds,
+    });
 
     const [kits, totalKits] = await Promise.all([
       db.kit.findMany({
         where: kitWhere,
         include: {
           category: true,
+          // Code-resolution relations for AssetCodeBadge / resolveDisplayCode.
+          // Kits are code-bearing entities (Qr.kitId and Barcode.kitId exist),
+          // so a kit-listing surface that omits these can never render the
+          // chip — see `.claude/rules/code-bearing-entity-list-consistency.md`.
+          // Same tight shape as KITS_INCLUDE_FIELDS in `~/modules/kit/types`.
+          qrCodes: { take: 1, select: { id: true } },
+          barcodes: { select: { id: true, type: true, value: true } },
           custody: {
             select: {
               custodian: {
@@ -1438,6 +1662,10 @@ export async function getLocationKits(
  * @param params.newLocation - The asset's location after the change
  * @param params.firstName - Acting user's first name (for the note link)
  * @param params.lastName - Acting user's last name (for the note link)
+ * @param params.displayName - Acting user's display name, or `null` when they
+ *   have none. Required, not optional: when set it REPLACES first + last as the
+ *   name the note shows, and an omitted one is indistinguishable at runtime
+ *   from a user who simply has none.
  * @param params.assetId - The asset the note is written against
  * @param params.userId - The acting user's ID
  * @param params.isRemoving - Whether the location is being removed
@@ -1449,19 +1677,34 @@ export async function createLocationChangeNote({
   newLocation,
   firstName,
   lastName,
+  displayName,
   assetId,
   userId,
   isRemoving,
   organizationId,
+  type,
+  unitOfMeasure,
+  quantity,
 }: {
   currentLocation: Pick<Location, "id" | "name"> | null;
   newLocation: Pick<Location, "id" | "name"> | null;
   firstName: string;
   lastName: string;
+  /** The user's display name, or `null`. Replaces first + last when set. */
+  displayName: string | null;
   assetId: Asset["id"];
   userId: User["id"];
   isRemoving: boolean;
   organizationId: string;
+  /** Asset type — only QUANTITY_TRACKED gets the "N units" phrasing. */
+  type?: AssetType;
+  /** Unit label for the count; defaults to "units". */
+  unitOfMeasure?: string | null;
+  /**
+   * The affected per-row `AssetLocation.quantity` (units placed / moved /
+   * removed at this location) — NOT `Asset.quantity`.
+   */
+  quantity?: number | null;
 }) {
   try {
     const message = getLocationUpdateNoteContent({
@@ -1470,7 +1713,11 @@ export async function createLocationChangeNote({
       userId,
       firstName,
       lastName,
+      displayName,
       isRemoving,
+      type,
+      unitOfMeasure,
+      quantity,
     });
 
     await createNote({
@@ -1500,15 +1747,35 @@ async function createBulkLocationChangeNotes({
   userId,
   location,
   organizationId,
+  assetQuantities = {},
 }: {
+  // Assets have no direct `Asset.location` relation; placement is read
+  // through the `AssetLocation` pivot. We surface the pivot's location
+  // via `assetLocations.select.location` and read the primary placement
+  // with `getPrimaryLocation` in the body below.
+  //
+  // `type` + `unitOfMeasure` drive the QUANTITY_TRACKED unit-count phrasing
+  // in the per-asset note; the full pivot rows (`quantity` + `assetKitId` +
+  // `locationId`) let us read the manual-row qty being removed at THIS
+  // location without a second fetch.
   modifiedAssets: Prisma.AssetGetPayload<{
     select: {
       title: true;
       id: true;
-      location: {
+      type: true;
+      quantity: true;
+      unitOfMeasure: true;
+      assetLocations: {
         select: {
-          name: true;
-          id: true;
+          locationId: true;
+          quantity: true;
+          assetKitId: true;
+          location: {
+            select: {
+              name: true;
+              id: true;
+            };
+          };
         };
       };
       user: {
@@ -1527,6 +1794,14 @@ async function createBulkLocationChangeNotes({
   location: Pick<Location, "id" | "name">;
   /** Caller's validated org — forwarded to each per-asset note for the IDOR guard */
   organizationId: string;
+  /**
+   * Per-asset submitted quantities from the location picker. Used to label
+   * the QUANTITY_TRACKED unit count in the "placed N units" note. Mirrors
+   * the createMany derivation in `updateLocationAssets`
+   * (`assetQuantities[id] ?? Asset.quantity ?? 1`). Defaults to `{}` so
+   * back-compat callers (mobile API) fall back to the asset's full pool.
+   */
+  assetQuantities?: Record<string, number>;
 }) {
   try {
     const user = await db.user
@@ -1557,22 +1832,63 @@ async function createBulkLocationChangeNotes({
       const isRemoving = removedAssetIds.includes(asset.id);
       const isNew = assetIds.includes(asset.id);
       const newLocation = isRemoving ? null : location;
-      const currentLocation = asset.location
-        ? { name: asset.location.name, id: asset.location.id }
-        : null;
+      const isQtyTracked = asset.type === AssetType.QUANTITY_TRACKED;
+      const assetPrimaryLocation = getPrimaryLocation(asset);
+
+      /**
+       * INDIVIDUAL assets have at most one placement, so adding to L
+       * implicitly relocates from their primary — render "moved from
+       * primary to L" (or "set the location to L" if there was no
+       * prior placement). For QUANTITY_TRACKED the picker adds a NEW
+       * AssetLocation row at L while leaving any other manual rows
+       * untouched, so referencing the primary in the note is wrong —
+       * pass `currentLocation = null` and the helper renders "placed
+       * N units at L".
+       *
+       * REMOVE path: the location being removed FROM is `location`
+       * (the picker's context), not the asset's primary — for
+       * INDIVIDUAL those are the same row anyway, but for
+       * QUANTITY_TRACKED the primary may be a different (untouched)
+       * placement. Always use `location` for the remove note.
+       */
+      let currentLocation: { id: string; name: string } | null = null;
+      if (isRemoving) {
+        currentLocation = { id: location.id, name: location.name };
+      } else if (!isQtyTracked && assetPrimaryLocation) {
+        currentLocation = {
+          id: assetPrimaryLocation.id,
+          name: assetPrimaryLocation.name,
+        };
+      }
 
       if (isNew || isRemoving) {
+        // Affected per-row `AssetLocation.quantity` for the note count.
+        // ADD: the qty written to the new pivot row (submitted picker value,
+        // falling back to the asset's full pool) — mirrors the createMany in
+        // `updateLocationAssets`. REMOVE: the MANUAL row qty dropped at THIS
+        // location (kit-driven rows aren't touched by this flow). `null` for
+        // INDIVIDUAL keeps the original phrasing via `formatUnitCount`.
+        const affectedQuantity = isRemoving
+          ? asset.assetLocations.find(
+              (al) => al.locationId === location.id && al.assetKitId == null
+            )?.quantity ?? null
+          : assetQuantities[asset.id] ?? asset.quantity ?? null;
+
         await createLocationChangeNote({
           currentLocation,
           newLocation,
           firstName: user.firstName || "",
           lastName: user.lastName || "",
+          displayName: user.displayName,
           assetId: asset.id,
           userId,
           isRemoving,
           // why: forward the caller's org so each per-asset note is
           // validated against the asset's true org (cross-org IDOR guard)
           organizationId,
+          type: asset.type,
+          unitOfMeasure: asset.unitOfMeasure,
+          quantity: affectedQuantity,
         });
 
         if (isNew && newLocation) {
@@ -1585,19 +1901,21 @@ async function createBulkLocationChangeNotes({
       }
     }
 
-    // Create summary notes on the location's activity log
-    const userLink = wrapUserLinkForNote({
-      id: userId,
-      firstName: user.firstName,
-      lastName: user.lastName,
-    });
+    // Create summary notes on the location's activity log.
+    // why: out of this rule — multi-asset popover, per-asset qty deferred.
+    // The `buildAssetListMarkup` summary renders MANY assets in one
+    // interactive chip; inlining per-asset unit counts here is the same
+    // limitation as the assets_list popover. Per-asset counts land on the
+    // individual asset notes above.
+    const userLink = wrapUserLinkForNote({ ...user, id: userId });
 
     if (addedAssets.length > 0) {
       // Group added assets by their previous location for "Moved from" context
       const byPrevLoc = new Map<string, string>();
       for (const asset of modifiedAssets) {
-        if (assetIds.includes(asset.id) && asset.location) {
-          byPrevLoc.set(asset.location.id, asset.location.name);
+        const prevLoc = getPrimaryLocation(asset);
+        if (assetIds.includes(asset.id) && prevLoc) {
+          byPrevLoc.set(prevLoc.id, prevLoc.name);
         }
       }
       const prevLocLinks = [...byPrevLoc.entries()].map(([id, name]) =>
@@ -1624,13 +1942,14 @@ async function createBulkLocationChangeNotes({
         { name: string; assets: typeof addedAssets }
       >();
       for (const asset of modifiedAssets) {
-        if (!assetIds.includes(asset.id) || !asset.location) continue;
-        const existing = byPrevLocation.get(asset.location.id);
+        const prevLoc = getPrimaryLocation(asset);
+        if (!assetIds.includes(asset.id) || !prevLoc) continue;
+        const existing = byPrevLocation.get(prevLoc.id);
         if (existing) {
           existing.assets.push({ id: asset.id, title: asset.title });
         } else {
-          byPrevLocation.set(asset.location.id, {
-            name: asset.location.name,
+          byPrevLocation.set(prevLoc.id, {
+            name: prevLoc.name,
             assets: [{ id: asset.id, title: asset.title }],
           });
         }
@@ -1668,6 +1987,30 @@ async function createBulkLocationChangeNotes({
   }
 }
 
+/**
+ * Updates the assets placed at a given location, with optional per-asset
+ * quantity for QUANTITY_TRACKED rows.
+ *
+ * Three diff branches are handled in a single transaction:
+ *
+ *  - **Add** (asset id in `assetIds` but not yet in the location's pivot
+ *    rows): `tx.assetLocation.createMany` with `quantity =
+ *    assetQuantities[assetId] ?? Asset.quantity ?? 1`.
+ *  - **Remove** (asset id in `removedAssetIds`): `tx.assetLocation.deleteMany`.
+ *  - **Qty edit** (asset id in `assetIds` AND already at this location AND
+ *    submitted qty differs from the existing pivot row): per-row
+ *    `tx.assetLocation.update` to set the new qty.
+ *
+ * Server-side strict-available re-validation runs BEFORE the transaction
+ * using the **orthogonal MAX formula** (no custody / booking subtraction —
+ * see `getLocationPickerMeta` for the rationale). The DEFERRED constraint
+ * trigger `enforce_asset_location_sum_within_total` is the underlying
+ * safety net at COMMIT; this re-validation just surfaces a clean 400
+ * instead of a trigger-fired 500.
+ *
+ * @see {@link file://./picker-meta.server.ts} — `getLocationPickerMeta` uses the same formula
+ * @see {@link file://./../../routes/_layout+/locations.$locationId.assets.manage-assets.tsx}
+ */
 export async function updateLocationAssets({
   assetIds,
   organizationId,
@@ -1675,6 +2018,7 @@ export async function updateLocationAssets({
   userId,
   request,
   removedAssetIds,
+  assetQuantities = {},
 }: {
   assetIds: Asset["id"][];
   organizationId: Location["organizationId"];
@@ -1682,8 +2026,20 @@ export async function updateLocationAssets({
   userId: User["id"];
   request: Request;
   removedAssetIds: Asset["id"][];
+  /**
+   * JSON map of QUANTITY_TRACKED asset id → submitted quantity from the
+   * location manage-assets picker. INDIVIDUAL rows are absent; missing
+   * entries fall back to `Asset.quantity` (full pool) for back-compat
+   * with paths that don't expose the qty input yet (bulk + scan +
+   * mobile API still call this helper without `assetQuantities`).
+   */
+  assetQuantities?: Record<string, number>;
 }) {
   try {
+    // Load the location alongside the assets currently placed at it via
+    // the `AssetLocation` pivot. We need the assets list for ALL_SELECTED
+    // expansion, to skip no-op connects below, and to detect qty edits
+    // against the existing pivot rows.
     const location = await db.location
       .findUniqueOrThrow({
         where: {
@@ -1691,7 +2047,9 @@ export async function updateLocationAssets({
           organizationId,
         },
         include: {
-          assets: true,
+          assetLocations: {
+            select: { assetId: true, quantity: true },
+          },
         },
       })
       .catch((cause) => {
@@ -1721,6 +2079,9 @@ export async function updateLocationAssets({
       const assetsWhere = getAssetsWhereInput({
         organizationId,
         currentSearchParams: searchParams.toString(),
+        // Location writes are ADMIN/OWNER-only, so the custodian filter
+        // here can never come from a restricted viewer.
+        allowedTeamMemberIds: "all",
       });
 
       const allAssets = await db.asset.findMany({
@@ -1728,7 +2089,8 @@ export async function updateLocationAssets({
         select: { id: true },
       });
 
-      const locationAssets = location.assets.map((asset) => asset.id);
+      // Derive currently-placed asset IDs from the AssetLocation pivot.
+      const locationAssets = location.assetLocations.map((al) => al.assetId);
       /**
        * New assets that needs to be added are
        * - Previously added assets
@@ -1756,32 +2118,81 @@ export async function updateLocationAssets({
 
     /**
      * Filter out assets already at this location - they don't need notes
-     * since no actual change is happening for them.
+     * since no actual change is happening for them. Existing placements
+     * come from the pivot rows we loaded above (`location.assetLocations`).
      */
-    const existingAssetIds = new Set(location.assets.map((a) => a.id));
+    const existingAssetIdQtyMap = new Map(
+      location.assetLocations.map((al) => [al.assetId, al.quantity])
+    );
+    const existingAssetIds = new Set(existingAssetIdQtyMap.keys());
     const actuallyNewAssetIds = assetIds.filter(
       (id) => !existingAssetIds.has(id)
     );
 
     /**
-     * We need to query all the modified assets so we know their location before the change
-     * That way we can later create notes for all the location changes
+     * Qty-edit set: assets already at this location whose submitted
+     * quantity differs from the existing pivot row. The picker pre-fills
+     * the qty input from `AssetLocation.quantity`, so a "no-op confirm"
+     * surfaces here as an empty set — only genuine changes hit the DB.
+     */
+    const alreadyAtLocationIds = assetIds.filter((id) =>
+      existingAssetIds.has(id)
+    );
+    const qtyEditedAssetIds = alreadyAtLocationIds.filter((id) => {
+      const submitted = assetQuantities[id];
+      if (submitted == null) return false;
+      return existingAssetIdQtyMap.get(id) !== submitted;
+    });
+
+    /**
+     * We need to query all the modified assets so we know their
+     * location before the change so we can later create notes for all
+     * the location changes, AND so we can run strict-available
+     * re-validation for any qty-tracked submission.
+     *
+     * Select `type` + `quantity` (needed to compute the pivot row's
+     * `quantity` on create) and the FULL `assetLocations` (locationId +
+     * quantity, plus the nested `location.name/id` for the note text)
+     * so the orthogonal-MAX formula can sum "other locations'" qty
+     * without a second fetch.
      */
     const modifiedAssets = await db.asset
       .findMany({
         where: {
           id: {
-            in: [...actuallyNewAssetIds, ...removedAssetIds],
+            in: [
+              ...actuallyNewAssetIds,
+              ...removedAssetIds,
+              ...qtyEditedAssetIds,
+            ],
           },
           organizationId,
         },
         select: {
           title: true,
           id: true,
-          location: {
+          type: true,
+          quantity: true,
+          // Labels the qty-tracked unit count in the per-asset location note
+          // ("placed 50 boxes at …"). Selected here so the note builder
+          // doesn't need a second fetch.
+          unitOfMeasure: true,
+          assetLocations: {
             select: {
-              name: true,
-              id: true,
+              locationId: true,
+              quantity: true,
+              // Discriminate manual vs kit-driven so the sum-within-total
+              // validator below can treat them correctly. Manual rows
+              // at THIS location are editable; kit-driven rows at THIS
+              // location aren't, but their qty still counts against
+              // the asset's pool.
+              assetKitId: true,
+              location: {
+                select: {
+                  name: true,
+                  id: true,
+                },
+              },
             },
           },
           user: {
@@ -1804,72 +2215,360 @@ export async function updateLocationAssets({
         });
       });
 
-    // Use transaction to ensure all location updates and activity events are atomic
-    await db.$transaction(async (tx) => {
-      if (assetIds.length > 0) {
-        /** We update the location with the new assets */
-        await tx.location.update({
-          where: {
-            id: locationId,
-            organizationId,
-          },
-          data: {
-            assets: {
-              connect: assetIds.map((id) => ({
-                id,
-              })),
-            },
+    /**
+     * Strict-available re-validation for every qty-tracked submission.
+     * Uses the orthogonal MAX formula:
+     *
+     *     spaceWithoutMe = Asset.quantity
+     *                    − sum(rows at OTHER locations)
+     *                    − sum(kit-driven rows at THIS location)
+     *     max            = max(manualAtThisLocation, spaceWithoutMe)
+     *
+     * Kit-driven rows AT this location aren't being edited by the
+     * picker (they're owned by the kit's flow) but their qty still
+     * eats into the asset's total pool. They must be subtracted from
+     * the picker's MAX explicitly — lumping them into "other
+     * locations" overshoots reality and would surface as a generic
+     * 500 from the DEFERRED sum-within-total trigger at COMMIT
+     * instead of a clean 400 here.
+     *
+     * Why "max(manual, spaceWithoutMe)": if the asset is already
+     * over-committed across locations, the picker shouldn't lock the
+     * user out of submitting the existing manual slice — the DEFERRED
+     * trigger is the ultimate guard. See {@link getLocationPickerMeta}
+     * for the same formula.
+     *
+     * The submission set covers both new placements and qty edits;
+     * INDIVIDUAL rows are skipped (their qty is always 1, no input).
+     */
+    const oversubscribed: Array<{
+      assetId: string;
+      title: string;
+      submitted: number;
+      max: number;
+      breakdown: {
+        total: number;
+        otherLocations: number;
+        kitDrivenAtThisLocation: number;
+      };
+    }> = [];
+    const validateIds = new Set([...actuallyNewAssetIds, ...qtyEditedAssetIds]);
+    for (const asset of modifiedAssets) {
+      if (!validateIds.has(asset.id)) continue;
+      if (asset.type !== AssetType.QUANTITY_TRACKED) continue;
+      const submitted = assetQuantities[asset.id];
+      if (submitted == null) continue;
+
+      const totalQty = asset.quantity ?? 0;
+      const otherLocationsQty = asset.assetLocations
+        .filter((al) => al.locationId !== locationId)
+        .reduce((sum, al) => sum + (al.quantity ?? 0), 0);
+      // Kit-driven rows at this location (untouched by the picker but
+      // still claiming part of the asset's pool). `== null` covers
+      // both null and undefined so fixtures without `assetKitId` read
+      // as manual.
+      const kitDrivenAtThisLocation = asset.assetLocations
+        .filter((al) => al.locationId === locationId && al.assetKitId != null)
+        .reduce((sum, al) => sum + (al.quantity ?? 0), 0);
+      // The manual row at this location is what the picker edits.
+      const manualAtThisLocation =
+        asset.assetLocations.find(
+          (al) => al.locationId === locationId && al.assetKitId == null
+        )?.quantity ?? 0;
+      const spaceWithoutMe = Math.max(
+        0,
+        totalQty - otherLocationsQty - kitDrivenAtThisLocation
+      );
+      const max = Math.max(manualAtThisLocation, spaceWithoutMe);
+
+      if (submitted > max) {
+        oversubscribed.push({
+          assetId: asset.id,
+          title: asset.title,
+          submitted,
+          max,
+          breakdown: {
+            total: totalQty,
+            otherLocations: otherLocationsQty,
+            kitDrivenAtThisLocation,
           },
         });
+      }
+    }
+    if (oversubscribed.length > 0) {
+      const detail = oversubscribed
+        .map((o) => {
+          const parts: string[] = [];
+          parts.push(`requested ${o.submitted}, max ${o.max}`);
+          if (o.breakdown.kitDrivenAtThisLocation > 0) {
+            parts.push(
+              `${o.breakdown.kitDrivenAtThisLocation} via kits at this location`
+            );
+          }
+          if (o.breakdown.otherLocations > 0) {
+            parts.push(`${o.breakdown.otherLocations} placed elsewhere`);
+          }
+          parts.push(`total ${o.breakdown.total}`);
+          return `${o.title} (${parts.join("; ")})`;
+        })
+        .join(". ");
+      throw new ShelfError({
+        cause: null,
+        title: "Quantity exceeds available pool",
+        message: `Submitted quantity exceeds the strict-available pool for: ${detail}.`,
+        additionalData: {
+          locationId,
+          userId,
+          organizationId,
+          oversubscribed,
+        },
+        status: 400,
+        label: "Location",
+        shouldBeCaptured: false,
+      });
+    }
+
+    // Use transaction to ensure all location updates and activity events are atomic
+    /**
+     * Cross-location MOVE for INDIVIDUAL assets — collected here so
+     * the activity events below can carry the proper `fromValue`
+     * (old location) instead of `null`. Computed pre-tx from the
+     * `modifiedAssets` fetch which already includes each asset's
+     * current `assetLocations`.
+     *
+     * An INDIVIDUAL asset is capped at one `AssetLocation` row by the
+     * `enforce_individual_asset_single_location` BEFORE trigger. If
+     * the user selects an INDIVIDUAL that's already at another
+     * location, a naked `createMany` would trip the trigger and roll
+     * back the whole tx with a generic check_violation. Instead, we
+     * delete the asset's existing manual row inside the same tx so
+     * the new row at this location passes the trigger. Mirror of the
+     * cross-kit move at `updateKitAssets`.
+     */
+    const movedIndividualPriorLocations = new Map<
+      string,
+      { id: string; name: string }
+    >();
+    for (const asset of modifiedAssets) {
+      if (!actuallyNewAssetIds.includes(asset.id)) continue;
+      if (asset.type !== AssetType.INDIVIDUAL) continue;
+      const priorRow = asset.assetLocations[0];
+      if (!priorRow) continue;
+      movedIndividualPriorLocations.set(asset.id, {
+        id: priorRow.location.id,
+        name: priorRow.location.name,
+      });
+    }
+    const crossLocationMovedIds = Array.from(
+      movedIndividualPriorLocations.keys()
+    );
+
+    /** Custody re-homes per pool, for the notes after the commit. */
+    const rehomes: Array<{
+      assetId: string;
+      result: CustodyRehomeResult;
+    }> = [];
+
+    await db.$transaction(async (tx) => {
+      /**
+       * Lock every quantity-tracked asset this call touches before any
+       * placement write, in one statement and in sorted id order: the same
+       * order the booking check-out and check-in paths lock assets in, so
+       * the two can never deadlock. The lock serializes these placement
+       * writes against custody and stock changes on the same pools, and the
+       * custody sources read right after it are what the re-home below
+       * compares against. Constant work however many pools are selected.
+       */
+      const poolIds = modifiedAssets
+        .filter((asset) => asset.type === AssetType.QUANTITY_TRACKED)
+        .map((asset) => asset.id);
+      const lockedPools = await lockAssetsForQuantityUpdate(
+        tx,
+        poolIds,
+        organizationId
+      );
+      const poolTotals = new Map(
+        lockedPools.map((pool) => [pool.id, pool.quantity ?? 0])
+      );
+      const custodyBefore = await loadCustodySourcesForAssets(
+        tx,
+        lockedPools.map((pool) => ({ id: pool.id, total: pool.quantity ?? 0 }))
+      );
+
+      // Drop the prior manual row for each INDIVIDUAL being moved
+      // across locations, done BEFORE the createMany below so the
+      // INDIVIDUAL single-row trigger sees zero rows for these
+      // assets when the new INSERT runs. Scoped to `assetKitId: null`
+      // because INDIVIDUAL assets can't have kit-driven rows (the
+      // trigger caps them at one row period). Defensive belt-and-
+      // braces.
+      if (crossLocationMovedIds.length > 0) {
+        await tx.assetLocation.deleteMany({
+          where: {
+            assetId: { in: crossLocationMovedIds },
+            assetKitId: null,
+          },
+        });
+      }
+
+      if (assetIds.length > 0) {
+        /**
+         * Connect-by-pivot. Build `AssetLocation` rows for every asset
+         * being attached to this location. Quantity is the asset's
+         * `quantity` for QUANTITY_TRACKED, otherwise 1 (matches the bulk
+         * `updateAssetsWithNewLocation` pattern in
+         * `asset/service.server.ts`).
+         *
+         * INDIVIDUALs that were moved across locations have already
+         * had their prior row dropped above, so the new row at this
+         * location passes the single-row trigger.
+         */
+        if (actuallyNewAssetIds.length > 0) {
+          const newPivotRows = modifiedAssets
+            .filter((a) => actuallyNewAssetIds.includes(a.id))
+            .map((asset) => ({
+              assetId: asset.id,
+              locationId,
+              organizationId,
+              quantity:
+                asset.type === AssetType.QUANTITY_TRACKED
+                  ? assetQuantities[asset.id] ?? asset.quantity ?? 1
+                  : 1,
+            }));
+          if (newPivotRows.length > 0) {
+            await tx.assetLocation.createMany({
+              data: newPivotRows,
+              skipDuplicates: true,
+            });
+          }
+        }
+      }
+
+      /**
+       * Qty edits on already-placed pivot rows. One `update` per
+       * affected (assetId, locationId) — bulk `updateMany` is no good
+       * because each row gets its own qty. Mirrors the kit-side
+       * `updateKitAssets` pattern.
+       */
+      if (qtyEditedAssetIds.length > 0) {
+        for (const assetId of qtyEditedAssetIds) {
+          const submitted = assetQuantities[assetId];
+          if (submitted == null) continue;
+          // Manual-row only. The (assetId, locationId) composite isn't
+          // unique on its own (a manual + kit-driven row can coexist
+          // at the same location), so we use `updateMany` scoped to
+          // `assetKitId IS NULL`. The partial unique
+          // `AssetLocation_manual_unique` ensures at most one matching
+          // row per (assetId, locationId).
+          await tx.assetLocation.updateMany({
+            where: { assetId, locationId, assetKitId: null },
+            data: { quantity: submitted },
+          });
+        }
       }
 
       /** If some assets were removed, we also need to handle those */
       if (removedAssetIds.length > 0) {
-        await tx.location.update({
+        // Disconnect-by-pivot. Drop the MANUAL `AssetLocation` rows
+        // tying these assets to this location (kit-driven rows must
+        // be managed through the kit's flow — they're untouched
+        // here). Org scope is defense-in-depth; the location lookup
+        // above already confirmed org ownership.
+        await tx.assetLocation.deleteMany({
           where: {
+            assetKitId: null,
+            assetId: { in: removedAssetIds },
+            locationId,
             organizationId,
-            id: locationId,
-          },
-          data: {
-            assets: {
-              disconnect: removedAssetIds.map((id) => ({
-                id,
-              })),
-            },
           },
         });
       }
 
-      // Activity events — one ASSET_LOCATION_CHANGED per affected asset, inside tx.
+      // Asset lookup so each event can attach `meta.quantity` (qty-tracked
+      // only) sourced from the per-row `AssetLocation.quantity` it touched.
+      const assetById = new Map(modifiedAssets.map((a) => [a.id, a]));
+
+      // Activity events — one ASSET_LOCATION_CHANGED per affected
+      // asset, inside tx. For cross-location-moved INDIVIDUALs the
+      // `fromValue` is the prior location id (not null) so reports
+      // can render the move correctly.
       const locEvents: Parameters<typeof recordEvents>[0] = [
-        ...actuallyNewAssetIds.map((assetId) => ({
-          organizationId,
-          actorUserId: userId,
-          action: "ASSET_LOCATION_CHANGED" as const,
-          entityType: "ASSET" as const,
-          entityId: assetId,
-          assetId,
-          locationId,
-          field: "locationId",
-          fromValue: null,
-          toValue: locationId,
-        })),
-        ...removedAssetIds.map((assetId) => ({
-          organizationId,
-          actorUserId: userId,
-          action: "ASSET_LOCATION_CHANGED" as const,
-          entityType: "ASSET" as const,
-          entityId: assetId,
-          assetId,
-          field: "locationId",
-          fromValue: locationId,
-          toValue: null,
-        })),
+        ...actuallyNewAssetIds.map((assetId) => {
+          const movedFrom = movedIndividualPriorLocations.get(assetId);
+          const asset = assetById.get(assetId);
+          // Placed qty = the value written to the new pivot row (mirrors the
+          // createMany above). `assetQtyMeta` no-ops for INDIVIDUAL.
+          const placedQty =
+            assetQuantities[assetId] ?? asset?.quantity ?? undefined;
+          return {
+            organizationId,
+            actorUserId: userId,
+            action: "ASSET_LOCATION_CHANGED" as const,
+            entityType: "ASSET" as const,
+            entityId: assetId,
+            assetId,
+            locationId,
+            field: "locationId",
+            fromValue: movedFrom?.id ?? null,
+            toValue: locationId,
+            ...(asset ? { meta: assetQtyMeta(asset, placedQty) } : {}),
+          };
+        }),
+        ...removedAssetIds.map((assetId) => {
+          const asset = assetById.get(assetId);
+          // Removed qty = the MANUAL pivot row dropped at THIS location.
+          const removedQty = asset?.assetLocations.find(
+            (al) => al.locationId === locationId && al.assetKitId == null
+          )?.quantity;
+          return {
+            organizationId,
+            actorUserId: userId,
+            action: "ASSET_LOCATION_CHANGED" as const,
+            entityType: "ASSET" as const,
+            entityId: assetId,
+            assetId,
+            field: "locationId",
+            fromValue: locationId,
+            toValue: null,
+            ...(asset ? { meta: assetQtyMeta(asset, removedQty) } : {}),
+          };
+        }),
       ];
       if (locEvents.length > 0) {
         await recordEvents(locEvents, tx);
       }
+
+      /**
+       * Custody follows the units. A pool removed from this location, or
+       * lowered here below what is in custody from here, has that excess
+       * custody made unplaced. A pool added here or raised here took the
+       * units from its unplaced pile, so unplaced custody beyond what is
+       * left unplaced now belongs here. Never refused.
+       */
+      rehomes.push(
+        ...(await rehomeCustodyForPlacementChanges(tx, {
+          before: custodyBefore,
+          totals: poolTotals,
+          destinationFor: (assetId) =>
+            removedAssetIds.includes(assetId) ? null : locationId,
+        }))
+      );
     });
+
+    for (const { assetId, result } of rehomes) {
+      const asset = modifiedAssets.find((a) => a.id === assetId);
+      if (!asset) continue;
+      await createCustodyRehomeNote({
+        result,
+        asset: {
+          id: asset.id,
+          type: asset.type,
+          unitOfMeasure: asset.unitOfMeasure,
+        },
+        userId,
+        organizationId,
+      });
+    }
 
     /** Creates the relevant notes for all the changed assets (not critical for atomicity) */
     await createBulkLocationChangeNotes({
@@ -1881,8 +2580,26 @@ export async function updateLocationAssets({
       // why: assets were loaded scoped to organizationId — forward it so
       // each per-asset note is validated against the asset's true org
       organizationId,
+      // Per-asset picker qty so the qty-tracked "placed N units" note count
+      // matches the value written to the pivot row.
+      assetQuantities,
     });
   } catch (cause) {
+    // Translate the DB `AssetLocation total ... exceeds Asset.quantity` trigger
+    // violation into a friendly 400 (user tried to place more units across
+    // locations than the asset has). No-ops for every other error. See
+    // SHELF-WEBAPP-21N.
+    throwIfAssetQuantityOverAllocation(cause, {
+      label,
+      additionalData: { assetIds, organizationId, locationId },
+    });
+    // Likewise translate the single-location trigger: an INDIVIDUAL asset added
+    // here while it's still placed at another location. See SHELF-WEBAPP-1P4.
+    throwIfIndividualAssetAlreadyPlaced(cause, {
+      label,
+      additionalData: { assetIds, organizationId, locationId },
+    });
+
     if (isLikeShelfError(cause)) {
       throw cause;
     }
@@ -1918,7 +2635,7 @@ export async function updateLocationKits({
           kits: {
             select: {
               id: true,
-              assets: { select: { id: true } },
+              assetKits: { select: { asset: { select: { id: true } } } },
             },
           },
         },
@@ -1950,13 +2667,16 @@ export async function updateLocationKits({
       const kitWhere = getKitsWhereInput({
         organizationId,
         currentSearchParams: searchParams.toString(),
+        // Location writes are ADMIN/OWNER-only, so the custodian filter
+        // here can never come from a restricted viewer.
+        allowedTeamMemberIds: "all",
       });
 
       const allKits = await db.kit.findMany({
         where: kitWhere,
         select: {
           id: true,
-          assets: { select: { id: true } },
+          assetKits: { select: { asset: { select: { id: true } } } },
         },
       });
 
@@ -1999,11 +2719,14 @@ export async function updateLocationKits({
      * so we don't create duplicate notes for them.
      */
     const existingKitAssetIds = new Set(
-      location.kits.flatMap((kit) => kit.assets.map((a) => a.id))
+      location.kits.flatMap((kit) => kit.assetKits.map((ak) => ak.asset.id))
     );
 
     if (kitIds.length > 0) {
-      // Get all asset IDs from the kits that are being added to this location
+      // Get all asset IDs from the kits that are being added to this
+      // location. Pull `type` + `quantity` on the kit's assets to compute
+      // the new `AssetLocation.quantity`, and read each asset's previous
+      // placement through the `assetLocations` pivot.
       const kitsToAdd = await db.kit.findMany({
         where: { id: { in: kitIds }, organizationId },
         select: {
@@ -2011,47 +2734,104 @@ export async function updateLocationKits({
           name: true,
           locationId: true,
           location: { select: { id: true, name: true } },
-          assets: {
+          assetKits: {
             select: {
-              id: true,
-              title: true,
-              location: { select: { id: true, name: true } },
+              asset: {
+                select: {
+                  id: true,
+                  title: true,
+                  type: true,
+                  quantity: true,
+                  assetLocations: {
+                    select: {
+                      location: { select: { id: true, name: true } },
+                    },
+                  },
+                },
+              },
             },
           },
         },
       });
 
       const assetIds = kitsToAdd.flatMap((kit) =>
-        kit.assets.map((asset) => asset.id)
+        kit.assetKits.map((ak) => ak.asset.id)
       );
 
-      /** We update the location with the new kits and their assets */
-      await db.location
-        .update({
-          where: {
-            id: locationId,
-            organizationId,
-          },
-          data: {
-            kits: {
-              connect: kitIds.map((id) => ({
-                id,
-              })),
+      /**
+       * Kits remain a direct relation on Location, but assets are placed
+       * via the `AssetLocation` pivot. We wrap the `kits.connect`
+       * mutation and the pivot inserts in a single transaction so the
+       * cascade is atomic. `skipDuplicates` matters because an asset
+       * already placed at this location (e.g. added solo before its kit
+       * was reparented) would violate `@@unique([assetId, locationId])`
+       * — the no-op is the desired behaviour.
+       */
+      const flattenedKitAssets = kitsToAdd.flatMap((kit) => kit.assetKits);
+      await db
+        .$transaction(async (tx) => {
+          await tx.location.update({
+            where: {
+              id: locationId,
+              organizationId,
             },
-            assets: {
-              connect: assetIds.map((id) => ({
-                id,
-              })),
+            data: {
+              kits: {
+                connect: kitIds.map((id) => ({ id })),
+              },
             },
-          },
+          });
+
+          if (flattenedKitAssets.length > 0) {
+            // A kit being attached to this location should drive
+            // kit-driven AssetLocation rows (`assetKitId` set) rather
+            // than manual ones, so the "via kit" badge and the
+            // kit-cascade flow downstream still work. Drop any
+            // pre-existing kit-driven rows for these AssetKits (the
+            // kit might be moving in from another location), then
+            // create fresh kit-driven rows here.
+            const newKitIds = kitsToAdd.map((k) => k.id);
+            await tx.assetLocation.deleteMany({
+              where: { assetKit: { kitId: { in: newKitIds } } },
+            });
+            const assetKitsForKits = await tx.assetKit.findMany({
+              where: { kitId: { in: newKitIds } },
+              select: { id: true, assetId: true, quantity: true },
+            });
+            if (assetKitsForKits.length > 0) {
+              await tx.assetLocation.createMany({
+                data: assetKitsForKits.map((ak) => ({
+                  assetId: ak.assetId,
+                  locationId,
+                  organizationId,
+                  quantity: ak.quantity,
+                  assetKitId: ak.id,
+                })),
+              });
+            }
+          }
         })
         .catch((cause) => {
+          // Adding kit-driven `AssetLocation` rows can trip two DB triggers.
+          // Translate both into friendly 400s (no-op for any other error):
+          // - a QUANTITY_TRACKED member exceeding Asset.quantity across
+          //   locations, and
+          // - an INDIVIDUAL member still placed at another location.
+          // See SHELF-WEBAPP-1P4.
+          throwIfAssetQuantityOverAllocation(cause, {
+            label,
+            additionalData: { kitIds, userId, locationId },
+          });
+          throwIfIndividualAssetAlreadyPlaced(cause, {
+            label,
+            additionalData: { kitIds, userId, locationId },
+          });
           throw new ShelfError({
             cause,
             message:
               "Something went wrong while adding the kits to the location. Please try again or contact support.",
             additionalData: { kitIds, userId, locationId },
-            label: "Location",
+            label,
           });
         });
 
@@ -2073,11 +2853,7 @@ export async function updateLocationKits({
         }));
 
       if (kitsSummary.length > 0) {
-        const userLink = wrapUserLinkForNote({
-          id: userId,
-          firstName: user?.firstName,
-          lastName: user?.lastName,
-        });
+        const userLink = wrapUserLinkForNote({ ...user, id: userId });
 
         // Build "Moved from" context for kits coming from other locations
         const actuallyNewKits = kitsToAdd.filter((kit) =>
@@ -2144,15 +2920,16 @@ export async function updateLocationKits({
       // Only include assets not already at this location
       if (assetIds.length > 0) {
         const allAssets = kitsToAdd
-          .flatMap((kit) => kit.assets)
+          .flatMap((kit) => kit.assetKits.map((ak) => ak.asset))
           .filter((asset) => !existingKitAssetIds.has(asset.id));
 
-        // Create individual notes for each asset
+        // Create individual notes for each asset — previous placement
+        // comes from the `AssetLocation` pivot.
         await Promise.all(
           allAssets.map((asset) =>
             createNote({
               content: getKitLocationUpdateNoteContent({
-                currentLocation: asset.location, // Use the asset's current location
+                currentLocation: getPrimaryLocation(asset),
                 newLocation: location,
                 userId,
                 firstName: user?.firstName ?? "",
@@ -2180,32 +2957,45 @@ export async function updateLocationKits({
         select: {
           id: true,
           name: true,
-          assets: { select: { id: true, title: true } },
+          assetKits: {
+            select: { asset: { select: { id: true, title: true } } },
+          },
         },
       });
 
       const removedAssetIds = kitsBeingRemoved.flatMap((kit) =>
-        kit.assets.map((asset) => asset.id)
+        kit.assetKits.map((ak) => ak.asset.id)
       );
 
-      await db.location
-        .update({
-          where: {
-            organizationId,
-            id: locationId,
-          },
-          data: {
-            kits: {
-              disconnect: removedKitIds.map((id) => ({
-                id,
-              })),
+      // Detach kits via the direct relation and drop the corresponding
+      // `AssetLocation` pivot rows for the kit's assets, atomically in
+      // one transaction.
+      await db
+        .$transaction(async (tx) => {
+          await tx.location.update({
+            where: {
+              organizationId,
+              id: locationId,
             },
-            assets: {
-              disconnect: removedAssetIds.map((id) => ({
-                id,
-              })),
+            data: {
+              kits: {
+                disconnect: removedKitIds.map((id) => ({ id })),
+              },
             },
-          },
+          });
+
+          if (removedAssetIds.length > 0) {
+            // Only drop the kit-driven rows for the kits being
+            // detached from this location. Manual rows the user
+            // created at this location for the same assets survive.
+            await tx.assetLocation.deleteMany({
+              where: {
+                assetKit: { kitId: { in: removedKitIds } },
+                locationId,
+                organizationId,
+              },
+            });
+          }
         })
         .catch((cause) => {
           throw new ShelfError({
@@ -2227,7 +3017,9 @@ export async function updateLocationKits({
             displayName: true,
           } satisfies Prisma.UserSelect,
         });
-        const allRemovedAssets = kitsBeingRemoved.flatMap((kit) => kit.assets);
+        const allRemovedAssets = kitsBeingRemoved.flatMap((kit) =>
+          kit.assetKits.map((ak) => ak.asset)
+        );
 
         // Create location activity note for removed kits
         const removedKitsSummary = kitsBeingRemoved.map((kit) => ({
@@ -2236,11 +3028,7 @@ export async function updateLocationKits({
         }));
 
         if (removedKitsSummary.length > 0) {
-          const userLink = wrapUserLinkForNote({
-            id: userId,
-            firstName: user?.firstName,
-            lastName: user?.lastName,
-          });
+          const userLink = wrapUserLinkForNote({ ...user, id: userId });
 
           await createSystemLocationActivityNote({
             locationId,

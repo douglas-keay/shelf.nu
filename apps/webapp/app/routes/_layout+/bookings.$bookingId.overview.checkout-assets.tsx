@@ -1,4 +1,4 @@
-import { OrganizationRoles } from "@prisma/client";
+import { AssetType } from "@prisma/client";
 import { useSetAtom } from "jotai";
 import type {
   MetaFunction,
@@ -6,25 +6,33 @@ import type {
   ActionFunctionArgs,
   LinksFunction,
 } from "react-router";
-import { data, useNavigation } from "react-router";
+import { data, useLoaderData, useNavigation } from "react-router";
 import { z } from "zod";
+import type { BookingExpectedAsset } from "~/atoms/qr-scanner";
 import { addScannedItemAtom } from "~/atoms/qr-scanner";
 import Header from "~/components/layout/header";
 import type { HeaderData } from "~/components/layout/header/types";
 import type { OnCodeDetectionSuccessProps } from "~/components/scanner/code-scanner";
 import { CodeScanner } from "~/components/scanner/code-scanner";
 import PartialCheckoutDrawer from "~/components/scanner/drawer/uses/partial-checkout-drawer";
+import { db } from "~/database/db.server";
+import { useBookingCheckinSessionInitialization } from "~/hooks/use-booking-checkin-session-initialization";
+import { useFillViewportHeight } from "~/hooks/use-fill-viewport-height";
 import { useScannerCameraId } from "~/hooks/use-scanner-camera-id";
-import { useViewportHeight } from "~/hooks/use-viewport-height";
+import { resolveAssetImage } from "~/modules/asset/image-resolution";
+import { getCheckoutSourceQuestions } from "~/modules/booking/checkout-source-location.server";
+import { outranksReservations } from "~/modules/booking/helpers";
 import {
   checkoutAssets,
+  computeBookingAssetRemainingToCheckOut,
+  computeBookingAssetSliceRemainingToCheckOut,
+  findKitsBookedElsewhere,
   getBooking,
   getDetailedPartialCheckoutData,
   getPartiallyCheckedInAssetIds,
 } from "~/modules/booking/service.server";
 import scannerCss from "~/styles/scanner.css?url";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
-import { canUserManageBookingAssets } from "~/utils/bookings";
 
 import { makeShelfError, ShelfError } from "~/utils/error";
 import { isFormProcessing } from "~/utils/form";
@@ -33,46 +41,45 @@ import {
   PermissionAction,
   PermissionEntity,
 } from "~/utils/permissions/permission.data";
+import { canPartialCheckInOut } from "~/utils/permissions/role-access";
+import type { RoleAccess } from "~/utils/permissions/role-access";
 import { requirePermission } from "~/utils/roles.server";
-import { tw } from "~/utils/tw";
 
 export const links: LinksFunction = () => [
   { rel: "stylesheet", href: scannerCss },
 ];
 
 /**
- * Checkout-eligibility guard shared by the loader and the action.
+ * Check-out guard shared by the loader and the action of the partial
+ * check-out page.
  *
- * Self-service users may check out only their OWN (custodian) booking and only
- * in a checkout-eligible status; everyone else is gated by
- * `canUserManageBookingAssets`. This MUST run in the action too, not just the
- * loader: a Remix action can be POSTed directly (bypassing the loader), and
- * `PermissionAction.checkout` alone is granted to SELF_SERVICE — so without it a
- * self-service user could check out assets in another user's booking in the
- * same organization.
+ * `canPartialCheckInOut` answers it: the manage-items rule, or, for roles
+ * whose policy has `bookings.partialScanAsCustodian`, a RESERVED, ONGOING or
+ * OVERDUE booking the caller is the custodian of. Creating the booking is not
+ * enough. It MUST run in the action as well as the loader: an action can be
+ * POSTed directly, and `booking:checkout` alone lets SELF_SERVICE reach any
+ * booking in the workspace.
  *
- * @throws {ShelfError} when the caller may not check out this booking
- * @returns the loaded booking (so the loader can reuse it without re-fetching)
+ * @throws {ShelfError} 403 when the caller may not check out this booking
+ * @returns the loaded booking, so the loader can reuse it
  */
 async function assertUserCanCheckoutBooking({
   bookingId,
   organizationId,
   userId,
-  role,
+  access,
   userOrganizations,
   request,
 }: {
   bookingId: string;
   organizationId: string;
   userId: string;
-  role: OrganizationRoles;
+  access: RoleAccess;
   userOrganizations: Awaited<
     ReturnType<typeof requirePermission>
   >["userOrganizations"];
   request: Request;
 }) {
-  const isSelfService = role === OrganizationRoles.SELF_SERVICE;
-
   const booking = await getBooking({
     id: bookingId,
     organizationId,
@@ -80,19 +87,15 @@ async function assertUserCanCheckoutBooking({
     request,
   });
 
-  // Self-service users are allowed when the booking is reservable/ongoing/overdue
-  // AND they are the custodian. The generic canUserManageBookingAssets blocks
-  // self-service on non-draft bookings, but that restriction is for
-  // adding/removing assets, not for checking out.
-  const isCheckoutEligible =
-    booking.status === "RESERVED" ||
-    booking.status === "ONGOING" ||
-    booking.status === "OVERDUE";
-  const isCustodian = booking.custodianUserId === userId;
-  const canCheckout =
-    isSelfService && isCheckoutEligible && isCustodian
-      ? true
-      : canUserManageBookingAssets(booking, isSelfService);
+  const canCheckout = canPartialCheckInOut({
+    access,
+    booking: {
+      status: booking.status,
+      custodianUserId: booking.custodianUserId,
+    },
+    userId,
+    direction: "checkout",
+  });
 
   if (!canCheckout) {
     throw new ShelfError({
@@ -100,6 +103,7 @@ async function assertUserCanCheckoutBooking({
       message:
         "You cannot check out assets for this booking at the moment. The booking may not be reservable/ongoing or you may not have permission to manage its assets.",
       label: "Booking",
+      status: 403,
       shouldBeCaptured: false,
     });
   }
@@ -116,20 +120,19 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
   });
 
   try {
-    const { organizationId, role, userOrganizations } = await requirePermission(
-      {
+    const { organizationId, access, userOrganizations } =
+      await requirePermission({
         userId,
         request,
         entity: PermissionEntity.booking,
         action: PermissionAction.checkout,
-      }
-    );
+      });
 
     const booking = await assertUserCanCheckoutBooking({
       bookingId,
       organizationId,
       userId,
-      role,
+      access,
       userOrganizations,
       request,
     });
@@ -149,10 +152,240 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
     // /16 instead of /14).
     const checkedInAssetIds = await getPartiallyCheckedInAssetIds(booking.id);
 
+    // Per-asset remaining-to-checkout for QUANTITY_TRACKED assets on this
+    // booking. Folds across all slices (kit + standalone) so the drawer can
+    // gate eligibility on `remaining > 0` instead of "appears in any prior
+    // PartialBookingCheckout record". Empty map when there are no qty-tracked
+    // assets — INDIVIDUAL flow is unchanged (those still reject on second scan
+    // via `checkedOutAssetIds`).
+    const qtyAssetIds = booking.bookingAssets
+      .filter((ba) => ba.asset?.type === AssetType.QUANTITY_TRACKED)
+      .map((ba) => ba.assetId);
+    const uniqueQtyAssetIds = [...new Set(qtyAssetIds)];
+    const remainingToCheckOutByAsset: Record<string, number> = {};
+    for (const assetId of uniqueQtyAssetIds) {
+      remainingToCheckOutByAsset[assetId] =
+        await computeBookingAssetRemainingToCheckOut(db, booking.id, assetId);
+    }
+
+    /**
+     * Per-slice (bookingAssetId) remaining-to-checkout for QUANTITY_TRACKED
+     * assets — mirror of the check-in loader's `qtyRemainingByBookingAssetId`
+     * but for the checkout direction. Polish-6 multi-row slices each get
+     * their own attribution: a kit-driven slice and a standalone slice of
+     * the same asset get independent `remaining` counts so the drawer's
+     * pending-list can show them as separate rows.
+     *
+     * Helper is called once per QT slice — we `Promise.all` to avoid
+     * serialising N round-trips. `computeBookingAssetSliceRemainingToCheckOut`
+     * already pools claims across sibling slices and attributes
+     * kit-driven-first, so per-slice and per-asset agree on the pool size.
+     *
+     * Calling `computeBookingAssetSliceRemainingToCheckOut` (and NOT
+     * `computeBookingAssetSliceRemaining`, which is the check-IN equivalent)
+     * is load-bearing — using the wrong helper silently shows check-IN
+     * remaining counts on the checkout drawer.
+     */
+    const qtySlices = booking.bookingAssets.filter(
+      (ba) => ba.asset?.type === AssetType.QUANTITY_TRACKED
+    );
+    const sliceRemainingPairs = await Promise.all(
+      qtySlices.map(async (ba) => {
+        const remaining = await computeBookingAssetSliceRemainingToCheckOut(
+          db,
+          booking.id,
+          ba.id
+        );
+        return [ba.id, remaining] as const;
+      })
+    );
+    const qtyRemainingByBookingAssetId: Record<
+      string,
+      {
+        booked: number;
+        logged: number;
+        remaining: number;
+        consumptionType: "ONE_WAY" | "TWO_WAY" | null;
+      }
+    > = {};
+    for (const ba of qtySlices) {
+      const pair = sliceRemainingPairs.find(([id]) => id === ba.id);
+      const remaining = pair ? pair[1] : 0;
+      const booked = ba.quantity ?? 0;
+      // `logged` in checkout semantics: units already CLAIMED for checkout
+      // by prior PartialBookingCheckout rows (units physically taken out of
+      // the warehouse already). On check-in this would be "units already
+      // returned"; on check-out it's "units already removed".
+      const logged = Math.max(0, booked - remaining);
+      qtyRemainingByBookingAssetId[ba.id] = {
+        booked,
+        logged,
+        remaining,
+        consumptionType:
+          (ba.asset.consumptionType as "ONE_WAY" | "TWO_WAY" | null) ?? null,
+      };
+    }
+
+    /**
+     * Drawer "expected assets" list — one entry per BookingAsset row.
+     * Same shape as the check-in loader builds (so the shared
+     * `bookingExpectedAssetsAtom` + drawer rendering primitives work for
+     * both directions). Polish-6 multi-row slices get separate entries so
+     * the operator can see e.g. "kit-driven slice fully checked out" next
+     * to "standalone slice still pending" instead of an aggregated
+     * half-truth.
+     *
+     * `alreadyCheckedIn` on INDIVIDUAL entries reuses the existing field
+     * name on the discriminated union; in checkout context it means
+     * "already reconciled in this direction" — i.e. already checked OUT,
+     * not already checked IN. Renaming to direction-neutral would touch
+     * ~20 sites and is deferred to a separate cleanup commit.
+     */
+    const expectedAssets: BookingExpectedAsset[] = booking.bookingAssets.map(
+      (ba) => {
+        const asset = ba.asset;
+        // Resolve kit attribution for THIS slice via `assetKitId` — a
+        // standalone slice (`assetKitId === null`) renders as a loose row
+        // even when the underlying asset belongs to other kits.
+        //
+        // why: out of this rule — deliberately no `sourceKitId` fallback here.
+        // The booking overview renders detached residue under its original
+        // kit because it describes what the booking WAS; this drawer drives a
+        // live physical operation, where CURRENT membership is the more
+        // useful grouping for the person holding the items.
+        const sourceKit = ba.assetKitId
+          ? asset.assetKits.find((ak) => ak.id === ba.assetKitId)?.kit ?? null
+          : null;
+        const base = {
+          id: asset.id,
+          bookingAssetId: ba.id,
+          title: asset.title,
+          // Collapse the model-image cascade into the flat fields the
+          // scanner drawer reads (`thumbnailImage || mainImage`), so an
+          // asset with no image of its own renders its model's cover.
+          // `null` stays `null` for the true no-image case — the drawer's
+          // own placeholder branch handles it.
+          ...(() => {
+            const image = resolveAssetImage({
+              mainImage: asset.mainImage ?? null,
+              thumbnailImage: asset.thumbnailImage ?? null,
+              assetModel: asset.assetModel ?? null,
+            });
+            const isPlaceholder = image.source === "placeholder";
+            return {
+              mainImage: isPlaceholder ? null : image.fullUrl,
+              thumbnailImage: isPlaceholder ? null : image.thumbnailUrl,
+            };
+          })(),
+          kitId: sourceKit?.id ?? null,
+          kitName: sourceKit?.name ?? null,
+        };
+
+        if (asset.type === AssetType.QUANTITY_TRACKED) {
+          const qty = qtyRemainingByBookingAssetId[ba.id];
+          const booked = qty?.booked ?? ba.quantity ?? 0;
+          const logged = qty?.logged ?? 0;
+          const remaining = qty?.remaining ?? Math.max(0, booked - logged);
+          return {
+            ...base,
+            kind: "QUANTITY_TRACKED" as const,
+            booked,
+            logged,
+            remaining,
+            // Checkout has no four-way RETURN/CONSUME/LOSS/DAMAGE split —
+            // populate `returned: logged` so existing badge code (which
+            // reads `breakdown.returned`) keeps working without widening
+            // the discriminated union with a direction discriminator.
+            breakdown: {
+              returned: logged,
+              consumed: 0,
+              lost: 0,
+              damaged: 0,
+            },
+            consumptionType: qty?.consumptionType ?? null,
+          };
+        }
+
+        return {
+          ...base,
+          kind: "INDIVIDUAL" as const,
+          // In checkout semantics this means "already checked OUT" (this
+          // INDIVIDUAL asset appears in a prior PartialBookingCheckout
+          // for this booking) — the field name on the union stays
+          // direction-neutral despite reading "checkedIn".
+          alreadyCheckedIn: checkedOutAssetIds.includes(asset.id),
+        };
+      }
+    );
+
+    /**
+     * Bucket expected assets by kit so the drawer can render a kit
+     * summary row (kit name, image, asset count) rather than N
+     * individual rows for each kitted asset. Mirrors the check-in
+     * loader's `expectedKits` bucketing — same `assetKitId`-driven
+     * attribution rules.
+     */
+    const kitMap = new Map<
+      string,
+      {
+        id: string;
+        name: string;
+        mainImage: string | null;
+        assetIds: string[];
+      }
+    >();
+    for (const ba of booking.bookingAssets) {
+      const kit = ba.assetKitId
+        ? ba.asset.assetKits.find((ak) => ak.id === ba.assetKitId)?.kit ?? null
+        : null;
+      const kitId = kit?.id ?? null;
+      if (!kit || !kitId) continue;
+      const entry = kitMap.get(kitId) ?? {
+        id: kitId,
+        name: kit.name,
+        mainImage: kit.image ?? null,
+        assetIds: [],
+      };
+      entry.assetIds.push(ba.asset.id);
+      kitMap.set(kitId, entry);
+    }
+    const expectedKits = [...kitMap.values()];
+
     const title = `Scan assets to check out | ${booking.name}`;
     const header: HeaderData = {
       title,
     };
+
+    /**
+     * Pools on this booking at two or more locations that have not gone out
+     * yet. The drawer shows a "From location" select under each one's
+     * quantity input.
+     */
+    const checkoutSourceQuestions = await getCheckoutSourceQuestions({
+      organizationId,
+      bookingId: booking.id,
+    });
+
+    /**
+     * Kits on this booking that another booking holds, so the drawer can raise
+     * the refusal as a blocker instead of only at submit. Same lookup, window
+     * and in-flight rule as `partialCheckoutBooking`, so the two cannot
+     * disagree.
+     */
+    const kitsBookedElsewhere = (
+      await findKitsBookedElsewhere({
+        slices: booking.bookingAssets.map((ba) => ({
+          assetId: ba.assetId,
+          assetKitId: ba.assetKitId,
+          sourceKitId: ba.sourceKitId,
+        })),
+        bookingId: booking.id,
+        from: booking.from,
+        to: booking.to,
+        organizationId,
+        ignoreReservedConflicts: outranksReservations(booking.status),
+      })
+    ).map(({ id, assetIds }) => ({ id, assetIds }));
 
     return payload({
       title,
@@ -160,6 +393,11 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       booking,
       checkedOutAssetIds,
       checkedInAssetIds,
+      remainingToCheckOutByAsset,
+      expectedAssets,
+      expectedKits,
+      checkoutSourceQuestions,
+      kitsBookedElsewhere,
     });
   } catch (cause) {
     const reason = makeShelfError(cause, { userId, bookingId });
@@ -176,14 +414,13 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
   try {
     assertIsPost(request);
 
-    const { organizationId, role, userOrganizations } = await requirePermission(
-      {
+    const { organizationId, access, userOrganizations } =
+      await requirePermission({
         userId,
         request,
         entity: PermissionEntity.booking,
         action: PermissionAction.checkout,
-      }
-    );
+      });
 
     // Re-apply the same custodian/eligibility guard as the loader. The action
     // is directly POST-able and PermissionAction.checkout is granted to
@@ -193,13 +430,21 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       bookingId,
       organizationId,
       userId,
-      role,
+      access,
       userOrganizations,
       request,
     });
 
     const formData = await request.formData();
 
+    // Wave B: the scanner drawer can include a `checkouts` JSON field
+    // alongside the legacy `assetIds[]` for per-slice quantities on
+    // QUANTITY_TRACKED assets. The schema extension lives on
+    // `partialCheckoutAssetsSchema` (imported by `checkoutAssets`), so
+    // forwarding the FormData unchanged is sufficient.
+    // Everything on this page went through the scanner, except the slices the
+    // drawer names in `selectedBookingAssetIds`: those were checked "without
+    // scanning" and are recorded as selected.
     return await checkoutAssets({
       formData,
       request,
@@ -207,6 +452,7 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       organizationId,
       userId,
       authSession,
+      provenance: { surface: "web", method: "scanned" },
     });
   } catch (cause) {
     const reason = makeShelfError(cause, { userId, bookingId });
@@ -224,12 +470,33 @@ export const handle = {
 };
 
 export default function CheckoutAssetsFromBooking() {
+  const { booking, expectedAssets } = useLoaderData<typeof loader>();
   const addItem = useSetAtom(addScannedItemAtom);
   const navigation = useNavigation();
   const isLoading = isFormProcessing(navigation.state);
 
-  const { vh, isMd } = useViewportHeight();
-  const height = isMd ? vh - 67 : vh - 100;
+  /**
+   * Seed the shared partial-checkin atoms (reused for checkout — the
+   * routes are never mounted simultaneously) with the loader's
+   * expected-asset list. The drawer reads `bookingExpectedAssetsAtom`
+   * to render the pending / scanned-this-session buckets. The hook
+   * teardown on unmount clears the atom so navigating back to a
+   * different booking (or to check-in) doesn't see stale data.
+   */
+  useBookingCheckinSessionInitialization({
+    session: {
+      bookingId: booking.id,
+      bookingName: booking.name,
+      status: booking.status,
+      expectedCount: booking.bookingAssets.length,
+    },
+    expectedAssets,
+  });
+
+  // Fills the screen below wherever the layout's chrome ends, measured rather
+  // than subtracted, so the page itself never scrolls behind the drawer.
+  const { ref: scannerContainerRef, height } =
+    useFillViewportHeight<HTMLDivElement>();
 
   const savedCameraId = useScannerCameraId();
 
@@ -248,7 +515,11 @@ export default function CheckoutAssetsFromBooking() {
 
       <PartialCheckoutDrawer isLoading={isLoading} defaultExpanded={true} />
 
-      <div className="-mx-4 flex flex-col" style={{ height: `${height}px` }}>
+      <div
+        ref={scannerContainerRef}
+        className="-mx-4 flex flex-col overflow-hidden"
+        style={height === undefined ? undefined : { height: `${height}px` }}
+      >
         <CodeScanner
           isLoading={isLoading}
           onCodeDetectionSuccess={handleCodeDetectionSuccess}
@@ -257,9 +528,6 @@ export default function CheckoutAssetsFromBooking() {
           allowNonShelfCodes
           paused={false}
           setPaused={() => {}}
-          scannerModeClassName={(mode) =>
-            tw(mode === "scanner" && "justify-start pt-[100px]")
-          }
           savedCameraId={savedCameraId}
         />
       </div>

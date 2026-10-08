@@ -8,7 +8,7 @@ import type {
 } from "react-router";
 import { redirect, data, useLoaderData, Outlet } from "react-router";
 import { z } from "zod";
-import { setReminderSchema } from "~/components/asset-reminder/set-or-edit-reminder-dialog";
+import { createSetReminderSchema } from "~/components/asset-reminder/set-or-edit-reminder-dialog";
 import ActionsDropdown from "~/components/assets/actions-dropdown";
 import { AssetImage } from "~/components/assets/asset-image/component";
 import { AssetStatusBadge } from "~/components/assets/asset-status-badge";
@@ -18,25 +18,34 @@ import Header from "~/components/layout/header";
 import type { HeaderData } from "~/components/layout/header/types";
 import HorizontalTabs from "~/components/layout/horizontal-tabs";
 import When from "~/components/when/when";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { db } from "~/database/db.server";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { getCustodySourceSummary } from "~/modules/asset/custody-source.server";
+import { ASSET_MODEL_IMAGE_SELECT } from "~/modules/asset/image-select";
+import { toStillOutBookingRows } from "~/modules/asset/quantity-breakdown.server";
 import {
   deleteAsset,
   deleteOtherImages,
   getAsset,
   relinkAssetQrCode,
 } from "~/modules/asset/service.server";
+import { isQuantityTracked } from "~/modules/asset/utils";
 import { createAssetReminder } from "~/modules/asset-reminder/service.server";
 import { createBarcode } from "~/modules/barcode/service.server";
 import {
   validateBarcodeValue,
   normalizeBarcodeValue,
 } from "~/modules/barcode/validation";
+import { computeCheckedOutByBookingForAsset } from "~/modules/booking/checked-out.server";
+import { getTeamMembersForQuantityCustody } from "~/modules/team-member/service.server";
 import assetCss from "~/styles/asset.css?url";
 
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
 import { checkExhaustiveSwitch } from "~/utils/check-exhaustive-switch";
-import { getHints } from "~/utils/client-hints";
+import { getClientHint } from "~/utils/client-hints";
 import { DATE_TIME_FORMAT } from "~/utils/constants";
+import { redactCustodianForViewer } from "~/utils/custody-visibility.server";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
 import { sendNotification } from "~/utils/emitter/send-notification.server";
 import { makeShelfError } from "~/utils/error";
 import {
@@ -61,6 +70,27 @@ export const AvailabilityForBookingFormSchema = z.object({
     .default("false"),
 });
 
+/**
+ * Asset detail page parent loader.
+ *
+ * Ships the canonical `asset` record consumed by both this page's header
+ * (notably `AssetStatusBadge` in the sub-heading) AND every child route
+ * outlet (`assets.$assetId.overview.tsx`, `…activity.tsx`, `…bookings.tsx`,
+ * `…reminders.tsx`). Because the header `AssetStatusBadge` reads its
+ * quantity-aware tooltip data straight from `asset.bookingAssets`, this
+ * loader is responsible for honouring the
+ * {@link import('~/components/assets/asset-status-badge/quantity-data').getQuantityData getQuantityData}
+ * contract for ONGOING/OVERDUE rows: `BookingAsset.quantity` on those rows is
+ * the units still off the shelf on that booking, not the raw pivot snapshot.
+ *
+ * If a child route adds another badge / tooltip that reads `bookingAssets`
+ * from the parent loader, it inherits this shape. The rows are built by
+ * `toStillOutBookingRows`, the same function the lazy-fetch endpoint uses, so
+ * the two paths agree.
+ *
+ * @see {@link file://./../../modules/asset/quantity-breakdown.server.ts}
+ * @see {@link file://./../../components/assets/asset-status-badge/quantity-data.ts}
+ */
 export async function loader({ context, request, params }: LoaderFunctionArgs) {
   const authSession = context.getSession();
   const { userId } = authSession;
@@ -69,12 +99,13 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
   });
 
   try {
-    const { organizationId, userOrganizations } = await requirePermission({
-      userId,
-      request,
-      entity: PermissionEntity.asset,
-      action: PermissionAction.read,
-    });
+    const { organizationId, userOrganizations, access } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.asset,
+        action: PermissionAction.read,
+      });
 
     const asset = await getAsset({
       id,
@@ -82,19 +113,135 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       userOrganizations,
       request,
       include: {
-        custody: { include: { custodian: true } },
-        kit: true,
+        // Model cover image for an asset with no image of its own
+        ...ASSET_MODEL_IMAGE_SELECT,
+        // Explicit select rather than `include: { custodian: true }`: the
+        // include returned every `Custody` scalar, `teamMemberId` among them —
+        // a stable per-holder identifier that survives redaction (which only
+        // empties `custodian`) and groups a colleague's items for a restricted
+        // viewer. Mirrors the shape at `modules/asset/fields.ts`. Nothing reads
+        // `custody.teamMemberId` client-side; the release control keys on
+        // `custodian.id`.
+        custody: {
+          select: {
+            createdAt: true,
+            quantity: true,
+            custodian: {
+              select: {
+                id: true,
+                name: true,
+                userId: true,
+                user: {
+                  select: {
+                    id: true,
+                    email: true,
+                    firstName: true,
+                    lastName: true,
+                    displayName: true,
+                    profilePicture: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+        assetKits: {
+          select: {
+            id: true,
+            quantity: true,
+            kit: { select: { id: true, name: true, status: true } },
+          },
+        },
         qrCodes: true,
+        bookingAssets: {
+          where: {
+            booking: { status: { in: ["RESERVED", "ONGOING", "OVERDUE"] } },
+          },
+          select: {
+            quantity: true,
+            assetKitId: true,
+            booking: { select: { id: true, name: true, status: true } },
+          },
+        },
       },
     });
+
+    /**
+     * Three reads only a QUANTITY_TRACKED asset needs, run together since none
+     * depends on another. An INDIVIDUAL asset's badge asks
+     * `/api/assets/:id/ongoing-booking` instead of reading `bookingAssets`,
+     * and it has no quantity custody dialogs, so it pays for none of them.
+     *
+     *  - Units still out per active booking. The header `AssetStatusBadge`
+     *    tooltip reads `asset.bookingAssets`, so ONGOING / OVERDUE rows carry
+     *    these units through the same `toStillOutBookingRows` the lazy-fetch
+     *    endpoint uses, and agree with the overview's "Checked out" figure.
+     *  - Team members, so the QuantityCustodyDialog in the actions dropdown
+     *    has initial data.
+     *  - Where the asset's units can come from, for the Assign and Adjust
+     *    dialogs. Built here, in the loader both entry points share (the
+     *    header's actions menu and the overview's custody and quantity cards),
+     *    so they always show the same numbers. Counts only, no names, so it
+     *    needs no redaction.
+     */
+    const qtyTracked = isQuantityTracked(asset);
+    const [
+      stillOutByBooking,
+      { teamMembers, totalTeamMembers },
+      custodySources,
+    ] = qtyTracked
+      ? await Promise.all([
+          computeCheckedOutByBookingForAsset(db, asset.id, organizationId),
+          getTeamMembersForQuantityCustody({
+            organizationId,
+            request,
+            userId,
+            access,
+          }),
+          getCustodySourceSummary({
+            assetId: asset.id,
+            organizationId,
+            total: asset.quantity ?? 0,
+          }),
+        ])
+      : [
+          null,
+          { teamMembers: [], totalTeamMembers: 0 },
+          { multiSource: false, options: [], poolAvailable: 0 },
+        ];
+
+    const assetWithEffectiveBookingAssets = stillOutByBooking
+      ? {
+          ...asset,
+          bookingAssets: toStillOutBookingRows(
+            asset.bookingAssets ?? [],
+            stillOutByBooking
+          ),
+        }
+      : asset;
 
     const header: HeaderData = {
       title: asset.title,
     };
 
+    /**
+     * `custody: { include: { custodian: true } }` selects the whole TeamMember
+     * row, and this route is gated on `asset: read` — held by BASE and
+     * SELF_SERVICE. Redacting the list payloads is not enough on its own: the
+     * ids are in the list, so iterating the detail pages recovers exactly the
+     * identities the index just removed.
+     */
+    const [redactedAsset] = redactCustodianForViewer(
+      [assetWithEffectiveBookingAssets],
+      { canSeeAllCustody: access.custody.seeAll, userId }
+    );
+
     return payload({
-      asset,
+      asset: redactedAsset,
       header,
+      teamMembers,
+      totalTeamMembers,
+      custodySources,
     });
   } catch (cause) {
     const reason = makeShelfError(cause);
@@ -102,6 +249,14 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
   }
 }
 
+/**
+ * Handles the asset page's own intents: delete, relink QR code, set reminder and
+ * add barcode. Each intent is permission-checked against the permission it maps
+ * to: deleting needs `asset: delete`, setting a reminder `assetReminders: create`,
+ * and relinking a QR code or adding a barcode `asset: update`.
+ *
+ * @returns A redirect after deletion, or the intent's result or failure with its status
+ */
 export async function action({ context, request, params }: ActionFunctionArgs) {
   const authSession = context.getSession();
   const { userId } = authSession;
@@ -124,18 +279,36 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       })
     );
 
-    const intent2ActionMap: { [K in typeof intent]: PermissionAction } = {
-      delete: PermissionAction.delete,
-      "relink-qr-code": PermissionAction.update,
-      "set-reminder": PermissionAction.update,
-      "add-barcode": PermissionAction.update,
+    // Setting a reminder has its own permission; the other intents act on
+    // the asset itself.
+    const intent2Permission: {
+      [K in typeof intent]: {
+        entity: PermissionEntity;
+        action: PermissionAction;
+      };
+    } = {
+      delete: {
+        entity: PermissionEntity.asset,
+        action: PermissionAction.delete,
+      },
+      "relink-qr-code": {
+        entity: PermissionEntity.asset,
+        action: PermissionAction.update,
+      },
+      "set-reminder": {
+        entity: PermissionEntity.assetReminders,
+        action: PermissionAction.create,
+      },
+      "add-barcode": {
+        entity: PermissionEntity.asset,
+        action: PermissionAction.update,
+      },
     };
 
     const { organizationId } = await requirePermission({
       userId,
       request,
-      entity: PermissionEntity.asset,
-      action: intent2ActionMap[intent],
+      ...intent2Permission[intent],
     });
 
     switch (intent) {
@@ -145,7 +318,10 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
           z.object({ mainImageUrl: z.string().optional() })
         );
 
-        await deleteAsset({ organizationId, id });
+        // Name the actor, or the activity event records the deletion as
+        // "System" — the mobile delete route already passes it, so the same
+        // action read differently depending on where it was performed.
+        await deleteAsset({ organizationId, id, actorUserId: userId });
 
         if (mainImageUrl) {
           // as it is deletion operation giving hardcoded path(to make sure all the images were deleted)
@@ -190,18 +366,30 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       }
 
       case "set-reminder": {
+        // Resolve the acting user's timezone BEFORE validating so the schema's
+        // "must be in the future" check runs in the SAME zone the value is later
+        // stored in (below) and the SAME zone the client validated in. Validating
+        // with the default server-zone schema first, then storing in the pref
+        // zone, lets the two disagree for a wall-clock time near "now".
+        const { timeZone } = await resolveUserFormatPrefsById(
+          userId,
+          getClientHint(request)
+        );
+
         const { redirectTo, ...payload } = parseData(
           formData,
-          setReminderSchema,
+          createSetReminderSchema({ timeZone }),
           { shouldBeCaptured: false }
         );
-        const hints = getHints(request);
 
+        // Parse the submitted wall-clock time in that same resolved timezone —
+        // not the browser hint. When the two differ the browser zone would
+        // offset the stored UTC instant wrong.
         const alertDateTime = DateTime.fromFormat(
           formData.get("alertDateTime")!.toString()!,
           DATE_TIME_FORMAT,
           {
-            zone: hints.timeZone,
+            zone: timeZone,
           }
         ).toJSDate();
 
@@ -311,11 +499,20 @@ export const links: LinksFunction = () => [
 export default function AssetDetailsPage() {
   const { asset } = useLoaderData<typeof loader>();
 
-  const { roles } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
 
   const items = [
     { to: "overview", content: "Overview" },
-    { to: "activity", content: "Activity" },
+    // The activity loader requires `note:read` and 403s without it, so a role
+    // that can't read notes must not be offered the tab. Mirrors the bookings
+    // detail page.
+    ...(userHasPermission({
+      roles,
+      entity: PermissionEntity.note,
+      action: PermissionAction.read,
+    })
+      ? [{ to: "activity", content: "Activity" }]
+      : []),
     { to: "bookings", content: "Bookings" },
     ...(userHasPermission({
       roles,
@@ -338,6 +535,7 @@ export default function AssetDetailsPage() {
                 mainImage: asset.mainImage,
                 thumbnailImage: asset.thumbnailImage,
                 mainImageExpiration: asset.mainImageExpiration,
+                assetModel: asset.assetModel ?? null,
               }}
               alt={`Image of ${asset.title}`}
               className={tw(
@@ -353,6 +551,7 @@ export default function AssetDetailsPage() {
               id={asset.id}
               status={asset.status}
               availableToBook={asset.availableToBook}
+              asset={asset}
             />
           </div>
         }

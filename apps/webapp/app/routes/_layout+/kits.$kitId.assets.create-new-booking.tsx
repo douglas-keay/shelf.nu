@@ -10,6 +10,7 @@ import NewBooking, {
   action as newBookingAction,
 } from "~/routes/_layout+/bookings.new";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { bookingCustodianIsSelf } from "~/utils/bookings";
 import { makeShelfError, ShelfError } from "~/utils/error";
 import {
   payload,
@@ -36,17 +37,13 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
   });
 
   try {
-    const {
-      organizationId,
-      currentOrganization,
-      isSelfServiceOrBase,
-      userOrganizations,
-    } = await requirePermission({
-      userId,
-      request,
-      entity: PermissionEntity.booking,
-      action: PermissionAction.create,
-    });
+    const { organizationId, currentOrganization, access, userOrganizations } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.booking,
+        action: PermissionAction.create,
+      });
 
     if (isPersonalOrg(currentOrganization)) {
       throw new ShelfError({
@@ -62,7 +59,9 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
     const kit = await getKit({
       id: kitId,
       organizationId,
-      extraInclude: { assets: true },
+      extraInclude: {
+        assetKits: { select: { asset: { select: { id: true } } } },
+      },
       userOrganizations,
       request,
     });
@@ -72,7 +71,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       getTeamMemberForForm({
         organizationId,
         userId,
-        isSelfServiceOrBase,
+        access,
         getAll:
           searchParams.has("getAll") &&
           hasGetAllValue(searchParams, "teamMember"),
@@ -82,13 +81,14 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       }),
     ]);
 
-    const selfServiceOrBaseUser = isSelfServiceOrBase
-      ? teamMembersData.teamMembers.find(
-          (member) => member.userId === authSession.userId
-        )
-      : undefined;
-
-    if (isSelfServiceOrBase && !selfServiceOrBaseUser) {
+    // A member whose booking custodian is fixed to themself must find their
+    // own team member in the seed, or the form has no custodian to offer.
+    if (
+      bookingCustodianIsSelf(access) &&
+      !teamMembersData.teamMembers.some(
+        (member) => member.userId === authSession.userId
+      )
+    ) {
       throw new ShelfError({
         cause: null,
         message:
@@ -102,12 +102,18 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       currentOrganization,
       userId,
       showModal: true,
-      isSelfServiceOrBase,
-      selfServiceOrBaseUser,
       ...teamMembersData,
       // For consistency, also provide teamMembersForForm
       teamMembersForForm: teamMembersData.teamMembers,
-      assetIds: kit.assets.map((a) => a.id),
+      // Kit member asset ids — still surfaced so the form can render them as
+      // hidden `assetIds[]` inputs (used for display/count). The shared
+      // `bookings.new` action moves these member ids into kit-driven slices so
+      // they become kit-grouped `BookingAsset` rows, not loose standalone rows.
+      assetIds: kit.assetKits.map((ak) => ak.asset.id),
+      // The originating kit id. Submitted as a hidden `kitId` input so the
+      // action can resolve the kit's memberships into kit slices, preserving
+      // the kit grouping in the new booking.
+      kitId,
       ...tagsData,
     });
   } catch (cause) {

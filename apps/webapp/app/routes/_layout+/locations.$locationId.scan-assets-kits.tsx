@@ -14,15 +14,15 @@ import type { OnCodeDetectionSuccessProps } from "~/components/scanner/code-scan
 import AddAssetsKitsToLocationDrawer, {
   addScannedAssetsOrKitsToLocationSchema,
 } from "~/components/scanner/drawer/uses/add-assets-to-location-drawer";
+import { useFillViewportHeight } from "~/hooks/use-fill-viewport-height";
 import { useScannerCameraId } from "~/hooks/use-scanner-camera-id";
-import { useViewportHeight } from "~/hooks/use-viewport-height";
 import {
   getLocation,
   updateLocationAssets,
   updateLocationKits,
 } from "~/modules/location/service.server";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
-
+import { AssetQuantitiesSchema } from "~/utils/asset-quantities-schema";
 import { makeShelfError } from "~/utils/error";
 import { isFormProcessing } from "~/utils/form";
 import { payload, error, getParams, parseData } from "~/utils/http.server";
@@ -31,7 +31,6 @@ import {
   PermissionEntity,
 } from "~/utils/permissions/permission.data";
 import { requirePermission } from "~/utils/roles.server";
-import { tw } from "~/utils/tw";
 
 export type LoaderData = typeof loader;
 
@@ -59,7 +58,10 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       userOrganizations,
       request,
       include: {
-        assets: { select: { id: true } },
+        // Use `include` (not `select`) at the AssetLocation pivot so Prisma's
+        // LocationInclude type narrows through and exposes the nested `asset`
+        // to downstream consumers.
+        assetLocations: { include: { asset: { select: { id: true } } } },
         kits: { select: { id: true } },
       },
     });
@@ -69,7 +71,15 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       title,
     };
 
-    return payload({ title, header, location });
+    // `getLocation` widens its include arg to `Prisma.LocationInclude`,
+    // which Prisma can't narrow back to the caller's precise shape.
+    // Reassert the shape downstream consumers (the drawer) require.
+    const locationForDrawer = location as typeof location & {
+      assetLocations: { asset: { id: string } }[];
+      kits: { id: string }[];
+    };
+
+    return payload({ title, header, location: locationForDrawer });
   } catch (cause) {
     const reason = makeShelfError(cause, { userId, locationId });
     throw data(error(reason), { status: reason.status });
@@ -97,13 +107,19 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
     });
 
     const formData = await request.formData();
-    const { kitIds, assetIds } = parseData(
-      formData,
-      addScannedAssetsOrKitsToLocationSchema,
-      {
-        additionalData: { userId, organizationId, locationId },
-      }
-    );
+    const {
+      kitIds,
+      assetIds,
+      assetQuantities: rawAssetQuantities,
+    } = parseData(formData, addScannedAssetsOrKitsToLocationSchema, {
+      additionalData: { userId, organizationId, locationId },
+    });
+
+    // Parse the JSON-encoded `assetQuantities` blob with the same
+    // schema the manage-assets picker uses. Missing entries fall back
+    // to full-pool inside `updateLocationAssets` — INDIVIDUAL rows
+    // never appear here.
+    const assetQuantities = AssetQuantitiesSchema.parse(rawAssetQuantities);
 
     if (assetIds.length) {
       await updateLocationAssets({
@@ -113,6 +129,7 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
         userId,
         request,
         removedAssetIds: [],
+        assetQuantities,
       });
     }
 
@@ -139,8 +156,10 @@ export default function ScanAssetsKitsForLocation() {
   const navigation = useNavigation();
   const isLoading = isFormProcessing(navigation.state);
 
-  const { vh, isMd } = useViewportHeight();
-  const height = isMd ? vh - 67 : vh - 100;
+  // Fills the screen below wherever the layout's chrome ends, measured rather
+  // than subtracted, so the page itself never scrolls behind the drawer.
+  const { ref: scannerContainerRef, height } =
+    useFillViewportHeight<HTMLDivElement>();
 
   const savedCameraId = useScannerCameraId();
 
@@ -159,7 +178,11 @@ export default function ScanAssetsKitsForLocation() {
 
       <AddAssetsKitsToLocationDrawer isLoading={isLoading} />
 
-      <div className="-mx-4 flex flex-col" style={{ height: `${height}px` }}>
+      <div
+        ref={scannerContainerRef}
+        className="-mx-4 flex flex-col overflow-hidden"
+        style={height === undefined ? undefined : { height: `${height}px` }}
+      >
         <CodeScanner
           isLoading={isLoading}
           onCodeDetectionSuccess={handleCodeDetectionSuccess}
@@ -167,9 +190,6 @@ export default function ScanAssetsKitsForLocation() {
           allowNonShelfCodes
           paused={false}
           setPaused={() => {}}
-          scannerModeClassName={(mode) =>
-            tw(mode === "scanner" && "justify-start pt-[100px]")
-          }
           savedCameraId={savedCameraId}
         />
       </div>

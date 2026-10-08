@@ -1,5 +1,6 @@
 import { action } from "~/routes/api+/mobile+/bulk-release-custody";
 import { createActionArgs } from "@mocks/remix";
+import { accessFor } from "@helpers/role-access";
 
 // @vitest-environment node
 
@@ -33,9 +34,13 @@ vitest.mock("~/modules/api/mobile-auth.server", () => ({
   getMobileUserContext: vitest.fn(),
 }));
 
-// why: external service — we mock bulk release custody without hitting the database
+// why: external service — we mock bulk release custody without hitting the
+// database. Resolves the real service's return shape — the route now
+// destructures `skippedQuantityTracked` off it.
 vitest.mock("~/modules/asset/service.server", () => ({
-  bulkReleaseCustody: vitest.fn().mockResolvedValue(undefined),
+  bulkCheckInAssets: vitest
+    .fn()
+    .mockResolvedValue({ success: true, skippedQuantityTracked: 0 }),
 }));
 
 // why: external service — we mock asset index settings without hitting the database
@@ -64,7 +69,7 @@ import {
   requireMobilePermission,
   getMobileUserContext,
 } from "~/modules/api/mobile-auth.server";
-import { bulkReleaseCustody } from "~/modules/asset/service.server";
+import { bulkCheckInAssets } from "~/modules/asset/service.server";
 
 const mockUser = {
   id: "user-1",
@@ -106,7 +111,7 @@ describe("POST /api/mobile/bulk-release-custody", () => {
     (requireMobilePermission as any).mockResolvedValue(undefined);
 
     (getMobileUserContext as any).mockResolvedValue({
-      role: "ADMIN",
+      access: accessFor(["ADMIN"]),
       canUseBarcodes: false,
     });
   });
@@ -121,14 +126,56 @@ describe("POST /api/mobile/bulk-release-custody", () => {
     expect(result instanceof Response).toBe(true);
     const body = await (result as unknown as Response).json();
     expect(body.success).toBe(true);
+    // Additive skip count — 0 for an all-INDIVIDUAL selection
+    expect(body.skippedQuantityTracked).toBe(0);
 
-    expect(bulkReleaseCustody).toHaveBeenCalledWith(
+    expect(bulkCheckInAssets).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user-1",
         assetIds: ["asset-1", "asset-2"],
         organizationId: "org-1",
         currentSearchParams: "",
+        custodyAssign: "anyone",
       })
+    );
+  });
+
+  it("forwards the service's skippedQuantityTracked count to the client", async () => {
+    // Mixed selections silently skip QUANTITY_TRACKED assets in the service;
+    // the route must forward the count so the app can report it honestly.
+    (bulkCheckInAssets as any).mockResolvedValueOnce({
+      success: true,
+      skippedQuantityTracked: 2,
+    });
+
+    const request = createBulkReleaseRequest({
+      assetIds: ["asset-1", "qt-asset-1", "qt-asset-2"],
+    });
+
+    const result = await action(createActionArgs({ request }));
+
+    expect((result as unknown as Response).status).toBe(200);
+    const body = await (result as unknown as Response).json();
+    expect(body.success).toBe(true);
+    expect(body.skippedQuantityTracked).toBe(2);
+  });
+
+  it("forwards a SELF_SERVICE caller's `self` custody scope so the service-level guard fires", async () => {
+    // `bulkCheckInAssets` refuses to release custody held by anyone but the
+    // caller when the scope is `self`; the route must forward the scope.
+    (getMobileUserContext as any).mockResolvedValue({
+      access: accessFor(["SELF_SERVICE"]),
+      canUseBarcodes: false,
+    });
+
+    const request = createBulkReleaseRequest({
+      assetIds: ["asset-1"],
+    });
+
+    await action(createActionArgs({ request }));
+
+    expect(bulkCheckInAssets).toHaveBeenCalledWith(
+      expect.objectContaining({ custodyAssign: "self" })
     );
   });
 

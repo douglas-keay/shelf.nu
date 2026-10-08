@@ -1,4 +1,7 @@
+import type { BookingStatus } from "@prisma/client";
 import { atom } from "jotai";
+import type { Getter, Setter } from "jotai";
+import { getPrimaryLocation } from "~/modules/asset/utils";
 import type {
   AssetFromQr,
   KitFromQr,
@@ -27,6 +30,100 @@ export type ScanListItem =
  ***********************/
 
 export const scannedItemsAtom = atom<ScanListItems>({});
+
+/**
+ * Per-asset quantity for QUANTITY_TRACKED scans. Keyed by `assetId` (not
+ * qrId — multiple QR codes can map to the same asset). Drawers default
+ * the displayed value to 1 when an entry is missing, so missing keys
+ * are safe; clear paths still drop the map to keep memory tidy.
+ *
+ * @see {@link scannedItemsAtom} — kept in sync via the remove/clear
+ *   atoms below so removing an item also drops its qty entry.
+ */
+export const scannedAssetQuantitiesAtom = atom<Record<string, number>>({});
+
+/**
+ * The "From location" a scanned pool's units come from, keyed by `assetId`:
+ * a location id or `"unplaced"`. Set only when the operator picks one; the
+ * assign drawer falls back to the pre-selected location (the one with the
+ * most units left) for rows without an entry. Every remove and clear path
+ * drops an asset's entry together with its quantity, so a rescan starts from
+ * the pre-selection again.
+ */
+export const scannedAssetSourcesAtom = atom<Record<string, string>>({});
+
+/**
+ * Drops the per-asset entries (quantity and picked source) of assets that
+ * left the scan list. Both maps are keyed by `assetId`, not by `qrId`.
+ */
+function dropScannedAssetEntries(get: Getter, set: Setter, assetIds: string[]) {
+  if (assetIds.length === 0) return;
+  const quantities = { ...get(scannedAssetQuantitiesAtom) };
+  const sources = { ...get(scannedAssetSourcesAtom) };
+  for (const id of assetIds) {
+    delete quantities[id];
+    delete sources[id];
+  }
+  set(scannedAssetQuantitiesAtom, quantities);
+  set(scannedAssetSourcesAtom, sources);
+}
+
+/**
+ * Writer for {@link scannedAssetSourcesAtom}: one asset's picked source.
+ * Pass `maxQuantity`, the new source's cap, to lower an entered quantity
+ * that no longer fits in the same update. A cap below 1 leaves the quantity
+ * alone: the row then shows no input, and the bulk route's up-front check
+ * names the location.
+ */
+export const setScannedAssetSourceAtom = atom(
+  null,
+  (
+    get,
+    set,
+    payload: { assetId: string; source: string; maxQuantity?: number }
+  ) => {
+    const { assetId, source, maxQuantity } = payload;
+    set(scannedAssetSourcesAtom, {
+      ...get(scannedAssetSourcesAtom),
+      [assetId]: source,
+    });
+    const quantities = get(scannedAssetQuantitiesAtom);
+    const entered = quantities[assetId];
+    if (
+      maxQuantity !== undefined &&
+      maxQuantity >= 1 &&
+      entered !== undefined &&
+      entered > maxQuantity
+    ) {
+      set(scannedAssetQuantitiesAtom, {
+        ...quantities,
+        [assetId]: maxQuantity,
+      });
+    }
+  }
+);
+
+/**
+ * Writer atom that updates a single asset's scanned quantity. Drawer
+ * qty inputs dispatch this on every change. Pass `qty = undefined` (or
+ * the asset's id only) to drop the entry entirely; missing entries
+ * fall back to the drawer's default (1).
+ */
+export const setScannedAssetQuantityAtom = atom(
+  null,
+  (get, set, payload: { assetId: string; quantity: number | undefined }) => {
+    const current = get(scannedAssetQuantitiesAtom);
+    if (payload.quantity == null) {
+      const { [payload.assetId]: _, ...rest } = current;
+      set(scannedAssetQuantitiesAtom, rest);
+      return;
+    }
+    set(scannedAssetQuantitiesAtom, {
+      ...current,
+      [payload.assetId]: payload.quantity,
+    });
+  }
+);
 
 /**
  * A derived atom that extracts asset and kit IDs from the scanned items
@@ -157,8 +254,12 @@ export const updateScannedItemAtom = atom(
 // Remove item based on key
 export const removeScannedItemAtom = atom(null, (get, set, qrId: string) => {
   const currentItems = get(scannedItemsAtom);
-  const { [qrId]: _, ...rest } = currentItems; // Removes the key
+  // Drop the matching scanned-item entry plus the removed asset's qty and
+  // source entries (both keyed by assetId, not qrId).
+  const removedAssetId = currentItems[qrId]?.data?.id;
+  const { [qrId]: _, ...rest } = currentItems;
   set(scannedItemsAtom, rest);
+  if (removedAssetId) dropScannedAssetEntries(get, set, [removedAssetId]);
 });
 
 // Remove multiple items based on key array
@@ -167,10 +268,14 @@ export const removeMultipleScannedItemsAtom = atom(
   (get, set, qrIds: string[]) => {
     const currentItems = get(scannedItemsAtom);
     const updatedItems = { ...currentItems };
+    const removedAssetIds: string[] = [];
     qrIds.forEach((qrId) => {
+      const id = currentItems[qrId]?.data?.id;
+      if (id) removedAssetIds.push(id);
       delete updatedItems[qrId];
     });
     set(scannedItemsAtom, updatedItems);
+    dropScannedAssetEntries(get, set, removedAssetIds);
   }
 );
 
@@ -186,12 +291,15 @@ export const removeScannedItemsByAssetIdAtom = atom(
       }
     });
     set(scannedItemsAtom, updatedItems);
+    dropScannedAssetEntries(get, set, ids);
   }
 );
 
 // Clear all items
 export const clearScannedItemsAtom = atom(null, (_get, set) => {
   set(scannedItemsAtom, {}); // Resets the atom to an empty object
+  set(scannedAssetQuantitiesAtom, {}); // Drop any qty entries too.
+  set(scannedAssetSourcesAtom, {}); // And any picked source locations.
 });
 
 /*******************************/
@@ -269,7 +377,7 @@ export const auditResultsAtom = atom((get) => {
         auditStatus: expectedAssetIds.has(assetData.id)
           ? ("found" as const)
           : ("unexpected" as const),
-        locationName: assetData.location?.name ?? null,
+        locationName: getPrimaryLocation(assetData)?.name ?? null,
       } satisfies AuditScannedItem;
     });
 
@@ -357,3 +465,432 @@ export const endAuditSessionAtom = atom(null, (_get, set) => {
   set(scannedItemsAtom, {});
   set(auditAssetMetaAtom, {});
 });
+
+/*******************************/
+
+/* BOOKING PARTIAL-CHECKIN ATOMS */
+
+/**
+ * Booking-side "expected assets" — mirrors the audit expected-list
+ * pattern so the partial-checkin drawer can render the full booking
+ * contents upfront (scanned + pending + already-reconciled).
+ *
+ * Why a separate atom and not a generalized one? Audits and booking
+ * check-in have divergent per-row metadata (audit: auditAssetId,
+ * notes/images counts; booking: remaining, consumptionType) and
+ * divergent derived states. Forcing one shared atom would require
+ * every consumer to narrow by tag. Keeping them parallel preserves
+ * the shared `scannedItemsAtom` substrate while giving each flow its
+ * own expected-list shape.
+ */
+
+export type BookingExpectedAssetBase = {
+  /** Asset id (not unique within the booking if Polish-6 multi-row slices exist) */
+  id: string;
+  /**
+   * BookingAsset.id — the row this expected-asset entry represents.
+   * Polish-6 introduced multi-row slices: an asset can appear twice
+   * (kit-driven + standalone) in the same booking, so atoms and
+   * synthetic QR keys hang off this id, not `asset.id`.
+   */
+  bookingAssetId: string;
+  title: string;
+  mainImage?: string | null;
+  thumbnailImage?: string | null;
+  /** When this slice was booked via a kit on the booking. */
+  kitId?: string | null;
+  kitName?: string | null;
+};
+
+export type BookingExpectedAsset =
+  | (BookingExpectedAssetBase & {
+      kind: "INDIVIDUAL";
+      /** True if this asset appears in any PartialBookingCheckin.assetIds
+       * for this booking (i.e. already reconciled by a prior session). */
+      alreadyCheckedIn: boolean;
+    })
+  | (BookingExpectedAssetBase & {
+      kind: "QUANTITY_TRACKED";
+      /** BookingAsset.quantity — what was reserved (for THIS slice). */
+      booked: number;
+      /** Units dispositioned against THIS slice (RETURN + CONSUME +
+       * LOSS + DAMAGE), per-row attributed. */
+      logged: number;
+      /** `max(0, booked − logged)`. Remaining units to reconcile. */
+      remaining: number;
+      /** Per-category split of `logged` for this slice, so the drawer
+       * can render the same Booked/Returned/Consumed/Lost/Remaining
+       * tooltip the booking page shows. */
+      breakdown: {
+        returned: number;
+        consumed: number;
+        lost: number;
+        damaged: number;
+      };
+      consumptionType: "ONE_WAY" | "TWO_WAY" | null;
+    });
+
+export type BookingCheckinSessionInfo = {
+  bookingId: string;
+  bookingName: string;
+  status: BookingStatus;
+  /** Total number of BookingAsset rows for this booking. Used by the
+   * drawer's header/progress indicator. */
+  expectedCount: number;
+} | null;
+
+/** Current booking check-in session metadata (similar to auditSessionAtom). */
+export const bookingCheckinSessionAtom = atom<BookingCheckinSessionInfo>(null);
+
+/** Expected assets for the current booking check-in session. */
+export const bookingExpectedAssetsAtom = atom<BookingExpectedAsset[]>([]);
+
+/** Replace the expected-assets list. Used by the init hook on mount. */
+export const setBookingExpectedAssetsAtom = atom(
+  null,
+  (_get, set, assets: BookingExpectedAsset[]) => {
+    set(bookingExpectedAssetsAtom, assets);
+  }
+);
+
+/** Start a booking check-in session. Clears the scanned-items container
+ * so prior sessions don't leak. */
+export const startBookingCheckinSessionAtom = atom(
+  null,
+  (_get, set, info: Exclude<BookingCheckinSessionInfo, null>) => {
+    set(bookingCheckinSessionAtom, info);
+    set(scannedItemsAtom, {});
+  }
+);
+
+/** End the session. Hook calls this on unmount. */
+export const endBookingCheckinSessionAtom = atom(null, (_get, set) => {
+  set(bookingCheckinSessionAtom, null);
+  set(bookingExpectedAssetsAtom, []);
+  set(scannedItemsAtom, {});
+});
+
+/**
+ * Synthetic QR-key prefix for quick-checkin of QUANTITY_TRACKED assets.
+ * Qty-tracked assets don't have physical barcodes, so operators can't
+ * scan them. When the user clicks "Check in without scanning" on a
+ * pending qty row, we insert an entry keyed by this prefix into
+ * `scannedItemsAtom` — the rest of the drawer logic (removal,
+ * disposition seeding, blockers) treats it identically to a real scan.
+ *
+ * Prefix is distinct enough to never collide with a real QR ID
+ * (cuid-shaped).
+ */
+export const QUICK_CHECKIN_QR_PREFIX = "qty-checkin:";
+
+/**
+ * Synthetic QR-key prefix for quick-checkout of QUANTITY_TRACKED assets.
+ *
+ * Direction-twin of {@link QUICK_CHECKIN_QR_PREFIX}. Qty-tracked assets
+ * lack physical barcodes, so the partial-checkout drawer offers a
+ * "Check out without scanning" affordance on each pending qty row;
+ * clicking it inserts a synthetic entry into `scannedItemsAtom` under
+ * this prefix, and the checkout drawer's `AssetRow` `isQuickCheckout`
+ * probe (mirrors check-in's `isQuickCheckin`) recognizes the entry and
+ * paints the indigo "Checked out without scan" badge.
+ *
+ * Kept as a separate constant from `QUICK_CHECKIN_QR_PREFIX` so the
+ * drawer's prefix probe is deterministic per-direction — a combined
+ * prefix would force every consumer to disambiguate by mode on every
+ * read. Two prefixes also keep React keys disjoint between the two
+ * drawers (only one is ever mounted at a time, but the explicit
+ * separation guards against accidental cross-talk).
+ */
+export const QUICK_CHECKOUT_QR_PREFIX = "qty-checkout:";
+
+/**
+ * Inserts a synthetic scanned-item entry for a pending QTY_TRACKED
+ * asset. The entry has pre-populated `data` so `GenericItemRow` skips
+ * its API fetch (see the `shouldFetch` guard in generic-item-row.tsx).
+ *
+ * Idempotent: re-dispatching for the same asset is a no-op.
+ */
+export const quickCheckinQtyAssetAtom = atom(
+  null,
+  (
+    get,
+    set,
+    asset: Extract<BookingExpectedAsset, { kind: "QUANTITY_TRACKED" }>
+  ) => {
+    // Keyed by `bookingAssetId` (Polish-7b), NOT `asset.id`. An asset can
+    // have multiple BookingAsset slices in one booking (kit-driven +
+    // standalone); keying by the slice lets each pending slice be
+    // quick-checked-in independently and gives the server an exact
+    // `ConsumptionLog.bookingAssetId` to attribute against. The drawer's
+    // disposition flow keys qty rows by `bookingAssetId` to match.
+    const key = `${QUICK_CHECKIN_QR_PREFIX}${asset.bookingAssetId}`;
+    const current = get(scannedItemsAtom);
+    if (current[key]) return;
+    set(scannedItemsAtom, {
+      // New entry first — matches the ordering convention used by
+      // `addScannedItemAtom` (newest scan appears at the top of the
+      // drawer's scanned list).
+      [key]: {
+        type: "asset",
+        codeType: "qr",
+        /**
+         * We cast through `unknown` because `AssetFromQr` is the full
+         * Prisma `Asset.include({ location, custody })` payload, which
+         * is vastly larger than what the drawer's `AssetRow` actually
+         * reads (id, title, images, kitId, consumptionType,
+         * bookingAssetId). Synthesizing the whole shape would be
+         * wasteful. The narrower downstream consumers don't touch the
+         * missing fields; if a new consumer starts reading them, the
+         * TS error on the cast site flags it.
+         */
+        data: {
+          id: asset.id,
+          // The slice this synthetic scan represents. AssetRow reads it
+          // back to key the disposition block + qtyRemaining lookups.
+          bookingAssetId: asset.bookingAssetId,
+          title: asset.title,
+          mainImage: asset.mainImage,
+          thumbnailImage: asset.thumbnailImage,
+          kitId: asset.kitId ?? null,
+          consumptionType: asset.consumptionType,
+          type: "QUANTITY_TRACKED",
+        } as unknown as AssetFromQr,
+      },
+      ...current,
+    });
+  }
+);
+
+/**
+ * Inserts a synthetic scanned-item entry for a pending QTY_TRACKED
+ * asset during the partial-checkout flow.
+ *
+ * Direction-twin of {@link quickCheckinQtyAssetAtom}: same
+ * `bookingAssetId`-keyed shape, same pre-populated `data` payload
+ * (so `GenericItemRow`'s `shouldFetch` guard skips the API fetch in
+ * generic-item-row.tsx), same idempotency contract. Only the key
+ * prefix differs — entries land under {@link QUICK_CHECKOUT_QR_PREFIX}
+ * so the checkout drawer's `AssetRow` `isQuickCheckout` probe (mirror
+ * of check-in's `isQuickCheckin`) can recognize and badge them.
+ *
+ * Kept as a separate atom from `quickCheckinQtyAssetAtom` rather than
+ * a single atom with a mode discriminator: the drawer-side prefix
+ * probe needs deterministic key matching, and a combined atom would
+ * force every consumer to check both prefixes. Two atoms keep the
+ * probe one-shot and the synthetic-key space cleanly partitioned.
+ *
+ * Idempotent: re-dispatching for the same `bookingAssetId` is a no-op.
+ */
+export const quickCheckoutQtyAssetAtom = atom(
+  null,
+  (
+    get,
+    set,
+    asset: Extract<BookingExpectedAsset, { kind: "QUANTITY_TRACKED" }>
+  ) => {
+    // Keyed by `bookingAssetId` (Polish-7b), NOT `asset.id`. An asset can
+    // have multiple BookingAsset slices in one booking (kit-driven +
+    // standalone); keying by the slice lets each pending slice be
+    // quick-checked-out independently and gives the server an exact
+    // `PartialBookingCheckout.bookingAssetId` to attribute against.
+    const key = `${QUICK_CHECKOUT_QR_PREFIX}${asset.bookingAssetId}`;
+    const current = get(scannedItemsAtom);
+    if (current[key]) return;
+    set(scannedItemsAtom, {
+      // New entry first — matches the ordering convention used by
+      // `addScannedItemAtom` (newest scan appears at the top of the
+      // drawer's scanned list).
+      [key]: {
+        type: "asset",
+        codeType: "qr",
+        /**
+         * Cast through `unknown` for the same reason as the check-in
+         * twin: `AssetFromQr` is the full Prisma payload and the
+         * checkout drawer's `AssetRow` only reads a narrow subset
+         * (id, title, images, kitId, consumptionType,
+         * bookingAssetId). If a new consumer starts reading omitted
+         * fields, the TS error on the cast site flags it.
+         */
+        data: {
+          id: asset.id,
+          // The slice this synthetic scan represents. AssetRow reads it
+          // back to key the per-slice qty-input + remaining-to-checkout
+          // lookups.
+          bookingAssetId: asset.bookingAssetId,
+          title: asset.title,
+          mainImage: asset.mainImage,
+          thumbnailImage: asset.thumbnailImage,
+          kitId: asset.kitId ?? null,
+          consumptionType: asset.consumptionType,
+          type: "QUANTITY_TRACKED",
+        } as unknown as AssetFromQr,
+      },
+      ...current,
+    });
+  }
+);
+
+/*******************************/
+
+/* BOOKING FULFIL-AND-CHECKOUT ATOMS */
+
+/**
+ * "Fulfil reservations & check out" flow atoms.
+ *
+ * These sit alongside the booking check-in session atoms above. The
+ * check-in flow reconciles BookingAsset rows that already exist on a
+ * booking; this flow resolves outstanding `BookingModelRequest`s (the
+ * "N × AssetModel" Book-by-Model reservations) by scanning concrete
+ * assets to materialize them, then transitions RESERVED → ONGOING in
+ * a single atomic submit.
+ *
+ * Why a separate parallel atom family (instead of generalising
+ * `bookingCheckinSessionAtom`)? The two sessions have divergent data
+ * models — check-in tracks per-asset `remaining` quantities on
+ * existing BookingAssets, whereas fulfil tracks per-model `booked`
+ * vs `remaining` counts on BookingModelRequests plus a read-only
+ * "already included" list of concrete assets. Sharing a single atom
+ * would force every consumer to discriminate by tag on every read.
+ * Keeping them parallel preserves the shared `scannedItemsAtom`
+ * substrate while each flow owns its own session shape.
+ */
+
+/**
+ * One expected entry per outstanding `BookingModelRequest`. The
+ * drawer renders `booked` synthetic pending rows per model and
+ * decrements `remaining` as matching scans arrive.
+ */
+export type ExpectedModelRequest = {
+  assetModelId: string;
+  assetModelName: string;
+  /** Original `BookingModelRequest.quantity` at session start. */
+  booked: number;
+  /** Units still pending in this session (client-side derived). */
+  remaining: number;
+};
+
+/**
+ * One concrete `BookingAsset` already on a booking before a scan session
+ * starts. Both the Check Out drawer and the Scan to Assign screen render
+ * these in an "already included" section, so the shape is shared even
+ * though each screen seeds its own atom from it.
+ */
+export type AlreadyIncludedRow = {
+  id: string;
+  title: string;
+  mainImage: string | null;
+  thumbnailImage: string | null;
+  assetModelId: string | null;
+  /**
+   * Whether this asset's standalone row still carries no reservation stamp,
+   * so scanning it could answer a reserved unit. The server decides it; the
+   * drawer only reads it to tell a countable scan from a plain duplicate.
+   */
+  claimable: boolean;
+  kitId: string | null;
+  /**
+   * `BookingAsset.quantity` on this booking: `1` for INDIVIDUAL
+   * assets, `N` for QUANTITY_TRACKED. Lets the "Already included"
+   * collapser render `"Pens × 20"` for qty-tracked rows instead
+   * of hiding the unit count entirely.
+   */
+  bookedQuantity: number;
+  /**
+   * Asset type so the renderer knows whether to show the quantity
+   * suffix (`QUANTITY_TRACKED`) or suppress it (`INDIVIDUAL`, which
+   * is implicitly `× 1`).
+   */
+  type: "INDIVIDUAL" | "QUANTITY_TRACKED";
+};
+
+/**
+ * Fulfil-and-checkout session metadata. Null when no session is
+ * active. `bookingFrom` is kept as ISO string because the atom layer
+ * shouldn't own `Date` instances (they serialize poorly across
+ * loader boundaries); consumers parse it when computing
+ * `isBookingEarlyCheckout`.
+ */
+export type FulfilSessionInfo = {
+  bookingId: string;
+  bookingName: string;
+  /** ISO string — drives `isBookingEarlyCheckout` in the submit path. */
+  bookingFrom: string;
+  /**
+   * Booking status when the scanner opened. Only a RESERVED booking's first
+   * check-out can move its start date, so only then is the operator asked.
+   */
+  bookingStatus: BookingStatus;
+  /**
+   * Whether submit sends out only the scanned items. True under the explicit
+   * check-out requirement and on a booking that is no longer RESERVED;
+   * otherwise every item on the booking goes out. Decides what counts as
+   * "something to check out" and whether scanning an item already on the
+   * booking is a check-out of it.
+   */
+  checksOutScannedOnly: boolean;
+  expectedModelRequests: ExpectedModelRequest[];
+  /**
+   * Concrete BookingAssets already on the booking before this
+   * session. Rendered in the drawer's "Already included" section as
+   * a visual-only, non-interactive list so operators see the full
+   * picture (mirrors the audit expected-list UX). Never mutated
+   * client-side — the server owns these rows.
+   */
+  alreadyIncluded: AlreadyIncludedRow[];
+} | null;
+
+/** Current fulfil-and-checkout session metadata. */
+export const fulfilSessionAtom = atom<FulfilSessionInfo>(null);
+
+/**
+ * Expected model-request list for the current session. Kept as a
+ * separate atom (rather than reading through `fulfilSessionAtom`)
+ * so per-scan derivations can subscribe without re-rendering on
+ * every session-info change.
+ */
+export const expectedModelRequestsAtom = atom<ExpectedModelRequest[]>([]);
+
+/**
+ * Write-only: mount-time setter for the fulfil session.
+ *
+ * Mirrors `startBookingCheckinSessionAtom`. Writes both the session
+ * metadata and the expected-model-requests list in one action, and
+ * clears `scannedItemsAtom` so a prior session's scans (e.g. from
+ * `scan-assets` or a previous fulfil attempt) don't leak into this
+ * one. Called by the fulfil init hook on mount.
+ */
+export const setFulfilSessionAtom = atom(
+  null,
+  (_get, set, info: Exclude<FulfilSessionInfo, null>) => {
+    set(fulfilSessionAtom, info);
+    set(expectedModelRequestsAtom, info.expectedModelRequests);
+    set(scannedItemsAtom, {});
+  }
+);
+
+/**
+ * Write-only: teardown for the fulfil session.
+ *
+ * Mirrors `endBookingCheckinSessionAtom`. Clears session info, the
+ * expected list, and the shared scanned-items container. Called by
+ * the fulfil init hook on unmount so returning to this flow later
+ * starts from a clean slate.
+ */
+export const endFulfilSessionAtom = atom(null, (_get, set) => {
+  set(fulfilSessionAtom, null);
+  set(expectedModelRequestsAtom, []);
+  set(scannedItemsAtom, {});
+});
+
+/**
+ * Assets already on the booking before the current Scan to Assign session.
+ *
+ * A separate atom rather than a read through `fulfilSessionAtom`: the Check
+ * Out drawer owns that atom's lifecycle, and pointing Scan to Assign's
+ * "already included" list at it would make one screen's teardown clear the
+ * other screen's data. `expectedModelRequestsAtom` is shared because both
+ * screens already agree on its lifecycle; this is the one piece that had no
+ * shared home yet. Seeded and cleared by
+ * `useBookingAssignSessionInitialization`.
+ */
+export const assignAlreadyIncludedAtom = atom<AlreadyIncludedRow[]>([]);

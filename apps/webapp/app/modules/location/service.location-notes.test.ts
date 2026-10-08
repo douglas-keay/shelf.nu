@@ -22,11 +22,36 @@ const dbMocks = vi.hoisted(() => ({
     // why: org-scope assertion in updateLocationAssets calls db.asset.count
     count: vi.fn(),
   },
+  // why: placement lives on the AssetLocation pivot (not Asset.locationId).
+  // updateLocationAssets/updateLocationKits create/delete pivot rows
+  // directly inside the transaction, so the delegate must be mockable.
+  assetLocation: {
+    createMany: vi.fn(),
+    deleteMany: vi.fn(),
+    findMany: vi.fn(),
+    // why: qty-edit branch uses `updateMany` scoped to `assetKitId IS NULL`
+    // because the (assetId, locationId) composite is no longer unique
+    // (manual + kit-driven rows can coexist).
+    update: vi.fn(),
+    updateMany: vi.fn(),
+  },
   // why: kit model stubs for fetching kits affected by location changes
   kit: {
     findMany: vi.fn(),
     // why: org-scope assertion in updateLocationKits calls db.kit.count
     count: vi.fn(),
+  },
+  // why: kit-driven AssetLocation cascade in `updateLocationKits`
+  // re-creates rows from the matching AssetKit rows; the cascade
+  // fetches them inside the tx.
+  assetKit: {
+    findMany: vi.fn().mockResolvedValue([]),
+  },
+  // why: updateLocationAssets reads each quantity-tracked asset's operator
+  // custody before and after its placement writes, to re-home custody taken
+  // from a placement it shrinks or removes; no custody is out in these tests.
+  custody: {
+    findMany: vi.fn().mockResolvedValue([]),
   },
   // why: user model stubs for resolving actor info in activity events
   user: {
@@ -40,8 +65,11 @@ const dbMocks = vi.hoisted(() => ({
     const txClient = {
       location: dbMocks.location,
       asset: dbMocks.asset,
+      assetLocation: dbMocks.assetLocation,
+      assetKit: dbMocks.assetKit,
       kit: dbMocks.kit,
       user: dbMocks.user,
+      custody: dbMocks.custody,
     };
     return cb(txClient);
   }),
@@ -53,6 +81,18 @@ const getUserByIDMock = vi.hoisted(() => vi.fn());
 
 vi.mock("~/database/db.server", () => ({
   db: dbMocks,
+}));
+
+// why: updateLocationAssets row-locks every quantity-tracked asset it touches
+// with a raw `SELECT ... FOR UPDATE`, which a mocked tx cannot run.
+vi.mock("~/modules/consumption-log/quantity-lock.server", () => ({
+  lockAssetsForQuantityUpdate: vi
+    .fn()
+    .mockImplementation((_tx: unknown, ids: string[]) =>
+      Promise.resolve(
+        ids.map((id) => ({ id, type: "QUANTITY_TRACKED", quantity: 80 }))
+      )
+    ),
 }));
 
 vi.mock("~/utils/geolocate.server", () => ({
@@ -111,6 +151,15 @@ vi.mock("~/utils/error", () => {
     // generic 500 wrap from the outer catch
     isLikeShelfError: (cause: unknown) => cause instanceof ShelfError,
     isNotFoundError: () => false,
+    // why: no-op here — production only translates the DB "exceeds
+    // Asset.quantity" trigger error; these tests exercise other errors (403
+    // org-scope guard, 400 quantity pre-check) which must fall through to
+    // their own status unchanged, exactly as the real helper does for them
+    throwIfAssetQuantityOverAllocation: () => {},
+    // why: same no-op rationale — the single-location trigger translator only
+    // fires on the DB "already placed at a location" error, which these tests
+    // don't exercise; other errors must fall through unchanged
+    throwIfIndividualAssetAlreadyPlaced: () => {},
     maybeUniqueConstraintViolation: (
       _cause: unknown,
       _label: string,
@@ -138,7 +187,10 @@ describe("location service activity logging", () => {
       address: "Old St",
       latitude: null,
       longitude: null,
-      assets: [],
+      // Placement comes from the AssetLocation pivot, not a direct `assets`
+      // relation. updateLocationAssets reads `location.assetLocations` to
+      // derive the current placement set.
+      assetLocations: [],
       kits: [],
     });
 
@@ -148,10 +200,12 @@ describe("location service activity logging", () => {
     dbMocks.user.findFirstOrThrow.mockResolvedValue({
       firstName: "Jane",
       lastName: "Doe",
+      displayName: null,
     });
     dbMocks.user.findFirst.mockResolvedValue({
       firstName: "Jane",
       lastName: "Doe",
+      displayName: null,
     });
     dbMocks.kit.findMany.mockResolvedValue([]);
     // why: assertion helpers count submitted IDs; default to "all authorized"
@@ -205,6 +259,7 @@ describe("location service activity logging", () => {
         newLocation: { id: "loc-2", name: "New" },
         firstName: "Ada",
         lastName: "Lovelace",
+        displayName: null,
         assetId: "asset-1",
         userId: "user-1",
         organizationId: "org-1",
@@ -227,7 +282,11 @@ describe("location service activity logging", () => {
         {
           id: "asset-1",
           title: "Camera",
-          location: { id: "loc-3", name: "Warehouse" },
+          type: "INDIVIDUAL",
+          quantity: 1,
+          // `getPrimaryLocation` reads `assetLocations[0].location` from
+          // the pivot to derive prior placement.
+          assetLocations: [{ location: { id: "loc-3", name: "Warehouse" } }],
           user: { id: "user-1", firstName: "Ada", lastName: "Lovelace" },
         },
       ]);
@@ -321,6 +380,252 @@ describe("location service activity logging", () => {
     });
   });
 
+  describe("updateLocationAssets quantity allocation", () => {
+    /**
+     * Builds the modifiedAssets fetch result. The orthogonal-MAX
+     * validator reads `type`, `quantity`, and the full `assetLocations`
+     * (locationId + quantity) per row to compute
+     * `Asset.quantity − sum(other locations)`.
+     */
+    function modifiedAssetRow(overrides: {
+      id: string;
+      type: "INDIVIDUAL" | "QUANTITY_TRACKED";
+      quantity: number;
+      assetLocations?: Array<{
+        locationId: string;
+        quantity: number;
+        location: { id: string; name: string };
+      }>;
+    }) {
+      return {
+        id: overrides.id,
+        title: `Asset ${overrides.id}`,
+        type: overrides.type,
+        quantity: overrides.quantity,
+        assetLocations: overrides.assetLocations ?? [],
+        user: { id: "user-1", firstName: "Ada", lastName: "Lovelace" },
+      };
+    }
+
+    it("falls back to Asset.quantity when assetQuantities is omitted (back-compat)", async () => {
+      dbMocks.asset.findMany.mockResolvedValueOnce([
+        modifiedAssetRow({
+          id: "pens",
+          type: "QUANTITY_TRACKED",
+          quantity: 80,
+        }),
+      ]);
+
+      await updateLocationAssets({
+        assetIds: ["pens"],
+        organizationId: "org-1",
+        locationId: "loc-1",
+        userId: "user-1",
+        request: new Request("https://example.com"),
+        removedAssetIds: [],
+      });
+
+      expect(dbMocks.assetLocation.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: [expect.objectContaining({ assetId: "pens", quantity: 80 })],
+        })
+      );
+    });
+
+    it("writes the submitted qty for QUANTITY_TRACKED assets", async () => {
+      dbMocks.asset.findMany.mockResolvedValueOnce([
+        modifiedAssetRow({
+          id: "pens",
+          type: "QUANTITY_TRACKED",
+          quantity: 80,
+        }),
+      ]);
+
+      await updateLocationAssets({
+        assetIds: ["pens"],
+        organizationId: "org-1",
+        locationId: "loc-1",
+        userId: "user-1",
+        request: new Request("https://example.com"),
+        removedAssetIds: [],
+        assetQuantities: { pens: 30 },
+      });
+
+      expect(dbMocks.assetLocation.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: [expect.objectContaining({ assetId: "pens", quantity: 30 })],
+        })
+      );
+    });
+
+    it("forces INDIVIDUAL qty to 1 even when assetQuantities tries to set it higher", async () => {
+      dbMocks.asset.findMany.mockResolvedValueOnce([
+        modifiedAssetRow({
+          id: "camera",
+          type: "INDIVIDUAL",
+          quantity: 1,
+        }),
+      ]);
+
+      await updateLocationAssets({
+        assetIds: ["camera"],
+        organizationId: "org-1",
+        locationId: "loc-1",
+        userId: "user-1",
+        request: new Request("https://example.com"),
+        removedAssetIds: [],
+        // INDIVIDUAL never honours a submitted qty (no input renders for them).
+        assetQuantities: { camera: 5 },
+      });
+
+      expect(dbMocks.assetLocation.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: [expect.objectContaining({ assetId: "camera", quantity: 1 })],
+        })
+      );
+    });
+
+    it("rejects with 400 when submitted qty exceeds orthogonal MAX", async () => {
+      // Pens 80 total, 50 already at Warehouse (loc-2). Submitting 60
+      // at loc-1 would push the sum to 110 → reject. spaceWithoutMe is
+      // 80 − 50 = 30; max = max(0, 30) = 30; submitted 60 > 30.
+      dbMocks.asset.findMany.mockResolvedValueOnce([
+        modifiedAssetRow({
+          id: "pens",
+          type: "QUANTITY_TRACKED",
+          quantity: 80,
+          assetLocations: [
+            {
+              locationId: "loc-2",
+              quantity: 50,
+              location: { id: "loc-2", name: "Warehouse" },
+            },
+          ],
+        }),
+      ]);
+
+      await expect(
+        updateLocationAssets({
+          assetIds: ["pens"],
+          organizationId: "org-1",
+          locationId: "loc-1",
+          userId: "user-1",
+          request: new Request("https://example.com"),
+          removedAssetIds: [],
+          assetQuantities: { pens: 60 },
+        })
+      ).rejects.toMatchObject({
+        status: 400,
+        title: "Quantity exceeds available pool",
+      });
+
+      // Validation runs before the tx → no pivot row written.
+      expect(dbMocks.assetLocation.createMany).not.toHaveBeenCalled();
+    });
+
+    it("allows submitting the current slice when over-committed (max = currentAtThisLocation)", async () => {
+      // Pathological state: 60 already at loc-1 + 50 at loc-2 = 110, but
+      // Asset.quantity is only 80. spaceWithoutMe = 80 − 50 = 30; max =
+      // max(60, 30) = 60. Submitting 60 should pass.
+      dbMocks.location.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "loc-1",
+        organizationId: "org-1",
+        address: "Old St",
+        latitude: null,
+        longitude: null,
+        // Pens is already at loc-1 with qty 60.
+        assetLocations: [{ assetId: "pens", quantity: 60 }],
+        kits: [],
+      });
+      dbMocks.asset.findMany.mockResolvedValueOnce([
+        modifiedAssetRow({
+          id: "pens",
+          type: "QUANTITY_TRACKED",
+          quantity: 80,
+          assetLocations: [
+            {
+              locationId: "loc-1",
+              quantity: 60,
+              location: { id: "loc-1", name: "Office" },
+            },
+            {
+              locationId: "loc-2",
+              quantity: 50,
+              location: { id: "loc-2", name: "Warehouse" },
+            },
+          ],
+        }),
+      ]);
+
+      await updateLocationAssets({
+        assetIds: ["pens"],
+        organizationId: "org-1",
+        locationId: "loc-1",
+        userId: "user-1",
+        request: new Request("https://example.com"),
+        removedAssetIds: [],
+        // Keep the existing 60-unit slice — qty edit is a no-op here
+        // (60 === 60) so it doesn't trip the qty-edit branch.
+        assetQuantities: { pens: 60 },
+      });
+
+      // No 400 thrown; the asset wasn't in actuallyNewAssetIds (it was
+      // already at loc-1) and the submitted qty matches the existing
+      // pivot row, so the qty-edit branch is also skipped.
+      expect(dbMocks.assetLocation.update).not.toHaveBeenCalled();
+    });
+
+    it("updates the existing pivot row when submitted qty differs from current", async () => {
+      // Pens already at loc-1 with qty 30; user picks the picker open
+      // and changes to 50. Asset has no other placements so MAX = 80.
+      dbMocks.location.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "loc-1",
+        organizationId: "org-1",
+        address: null,
+        latitude: null,
+        longitude: null,
+        assetLocations: [{ assetId: "pens", quantity: 30 }],
+        kits: [],
+      });
+      dbMocks.asset.findMany.mockResolvedValueOnce([
+        modifiedAssetRow({
+          id: "pens",
+          type: "QUANTITY_TRACKED",
+          quantity: 80,
+          assetLocations: [
+            {
+              locationId: "loc-1",
+              quantity: 30,
+              location: { id: "loc-1", name: "Office" },
+            },
+          ],
+        }),
+      ]);
+
+      await updateLocationAssets({
+        assetIds: ["pens"],
+        organizationId: "org-1",
+        locationId: "loc-1",
+        userId: "user-1",
+        request: new Request("https://example.com"),
+        removedAssetIds: [],
+        assetQuantities: { pens: 50 },
+      });
+
+      // The qty-edit branch uses `updateMany` scoped to
+      // `assetKitId: null` because the (assetId, locationId) composite
+      // isn't unique when manual + kit-driven rows can coexist. The
+      // partial unique `AssetLocation_manual_unique` still caps it at
+      // one match.
+      expect(dbMocks.assetLocation.updateMany).toHaveBeenCalledWith({
+        where: { assetId: "pens", locationId: "loc-1", assetKitId: null },
+        data: { quantity: 50 },
+      });
+      // No createMany because the asset is already at this location.
+      expect(dbMocks.assetLocation.createMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe("updateLocationKits", () => {
     it("records notes when kits are assigned", async () => {
       dbMocks.location.findUniqueOrThrow.mockResolvedValueOnce({
@@ -339,8 +644,13 @@ describe("location service activity logging", () => {
         },
       ];
 
+      // Phase-4a: Kit now exposes assets through the AssetKit pivot
       const kitRecords = [
-        { id: "kit-1", name: "Shoot Kit", assets: kitAssets },
+        {
+          id: "kit-1",
+          name: "Shoot Kit",
+          assetKits: kitAssets.map((asset) => ({ asset })),
+        },
       ];
 
       dbMocks.kit.findMany

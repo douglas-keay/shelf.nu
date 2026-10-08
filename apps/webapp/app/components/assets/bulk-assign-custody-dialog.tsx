@@ -1,41 +1,78 @@
+import { useAtomValue } from "jotai";
 import { useLoaderData } from "react-router";
 import { useZorm } from "react-zorm";
 import { z } from "zod";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { selectedBulkItemsAtom } from "~/atoms/list";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { isQuantityTracked } from "~/modules/asset/utils";
 import { createCustodianSchema } from "~/modules/custody/schema";
 import { type loader } from "~/routes/_layout+/assets._index";
+import {
+  AssetQuantitiesSchema,
+  AssetSourceLocationsSchema,
+} from "~/utils/asset-quantities-schema";
 import { tw } from "~/utils/tw";
 import { resolveTeamMemberName } from "~/utils/user";
 import { BulkUpdateDialogContent } from "../bulk-update-dialog/bulk-update-dialog";
 import DynamicSelect from "../dynamic-select/dynamic-select";
 import { Button } from "../shared/button";
+import { WarningBox } from "../shared/warning-box";
 
 export const BulkAssignCustodySchema = z.object({
   assetIds: z.array(z.string()).min(1),
   custodian: createCustodianSchema(),
+  /**
+   * Units per quantity-tracked asset, sent only by the scanner, which shows a
+   * quantity input on each scanned row. This dialog selects rows on the assets
+   * index, where there is nowhere to say how many units each hand-over covers,
+   * so it sends nothing and those assets keep being skipped.
+   */
+  quantities: AssetQuantitiesSchema,
+  /**
+   * Where each quantity-tracked asset's units come from, sent only by the
+   * scanner, and only for pools placed at two or more locations. Keyed by
+   * asset id: a location id or `"unplaced"`.
+   */
+  sourceLocations: AssetSourceLocationsSchema,
 });
 
 export default function BulkAssignCustodyDialog() {
   const zo = useZorm("BulkAssignCustody", BulkAssignCustodySchema);
 
-  const { isSelfService } = useUserRoleHelper();
+  const assignsSelfOnly = useRoleAccess().custody.assign === "self";
   const { currentUserTeamMember } = useLoaderData<typeof loader>();
+
+  const selectedItems = useAtomValue(selectedBulkItemsAtom);
+  const quantityTrackedCount = selectedItems.filter((item) =>
+    isQuantityTracked(item)
+  ).length;
 
   return (
     <BulkUpdateDialogContent
       ref={zo.ref}
       type="assign-custody"
-      title={`${isSelfService ? "Take" : "Assign"} custody of assets`}
+      title={`${assignsSelfOnly ? "Take" : "Assign"} custody of assets`}
       description={`These assets are currently available. You're about to assign custody to ${
-        isSelfService ? "yourself" : "one of your team members"
+        assignsSelfOnly ? "yourself" : "one of your team members"
       }.`}
       actionUrl="/api/assets/bulk-assign-custody"
       arrayFieldId="assetIds"
     >
       {({ disabled, handleCloseDialog, fetcherError }) => (
         <div className="modal-content-wrapper">
+          {quantityTrackedCount > 0 ? (
+            <div className="mb-4">
+              <WarningBox>
+                <span>
+                  {quantityTrackedCount} quantity-tracked asset(s) in your
+                  selection will be skipped. Quantity-tracked assets must be
+                  assigned custody individually with a specific quantity.
+                </span>
+              </WarningBox>
+            </div>
+          ) : null}
           <div className="relative z-50 mb-8">
-            {isSelfService && currentUserTeamMember ? (
+            {assignsSelfOnly && currentUserTeamMember ? (
               <input
                 type="hidden"
                 name="custodian"
@@ -51,6 +88,9 @@ export default function BulkAssignCustodyDialog() {
                   name: "teamMember",
                   queryKey: "name",
                   deletedAt: null,
+                  // ASSET custody: SELF_SERVICE may only take custody itself
+                  // and BASE never.
+                  custodyPurpose: "custody-assignment",
                 }}
                 fieldName="custodian"
                 contentLabel="Team members"
@@ -83,7 +123,7 @@ export default function BulkAssignCustodyDialog() {
             ) : null}
           </div>
 
-          <div className={tw("flex gap-3", isSelfService && "-mt-8")}>
+          <div className={tw("flex gap-3", assignsSelfOnly && "-mt-8")}>
             <Button
               type="button"
               variant="secondary"

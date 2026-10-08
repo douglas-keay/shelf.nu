@@ -3,8 +3,9 @@ import { bookingUpdatesTemplateString } from "~/emails/bookings-updates-template
 import { sendEmail } from "~/emails/mail.server";
 import type { BookingForEmail } from "~/emails/types";
 import type { ClientHint } from "~/utils/client-hints";
-import { getDateTimeFormatFromHints } from "~/utils/client-hints";
 import { getTimeRemainingMessage } from "~/utils/date-fns";
+import type { ResolvedFormatPrefs } from "~/utils/date-format";
+import { formatDate, resolveFormatPrefs } from "~/utils/date-format";
 import { SERVER_URL } from "~/utils/env";
 import { ShelfError } from "~/utils/error";
 import { Logger } from "~/utils/logger";
@@ -19,7 +20,8 @@ type BasicEmailContentArgs = {
   from: Date;
   to: Date;
   bookingId: string;
-  hints: ClientHint;
+  /** Resolved formatting prefs — recipient's for the fan-out, actor's elsewhere. */
+  prefs: ResolvedFormatPrefs;
   customEmailFooter?: string | null;
 };
 
@@ -35,17 +37,11 @@ export const baseBookingTextEmailContent = ({
   bookingId,
   assetsCount,
   emailContent,
-  hints,
+  prefs,
   customEmailFooter,
 }: BasicEmailContentArgs & { emailContent: string }) => {
-  const fromDate = getDateTimeFormatFromHints(hints, {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(from);
-  const toDate = getDateTimeFormatFromHints(hints, {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(to);
+  const fromDate = formatDate(from, prefs, { includeTime: true });
+  const toDate = formatDate(to, prefs, { includeTime: true });
   return `Howdy,
 
 ${emailContent}
@@ -65,13 +61,37 @@ The Shelf Team
 };
 
 /**
- * This is the content of the email sent to the custodian when a booking is reserved.
+ * This is the content of the email sent to the custodian when a booking
+ * is reserved.
+ *
+ * Phase 3d (Book-by-Model): when the booking has outstanding
+ * `BookingModelRequest` rows, the plain-text email appends a
+ * "Requested models" block that mirrors the HTML template. The list is
+ * omitted when empty so the plain-text output stays identical for
+ * bookings that don't use model-level reservations.
+ *
+ * @param args.modelRequests - Optional list of `{ quantity, modelName }`
+ *   rows. Must be pre-filtered so only entries with `quantity > 0`
+ *   reach this helper.
  */
-export const assetReservedEmailContent = (args: BasicEmailContentArgs) =>
-  baseBookingTextEmailContent({
+export const assetReservedEmailContent = ({
+  modelRequests,
+  ...args
+}: BasicEmailContentArgs & {
+  modelRequests?: { quantity: number; modelName: string }[];
+}) => {
+  const modelRequestsBlock =
+    modelRequests && modelRequests.length > 0
+      ? `\n\nRequested models:\n${modelRequests
+          .map((req) => `- ${req.quantity} × ${req.modelName}`)
+          .join("\n")}`
+      : "";
+
+  return baseBookingTextEmailContent({
     ...args,
-    emailContent: `Booking reservation for ${args.custodian}.`,
+    emailContent: `Booking reservation for ${args.custodian}.${modelRequestsBlock}`,
   });
+};
 
 /**
  * This is the content of the email sent to the custodian when a booking is checked out.
@@ -135,18 +155,23 @@ export async function sendCheckinReminder(
 
   const subject = `🔔 Checkin reminder (${booking.name}) - shelf.nu`;
 
-  const text = checkinReminderEmailContent({
-    hints,
-    bookingName: booking.name,
-    assetsCount: assetCount,
-    custodian,
-    from: booking.from!,
-    to: booking.to!,
-    bookingId: booking.id,
-    customEmailFooter: booking.organization.customEmailFooter,
-  });
-
   for (const recipient of recipients) {
+    // Recipient prefs resolved from the ALREADY-LOADED row (raw pref fields on
+    // NotificationRecipient); hints is the null-field fallback only. Pure —
+    // no per-recipient DB fetch (avoids an N+1 in the fan-out).
+    const recipientPrefs = resolveFormatPrefs(recipient, hints);
+
+    const text = checkinReminderEmailContent({
+      prefs: recipientPrefs,
+      bookingName: booking.name,
+      assetsCount: assetCount,
+      custodian,
+      from: booking.from!,
+      to: booking.to!,
+      bookingId: booking.id,
+      customEmailFooter: booking.organization.customEmailFooter,
+    });
+
     const html = await bookingUpdatesTemplateString({
       booking,
       heading: `Your booking is due for checkin in ${getTimeRemainingMessage(
@@ -154,7 +179,7 @@ export async function sendCheckinReminder(
         new Date()
       )}.`,
       assetCount,
-      hints,
+      prefs: recipientPrefs,
       recipientReason: recipient.reason,
       recipientEmail: recipient.email,
     });
@@ -217,6 +242,18 @@ export const cancelledBookingEmailContent = (
   });
 
 /**
+ * This is the content of the email sent to the custodian when a reserved
+ * booking is reverted back to draft (e.g. an admin sends a reservation
+ * request back for changes). The booking still exists — the recipient can
+ * open it, adjust it and reserve it again.
+ */
+export const revertedToDraftEmailContent = (args: BasicEmailContentArgs) =>
+  baseBookingTextEmailContent({
+    ...args,
+    emailContent: `Your booking reservation has been reverted to draft: "${args.bookingName}". You can review the booking, make changes and submit it again.`,
+  });
+
+/**
  * Booking is extended
  *
  * This email is sent when a booking's end date is extended.
@@ -225,10 +262,8 @@ export function extendBookingEmailContent({
   oldToDate,
   ...args
 }: BasicEmailContentArgs & { oldToDate: Date }) {
-  const { format } = getDateTimeFormatFromHints(args.hints, {
-    dateStyle: "short",
-    timeStyle: "short",
-  });
+  const format = (date: Date) =>
+    formatDate(date, args.prefs, { includeTime: true });
 
   return baseBookingTextEmailContent({
     ...args,
@@ -309,18 +344,17 @@ export async function sendBookingUpdatedEmail({
 
     const subject = `📝 Booking updated (${booking.name}) - shelf.nu`;
 
-    const emailArgs: BasicEmailContentArgs = {
+    // Shared args for every recipient's plain-text body. `prefs` is supplied
+    // per recipient inside the loop, so it is omitted here.
+    const emailArgs: Omit<BasicEmailContentArgs, "prefs"> = {
       bookingName: booking.name,
-      assetsCount: booking._count.assets,
+      assetsCount: booking._count.bookingAssets,
       custodian,
       from: booking.from!,
       to: booking.to!,
       bookingId: booking.id,
-      hints,
       customEmailFooter: booking.organization.customEmailFooter,
     };
-
-    const text = bookingUpdatedEmailContent({ ...emailArgs, changes });
 
     // Resolve all recipients with editor exclusion.
     // The old custodian (if changed) is handled separately below.
@@ -331,13 +365,26 @@ export async function sendBookingUpdatedEmail({
       editorUserId: userId,
     });
 
-    // Send to all resolved recipients
+    // Send to all resolved recipients — the from/to dates and change list are
+    // formatted with each recipient's own resolved prefs. The `changes[]`
+    // strings themselves were built once by the editor upstream (acting-user
+    // compromise), so only the base template dates vary per recipient.
     for (const recipient of recipients) {
+      // Pure resolve from the loaded recipient row; hints as null-field
+      // fallback only. No per-recipient DB fetch (avoids an N+1).
+      const recipientPrefs = resolveFormatPrefs(recipient, hints);
+
+      const text = bookingUpdatedEmailContent({
+        ...emailArgs,
+        prefs: recipientPrefs,
+        changes,
+      });
+
       const html = await bookingUpdatesTemplateString({
         booking,
         heading: `Your booking "${booking.name}" has been updated`,
-        assetCount: booking._count.assets,
-        hints,
+        assetCount: booking._count.bookingAssets,
+        prefs: recipientPrefs,
         changes,
         recipientReason: recipient.reason,
         recipientEmail: recipient.email,
@@ -356,18 +403,37 @@ export async function sendBookingUpdatedEmail({
     if (oldCustodianEmail) {
       const alreadySent = recipients.some((r) => r.email === oldCustodianEmail);
       if (!alreadySent) {
-        // Check the old custodian is not the editor
+        // Check the old custodian is not the editor. The four format-pref
+        // columns are selected alongside `id` so we can resolve their prefs
+        // from this single lookup (already required for the editor check) —
+        // no extra round-trip.
         const oldCustodianUser = await db.user.findUnique({
           where: { email: oldCustodianEmail },
-          select: { id: true },
+          select: {
+            id: true,
+            dateFormat: true,
+            timeFormat: true,
+            weekStart: true,
+            timeZone: true,
+          },
         });
 
         if (!oldCustodianUser || oldCustodianUser.id !== userId) {
+          // Resolve the old custodian's prefs from the row just fetched (or
+          // hints/defaults when they have no user account).
+          const oldCustodianPrefs = resolveFormatPrefs(oldCustodianUser, hints);
+
+          const text = bookingUpdatedEmailContent({
+            ...emailArgs,
+            prefs: oldCustodianPrefs,
+            changes,
+          });
+
           const html = await bookingUpdatesTemplateString({
             booking,
             heading: `Your booking "${booking.name}" has been updated`,
-            assetCount: booking._count.assets,
-            hints,
+            assetCount: booking._count.bookingAssets,
+            prefs: oldCustodianPrefs,
             changes,
             recipientReason: "custodian",
             recipientEmail: oldCustodianEmail,

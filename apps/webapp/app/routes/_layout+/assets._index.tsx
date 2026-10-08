@@ -9,13 +9,13 @@ import { data, useLoaderData } from "react-router";
 import { z } from "zod";
 import { AssetsList } from "~/components/assets/assets-index/assets-list";
 import { ImportButton } from "~/components/assets/import-button";
+import { NewAssetDropdown } from "~/components/assets/new-asset-dropdown";
 import Header from "~/components/layout/header";
-import { Button } from "~/components/shared/button";
 import When from "~/components/when/when";
 import { db } from "~/database/db.server";
 
 import { useAssetIndexViewState } from "~/hooks/use-asset-index-view-state";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
 import {
   advancedModeLoader,
   simpleModeLoader,
@@ -42,6 +42,8 @@ import assetCss from "~/styles/assets.css?url";
 import calendarStyles from "~/styles/layout/calendar.css?url";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
 import { checkExhaustiveSwitch } from "~/utils/check-exhaustive-switch";
+import { getClientHint } from "~/utils/client-hints";
+import { resolveUserFormatPrefsById } from "~/utils/date-format.server";
 
 import { sendNotification } from "~/utils/emitter/send-notification.server";
 import { ShelfError, makeShelfError } from "~/utils/error";
@@ -72,6 +74,7 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
         currentOrganization,
         role,
         canUseBarcodes,
+        access,
       },
       user,
     ] = await Promise.all([
@@ -110,8 +113,8 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
     });
     const mode = settings.mode;
 
-    /** For base and self service users, we dont allow to view the advanced index */
-    if (mode === "ADVANCED" && ["BASE", "SELF_SERVICE"].includes(role)) {
+    /** The advanced index is a per-role capability; switch back if the role lacks it. */
+    if (mode === "ADVANCED" && !access.policy.ui.advancedAssetIndex) {
       await changeMode({
         userId,
         organizationId,
@@ -138,6 +141,8 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
           currentOrganization,
           user,
           settings,
+          canSeeAllCustody: access.custody.seeAll,
+          access,
         })
       : await advancedModeLoader({
           request,
@@ -148,6 +153,8 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
           currentOrganization,
           user,
           settings,
+          canSeeAllCustody: access.custody.seeAll,
+          access,
         });
   } catch (cause) {
     const reason = makeShelfError(cause, { userId });
@@ -207,12 +214,21 @@ export async function action({ context, request }: ActionFunctionArgs) {
             .and(CurrentSearchParamsSchema)
         );
 
+        // Acting user's timezone: when "select all" is active the deletion set
+        // is resolved from the current date filters, which must truncate the
+        // day in the user's tz (avoids an off-by-one for non-UTC users).
+        const { timeZone } = await resolveUserFormatPrefsById(
+          userId,
+          getClientHint(request)
+        );
+
         await bulkDeleteAssets({
           assetIds,
           organizationId,
           userId,
           currentSearchParams,
           settings,
+          timeZone,
         });
 
         sendNotification({
@@ -333,7 +349,7 @@ export const meta: MetaFunction<typeof loader> = ({ data }) => [
 ];
 
 export default function AssetIndexPage() {
-  const { roles } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
   const { canImportAssets } = useLoaderData<typeof loader>();
   const { modeIsAdvanced } = useAssetIndexViewState();
 
@@ -349,14 +365,7 @@ export default function AssetIndexPage() {
         >
           <>
             <ImportButton canImportAssets={canImportAssets} />
-            <Button
-              to="new"
-              role="link"
-              aria-label={`new asset`}
-              data-test-id="createNewAsset"
-            >
-              New asset
-            </Button>
+            <NewAssetDropdown canImportAssets={canImportAssets} />
           </>
         </When>
       </Header>

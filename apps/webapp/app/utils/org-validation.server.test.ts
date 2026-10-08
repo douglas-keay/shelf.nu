@@ -15,13 +15,16 @@
 import { ShelfError } from "./error";
 import {
   assertAssetsBelongToOrg,
-  assertCustomFieldsBelongToOrg,
-  assertTagsBelongToOrg,
-  assertTeamMemberBelongsToOrg,
+  assertAssetKitsBelongToOrg,
+  assertAssetModelBelongsToOrg,
   assertCategoryBelongsToOrg,
+  assertCustomFieldsBelongToOrg,
   assertKitsBelongToOrg,
   assertLocationBelongsToOrg,
   assertLocationsBelongToOrg,
+  assertTagsBelongToOrg,
+  assertTagsAssignableToAssets,
+  assertTeamMemberBelongsToOrg,
   assertUserBelongsToOrg,
 } from "./org-validation.server";
 
@@ -45,6 +48,8 @@ function txWith(overrides: Record<string, any>) {
     kit: { findMany: vitest.fn().mockResolvedValue([]) },
     customField: { findMany: vitest.fn().mockResolvedValue([]) },
     userOrganization: { findFirst: vitest.fn().mockResolvedValue(null) },
+    assetKit: { findMany: vitest.fn().mockResolvedValue([]) },
+    assetModel: { findFirst: vitest.fn().mockResolvedValue(null) },
     ...overrides,
   } as any;
 }
@@ -115,6 +120,166 @@ describe("assertAssetsBelongToOrg", () => {
   });
 });
 
+describe("assertAssetKitsBelongToOrg", () => {
+  it("is a no-op for an empty list (no query issued)", async () => {
+    const tx = txWith({});
+    await expect(
+      assertAssetKitsBelongToOrg({ assetKitIds: [], organizationId: ORG }, tx)
+    ).resolves.toEqual(new Map());
+    expect(tx.assetKit.findMany).not.toHaveBeenCalled();
+  });
+
+  it("resolves when every AssetKit belongs to the org and scopes by organizationId", async () => {
+    const tx = txWith({
+      assetKit: {
+        findMany: vitest.fn().mockResolvedValue([
+          { id: "ak1", kitId: "kit-1" },
+          { id: "ak2", kitId: "kit-2" },
+        ]),
+      },
+    });
+
+    await expect(
+      assertAssetKitsBelongToOrg(
+        { assetKitIds: ["ak1", "ak2"], organizationId: ORG },
+        tx
+      )
+    ).resolves.toEqual(
+      new Map([
+        ["ak1", "kit-1"],
+        ["ak2", "kit-2"],
+      ])
+    );
+
+    expect(tx.assetKit.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ["ak1", "ak2"] }, organizationId: ORG },
+      select: { id: true, kitId: true },
+    });
+  });
+
+  it("returns the owning kit id per AssetKit so callers never trust a client-supplied one", async () => {
+    // `BookingAsset.sourceKitId`'s FK accepts any org's Kit, so the booking
+    // write paths must derive it from THIS map — the same org-scoped query
+    // that validated `assetKitId` — rather than from the request payload.
+    // Two memberships of the SAME kit must both resolve to that kit.
+    const tx = txWith({
+      assetKit: {
+        findMany: vitest.fn().mockResolvedValue([
+          { id: "ak1", kitId: "kit-1" },
+          { id: "ak2", kitId: "kit-1" },
+        ]),
+      },
+    });
+
+    const map = await assertAssetKitsBelongToOrg(
+      { assetKitIds: ["ak1", "ak2"], organizationId: ORG },
+      tx
+    );
+
+    expect(map.get("ak1")).toBe("kit-1");
+    expect(map.get("ak2")).toBe("kit-1");
+  });
+
+  it("dedupes input so duplicate IDs don't inflate the expected count", async () => {
+    const tx = txWith({
+      assetKit: {
+        findMany: vitest
+          .fn()
+          .mockResolvedValue([{ id: "ak1", kitId: "kit-1" }]),
+      },
+    });
+
+    await expect(
+      assertAssetKitsBelongToOrg(
+        { assetKitIds: ["ak1", "ak1"], organizationId: ORG },
+        tx
+      )
+    ).resolves.toEqual(new Map([["ak1", "kit-1"]]));
+
+    expect(tx.assetKit.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ["ak1"] }, organizationId: ORG },
+      select: { id: true, kitId: true },
+    });
+  });
+
+  it("rejects with a 400 ShelfError when any AssetKit id is foreign/missing", async () => {
+    // ak2 belongs to another org → org-scoped findMany returns only ak1
+    const tx = txWith({
+      assetKit: {
+        findMany: vitest
+          .fn()
+          .mockResolvedValue([{ id: "ak1", kitId: "kit-1" }]),
+      },
+    });
+
+    const err = await assertAssetKitsBelongToOrg(
+      { assetKitIds: ["ak1", "ak2"], organizationId: ORG },
+      tx
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ShelfError);
+    expect(err.status).toBe(400);
+  });
+});
+
+describe("assertKitsBelongToOrg", () => {
+  it("is a no-op for an empty list (no query issued)", async () => {
+    const tx = txWith({});
+    await expect(
+      assertKitsBelongToOrg({ kitIds: [], organizationId: ORG }, tx)
+    ).resolves.toBeUndefined();
+    expect(tx.kit.findMany).not.toHaveBeenCalled();
+  });
+
+  it("resolves when every kit belongs to the org and scopes the query by organizationId", async () => {
+    const tx = txWith({
+      kit: {
+        findMany: vitest.fn().mockResolvedValue([{ id: "k1" }, { id: "k2" }]),
+      },
+    });
+
+    await expect(
+      assertKitsBelongToOrg({ kitIds: ["k1", "k2"], organizationId: ORG }, tx)
+    ).resolves.toBeUndefined();
+
+    expect(tx.kit.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ["k1", "k2"] }, organizationId: ORG },
+      select: { id: true },
+    });
+  });
+
+  it("dedupes input so duplicate IDs don't inflate the expected count", async () => {
+    const tx = txWith({
+      kit: { findMany: vitest.fn().mockResolvedValue([{ id: "k1" }]) },
+    });
+
+    await expect(
+      assertKitsBelongToOrg({ kitIds: ["k1", "k1"], organizationId: ORG }, tx)
+    ).resolves.toBeUndefined();
+
+    expect(tx.kit.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ["k1"] }, organizationId: ORG },
+      select: { id: true },
+    });
+  });
+
+  it("rejects with a 400 ShelfError when any ID is foreign/missing", async () => {
+    // k2 belongs to another org → the org-scoped findMany returns only k1
+    const tx = txWith({
+      kit: { findMany: vitest.fn().mockResolvedValue([{ id: "k1" }]) },
+    });
+
+    const err = await assertKitsBelongToOrg(
+      { kitIds: ["k1", "k2"], organizationId: ORG },
+      tx
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ShelfError);
+    expect(err.status).toBe(400);
+    expect(err.title).toBe("Invalid kits");
+  });
+});
+
 describe("assertLocationsBelongToOrg", () => {
   it("is a no-op for an empty list (no query issued)", async () => {
     const tx = txWith({});
@@ -179,64 +344,6 @@ describe("assertLocationsBelongToOrg", () => {
   });
 });
 
-describe("assertKitsBelongToOrg", () => {
-  it("is a no-op for an empty list (no query issued)", async () => {
-    const tx = txWith({});
-    await expect(
-      assertKitsBelongToOrg({ kitIds: [], organizationId: ORG }, tx)
-    ).resolves.toBeUndefined();
-    expect(tx.kit.findMany).not.toHaveBeenCalled();
-  });
-
-  it("resolves when every kit belongs to the org and scopes the query by organizationId", async () => {
-    const tx = txWith({
-      kit: {
-        findMany: vitest.fn().mockResolvedValue([{ id: "k1" }, { id: "k2" }]),
-      },
-    });
-
-    await expect(
-      assertKitsBelongToOrg({ kitIds: ["k1", "k2"], organizationId: ORG }, tx)
-    ).resolves.toBeUndefined();
-
-    expect(tx.kit.findMany).toHaveBeenCalledWith({
-      where: { id: { in: ["k1", "k2"] }, organizationId: ORG },
-      select: { id: true },
-    });
-  });
-
-  it("dedupes input so duplicate IDs don't inflate the expected count", async () => {
-    const tx = txWith({
-      kit: { findMany: vitest.fn().mockResolvedValue([{ id: "k1" }]) },
-    });
-
-    await expect(
-      assertKitsBelongToOrg({ kitIds: ["k1", "k1"], organizationId: ORG }, tx)
-    ).resolves.toBeUndefined();
-
-    expect(tx.kit.findMany).toHaveBeenCalledWith({
-      where: { id: { in: ["k1"] }, organizationId: ORG },
-      select: { id: true },
-    });
-  });
-
-  it("rejects with a 400 ShelfError when any ID is foreign/missing", async () => {
-    // k2 belongs to another org → the org-scoped findMany returns only k1
-    const tx = txWith({
-      kit: { findMany: vitest.fn().mockResolvedValue([{ id: "k1" }]) },
-    });
-
-    const err = await assertKitsBelongToOrg(
-      { kitIds: ["k1", "k2"], organizationId: ORG },
-      tx
-    ).catch((e) => e);
-
-    expect(err).toBeInstanceOf(ShelfError);
-    expect(err.status).toBe(400);
-    expect(err.title).toBe("Invalid kits");
-  });
-});
-
 describe("assertTagsBelongToOrg", () => {
   it("is a no-op for an empty list", async () => {
     const tx = txWith({});
@@ -253,6 +360,56 @@ describe("assertTagsBelongToOrg", () => {
 
     const err = await assertTagsBelongToOrg(
       { tagIds: ["t1"], organizationId: ORG },
+      tx
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ShelfError);
+    expect(err.status).toBe(400);
+    expect(err.title).toBe("Invalid tags");
+  });
+});
+
+describe("assertTagsAssignableToAssets", () => {
+  it("is a no-op for an empty list", async () => {
+    const tx = txWith({});
+    await expect(
+      assertTagsAssignableToAssets({ tagIds: [], organizationId: ORG }, tx)
+    ).resolves.toBeUndefined();
+    expect(tx.tag.findMany).not.toHaveBeenCalled();
+  });
+
+  it("queries org-scoped AND asset-assignable tags (useFor empty or ASSET)", async () => {
+    const tx = txWith({
+      tag: { findMany: vitest.fn().mockResolvedValue([{ id: "t1" }]) },
+    });
+
+    await assertTagsAssignableToAssets(
+      { tagIds: ["t1"], organizationId: ORG },
+      tx
+    );
+
+    // The where clause must constrain BOTH org and the asset-assignable predicate
+    // so a same-org booking-only tag is rejected, not just cross-org ids.
+    expect(tx.tag.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: { in: ["t1"] },
+          organizationId: ORG,
+          OR: [{ useFor: { isEmpty: true } }, { useFor: { has: "ASSET" } }],
+        }),
+      })
+    );
+  });
+
+  it("rejects with a 400 ShelfError when a tag is not asset-assignable/foreign", async () => {
+    // findMany returns fewer rows than requested (the booking-only tag is
+    // filtered out by the useFor predicate) -> mismatch -> throw.
+    const tx = txWith({
+      tag: { findMany: vitest.fn().mockResolvedValue([]) },
+    });
+
+    const err = await assertTagsAssignableToAssets(
+      { tagIds: ["booking-only"], organizationId: ORG },
       tx
     ).catch((e) => e);
 
@@ -404,6 +561,43 @@ describe("single-entity guards reject foreign/missing with 400", () => {
     await expect(
       assertLocationBelongsToOrg({ locationId: "l-1", organizationId: ORG }, tx)
     ).resolves.toBeUndefined();
+  });
+
+  it("assertAssetModelBelongsToOrg throws 404 when foreign/missing", async () => {
+    const tx = txWith({
+      assetModel: { findFirst: vitest.fn().mockResolvedValue(null) },
+    });
+    const err = await assertAssetModelBelongsToOrg(
+      { assetModelId: "am-foreign", organizationId: ORG },
+      tx
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ShelfError);
+    expect(err.status).toBe(404);
+    expect(err.title).toBe("Invalid asset model");
+    expect(tx.assetModel.findFirst).toHaveBeenCalledWith({
+      where: { id: "am-foreign", organizationId: ORG },
+      select: { id: true, name: true },
+    });
+  });
+
+  it("assertAssetModelBelongsToOrg returns the row so callers skip a second read", async () => {
+    const tx = txWith({
+      assetModel: {
+        findFirst: vitest
+          .fn()
+          .mockResolvedValue({ id: "am-1", name: "Panasonic PT-VZ580" }),
+      },
+    });
+
+    // `name` is part of the contract: `bulkUpdateAssetModel` builds its toast
+    // label from this row instead of querying the model a second time.
+    await expect(
+      assertAssetModelBelongsToOrg(
+        { assetModelId: "am-1", organizationId: ORG },
+        tx
+      )
+    ).resolves.toEqual({ id: "am-1", name: "Panasonic PT-VZ580" });
   });
 });
 

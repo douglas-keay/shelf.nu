@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import type { Booking, TeamMember, User } from "@prisma/client";
 import type { useLoaderData } from "react-router";
 import { useCurrentOrganization } from "~/hooks/use-current-organization";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
 import type { KitIndexLoaderData } from "~/routes/_layout+/kits._index";
 import { getStatusClasses, isOneDayEvent } from "~/utils/calendar";
 import { useHints } from "~/utils/client-hints";
@@ -16,7 +16,7 @@ type Items = NonNullable<
 >;
 
 export function useKitAvailabilityData(items: Items) {
-  const { roles } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
   const organization = useCurrentOrganization();
   const canSeeAllCustody = userHasCustodyViewPermission({
     roles,
@@ -33,7 +33,23 @@ export function useKitAvailabilityData(items: Items) {
         mainImage: item.image,
         thumbnailImage: item.imageExpiration,
         status: item.status,
-        availableToBook: item.assets.some((asset) => asset.availableToBook),
+        // Passed through to `resourceLabelContent` so the calendar shows the
+        // same code chip as the list view. The kits loader already carries
+        // these (KITS_INCLUDE_FIELDS); they were simply not forwarded, which
+        // is why the calendar was the one kit surface with no chip despite
+        // having the data. Mirrors use-asset-availability-data.ts.
+        // Kit has no sequentialId / preferredBarcodeId — the resolver treats
+        // both as absent and falls back to the QR id.
+        qrCodes: item.qrCodes ?? [],
+        barcodes: item.barcodes ?? [],
+        // why: match the list view's semantic in kits._index.tsx — a kit is
+        // bookable only when ALL slices are bookable (booking reserves the
+        // whole kit). Undefined assetKits is treated as not-bookable since we
+        // can't verify the slices.
+        availableToBook:
+          item.assetKits == null
+            ? false
+            : !item.assetKits.some((ak) => !ak.asset.availableToBook),
       },
     }));
 
@@ -43,14 +59,38 @@ export function useKitAvailabilityData(items: Items) {
     const allBookings = new Map();
 
     items.forEach((kit) => {
-      kit.assets.forEach((asset) => {
-        if (asset.bookings) {
-          asset.bookings.forEach((booking) => {
-            const key = `${booking.id}-${kit.id}`;
-            if (!allBookings.has(key)) {
-              allBookings.set(key, { ...booking, kitId: kit.id });
-            }
-          });
+      (kit.assetKits ?? []).forEach((ak) => {
+        const asset = ak.asset;
+        if ("bookingAssets" in asset && asset.bookingAssets) {
+          // Cast through `unknown` because the kits._index loader passes
+          // its `extraInclude` shape through a `<T extends Prisma.KitInclude>`
+          // generic that doesn't propagate the deep
+          // `bookingAssets.select.{assetKitId, booking}` selection back to
+          // consumers — TS sees the default BookingAsset scalar shape
+          // which doesn't overlap with the asserted projection. Runtime
+          // shape is correct: loader at kits._index.tsx selects
+          // assetKitId + booking.
+          (
+            asset.bookingAssets as unknown as Array<{
+              assetKitId: string | null;
+              booking: Booking;
+            }>
+          )
+            // Per-kit-slice filter (Codex review #2676 P2): a QT asset
+            // shared between Kit A and Kit B has one BookingAsset row per
+            // kit slice, each tagged with its own assetKitId. Only emit
+            // the slice belonging to THIS outer kit-iteration (ak.id),
+            // so Kit B's calendar doesn't render bookings that actually
+            // reserved Kit A's slice. Standalone slices (assetKitId =
+            // null) are intentionally dropped — they're not kit-specific.
+            .filter((ba) => ba.assetKitId === ak.id)
+            .forEach((ba) => {
+              const booking = ba.booking;
+              const key = `${booking.id}-${kit.id}`;
+              if (!allBookings.has(key)) {
+                allBookings.set(key, { ...booking, kitId: kit.id });
+              }
+            });
         }
       });
     });

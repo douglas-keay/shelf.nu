@@ -1,3 +1,19 @@
+/**
+ * Location Assets
+ *
+ * The asset list on a location's detail page: every asset with a placement at
+ * this location, with the per-location quantity, whether that placement came
+ * from a kit, and who holds the asset.
+ *
+ * Rows come from `getLocation`, which has no `Location.assets` relation to
+ * follow and instead runs a pivot-filtered query and returns the assets
+ * alongside the location. The row type here is written by hand and must be
+ * kept in step with that query's projection.
+ *
+ * @see {@link file://./../../modules/location/service.server.ts} getLocation
+ * @see {@link file://./locations.$locationId.overview.tsx}
+ */
+
 import type {
   Asset,
   BarcodeType,
@@ -10,7 +26,7 @@ import type {
   LoaderFunctionArgs,
   MetaFunction,
 } from "react-router";
-import { data, useLoaderData } from "react-router";
+import { data, useLoaderData, useParams } from "react-router";
 import z from "zod";
 import { AssetCodeBadge } from "~/components/assets/asset-code-badge";
 import { AssetImage } from "~/components/assets/asset-image";
@@ -33,13 +49,25 @@ import { EmptyTableValue } from "~/components/shared/empty-table-value";
 import { GrayBadge } from "~/components/shared/gray-badge";
 import { InfoTooltip } from "~/components/shared/info-tooltip";
 import TextualDivider from "~/components/shared/textual-divider";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "~/components/shared/tooltip";
 import { Td, Th } from "~/components/table";
 import { TeamMemberBadge } from "~/components/user/team-member-badge";
 import When from "~/components/when/when";
 import { useCurrentOrganization } from "~/hooks/use-current-organization";
 import { hasGetAllValue } from "~/hooks/use-model-filters";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { getCustodyFromLocationByPool } from "~/modules/asset/custody-source.server";
+import { isQuantityTracked } from "~/modules/asset/utils";
+import { CurrentSearchParamsSchema } from "~/modules/asset/utils.server";
 import { resolveDisplayCode } from "~/modules/barcode/display";
+import { loadMultiPlacedPoolIds } from "~/modules/booking/checkout-source-location.server";
+import { countUnitsOnBookingsFromLocation } from "~/modules/booking/units-out-by-source.server";
+import { getPrimaryCustody } from "~/modules/custody/utils";
 import { resolveLocationAssetIds } from "~/modules/location/bulk-select.server";
 import {
   getLocation,
@@ -79,7 +107,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
   const { locationId } = getParams(params, paramsSchema);
 
   try {
-    const { organizationId, userOrganizations, canSeeAllCustody } =
+    const { organizationId, userOrganizations, access } =
       await requirePermission({
         request,
         userId,
@@ -100,7 +128,10 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
     const { perPage } = cookie;
 
     const [
-      { location, totalAssetsWithinLocation },
+      // `assets` is returned alongside `location` — there is no direct
+      // Location.assets relation; getLocation runs a separate pivot-filtered
+      // findMany and synthesizes the array here.
+      { location, totalAssetsWithinLocation, assets },
       { teamMembers, totalTeamMembers },
     ] = await Promise.all([
       getLocation({
@@ -122,7 +153,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
           searchParams.has("getAll") &&
           hasGetAllValue(searchParams, "teamMember"),
         // When the user cannot see all custody, only return their own team member
-        filterByUserId: !canSeeAllCustody,
+        filterByUserId: !access.custody.seeAll,
         userId,
       }),
     ]);
@@ -135,6 +166,41 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
     const totalItems = totalAssetsWithinLocation;
     const totalPages = Math.ceil(totalAssetsWithinLocation / perPage);
 
+    /**
+     * For pools placed at two or more locations, how many of this location's
+     * units are out with people ("· 2 in custody"), and how many are out on a
+     * booking having left from here ("· 10 on a booking"). Counts only,
+     * never a name, and neither changes the location's placed count.
+     */
+    const pools = assets.filter((asset) => isQuantityTracked(asset));
+    const [custodyFromHere, onBookingByAssetId] = await Promise.all([
+      getCustodyFromLocationByPool({
+        locationId,
+        organizationId,
+        pools: pools.map((asset) => ({
+          id: asset.id,
+          total: asset.quantity ?? 0,
+        })),
+      }),
+      // Only pools at two or more placements say where booked units came
+      // from; a pool at one location shows nothing new.
+      loadMultiPlacedPoolIds({
+        organizationId,
+        assetIds: pools.map((asset) => asset.id),
+      }).then((multiPlaced) =>
+        countUnitsOnBookingsFromLocation({
+          organizationId,
+          locationId,
+          assetIds: [...multiPlaced],
+        })
+      ),
+    ]);
+    const items = assets.map((asset) => ({
+      ...asset,
+      inCustodyHere: custodyFromHere[asset.id] ?? 0,
+      onBookingFromHere: onBookingByAssetId.get(asset.id) ?? 0,
+    }));
+
     const header: HeaderData = {
       title: `${location.name} - Assets`,
       subHeading: location.id,
@@ -144,7 +210,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       location,
       header,
       modelName,
-      items: location.assets,
+      items,
       page,
       totalItems,
       perPage,
@@ -200,18 +266,23 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       }
 
       case "bulk-remove-assets": {
-        const { assetIds } = parseData(
+        // `currentSearchParams` comes from the submitted form, not `request.url`
+        // — the dialog posts to a bare action URL, so the request carries no
+        // query string and "select all" would match every asset here.
+        const { assetIds, currentSearchParams } = parseData(
           formData,
-          z.object({
-            assetIds: z.array(z.string()).min(1),
-          })
+          z
+            .object({
+              assetIds: z.array(z.string()).min(1),
+            })
+            .and(CurrentSearchParamsSchema)
         );
 
         const resolvedAssetIds = await resolveLocationAssetIds({
           ids: assetIds,
           organizationId,
           locationId,
-          request,
+          currentSearchParams,
         });
 
         if (resolvedAssetIds.length === 0) {
@@ -250,7 +321,7 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
 }
 
 export default function LocationAssets() {
-  const { roles } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
   const { location } = useLoaderData<typeof loader>();
   const userRoleCanManageAssets = userHasPermission({
     roles,
@@ -293,6 +364,8 @@ export default function LocationAssets() {
                       name: "teamMember",
                       queryKey: "name",
                       deletedAt: null,
+                      // A read FILTER — the workspace custody override governs.
+                      custodyPurpose: "custody-filter",
                     }}
                     label="Filter by custodian"
                     placeholder="Search team members"
@@ -384,31 +457,83 @@ const ListAssetContent = ({
   extraProps,
 }: {
   item: Asset & {
+    /** Cover image of the asset's model, rendered when the asset has no
+     * image of its own. See `~/modules/asset/image-resolution`. */
+    assetModel: { image: string | null; thumbnailImage: string | null } | null;
     category: Pick<Category, "id" | "name" | "color"> | null;
     tags?: Tag[];
     location?: Location;
+    /**
+     * The pivot row for the current location, included by `getLocation`'s
+     * `assetLocations: { where: { locationId: id } }` filter. Always
+     * length-1 in this page's data — the row for the location the user
+     * is viewing.
+     */
+    assetLocations: Array<{
+      locationId: string;
+      quantity: number;
+      // Manual-vs-kit-driven discriminator + kit info for the "via kit" badge.
+      assetKitId: string | null;
+      assetKit: { id: string; kit: { id: string; name: string } } | null;
+    }>;
     qrCodes: { id: string }[];
     barcodes: { id: string; type: BarcodeType; value: string }[];
-    custody: {
+    /**
+     * Units of this pool out on an ONGOING or OVERDUE booking that left from
+     * this location (see `countUnitsOnBookingsFromLocation`). 0 for
+     * individual assets and for pools with nothing out from here.
+     */
+    onBookingFromHere?: number;
+    /**
+     * Custody rows for this asset, one per holder — quantity-tracked stock can
+     * be held by several people at once. The list column shows one badge, so
+     * it renders the primary holder via `getPrimaryCustody`.
+     *
+     * Optionality mirrors the schema: a `TeamMember` need not be linked to a
+     * `User` (non-registered members exist), and a linked user's name fields
+     * and avatar are all optional. This projection is written by hand, so the
+     * compiler checks it against nothing — keep it in step with the `custody`
+     * select in `getLocation`.
+     */
+    /**
+     * Units in custody taken from THIS location, for pools with two or more
+     * sources; 0 otherwise. Set by the loader.
+     */
+    inCustodyHere?: number;
+    custody: Array<{
+      quantity: number;
       custodian: {
         id: string;
         name: string;
         user: {
           id: string;
-          firstName: string;
-          lastName: string;
-          profilePicture: string;
+          firstName: string | null;
+          lastName: string | null;
+          displayName: string | null;
+          profilePicture: string | null;
           email: string;
-        };
+        } | null;
       };
-    };
+    }>;
   };
   extraProps: { canReadCustody: boolean; userRoleCanManageAssets: boolean };
 }) => {
   const { category, tags, custody } = item;
+  // The list column shows one badge, so it shows the primary holder — the
+  // same choice `getPrimaryCustody` makes everywhere else custody is
+  // summarised in a single slot.
+  const primaryCustody = getPrimaryCustody(custody);
+  // The location whose detail page we're on — used to pick this asset's
+  // pivot row out of `item.assetLocations`. Mirrors the kit-page
+  // `useParams<{ kitId }>` pattern at `kits.$kitId.assets.tsx:179`.
+  const { locationId } = useParams<{ locationId: string }>();
   const currentOrganization = useCurrentOrganization();
   const displayCode = currentOrganization
-    ? resolveDisplayCode({ entity: item, organization: currentOrganization })
+    ? resolveDisplayCode({
+        entity: item,
+        organization: currentOrganization,
+        entityKind: "asset",
+      })
     : null;
   return (
     <>
@@ -422,6 +547,7 @@ const ListAssetContent = ({
                   mainImage: item.mainImage,
                   thumbnailImage: item.thumbnailImage,
                   mainImageExpiration: item.mainImageExpiration,
+                  assetModel: item.assetModel ?? null,
                 }}
                 alt={`Image of ${item.title}`}
                 className="size-full rounded-[4px] border object-cover"
@@ -439,6 +565,126 @@ const ListAssetContent = ({
                 >
                   {item.title}
                 </Button>
+                {isQuantityTracked(item)
+                  ? (() => {
+                      /**
+                       * Render `· N units at this location` for qty-
+                       * tracked rows. `AssetLocation.quantity` is the
+                       * source of truth — the picker writes it, the
+                       * orthogonal-MAX formula reads it, the DEFERRED
+                       * trigger enforces the sum. Surface the
+                       * location-specific count only; the asset's total
+                       * is irrelevant on the location page. Mirrors
+                       * `kits.$kitId.assets.tsx`'s `· N units in kit`.
+                       *
+                       * An asset can have both a manual row and one
+                       * or more kit-driven rows at the same location,
+                       * so SUM across all rows for this asset at this
+                       * location. Track whether any row is kit-driven
+                       * to surface the "via kit" badge inline.
+                       */
+                      const unit = item.unitOfMeasure || "units";
+                      const rowsAtThisLocation = item.assetLocations.filter(
+                        (al) => al.locationId === locationId
+                      );
+                      const atLocation = rowsAtThisLocation.reduce(
+                        (sum, al) => sum + (al.quantity ?? 0),
+                        0
+                      );
+                      // An asset can have multiple kit-driven rows at
+                      // the same location (one per AssetKit) — see the
+                      // schema comment on `AssetLocation.assetKitId`.
+                      // Dedup by kit id so the badge pluralises
+                      // correctly ("via 2 kits") and the tooltip lists
+                      // every kit + its slice.
+                      const kitRowsByKitId = new Map<
+                        string,
+                        { kit: { id: string; name: string }; quantity: number }
+                      >();
+                      for (const al of rowsAtThisLocation) {
+                        const k = al.assetKit?.kit;
+                        if (!k) continue;
+                        const existing = kitRowsByKitId.get(k.id);
+                        kitRowsByKitId.set(k.id, {
+                          kit: k,
+                          quantity:
+                            (existing?.quantity ?? 0) + (al.quantity ?? 0),
+                        });
+                      }
+                      const kitEntries = Array.from(kitRowsByKitId.values());
+                      return (
+                        <span className="ml-2 inline-flex items-center gap-2 text-xs font-normal text-gray-500">
+                          · {atLocation} {unit} at this location
+                          {item.inCustodyHere
+                            ? ` · ${item.inCustodyHere} in custody`
+                            : null}
+                          {item.onBookingFromHere
+                            ? ` · ${item.onBookingFromHere} on a booking`
+                            : null}
+                          {kitEntries.length > 0 ? (
+                            <TooltipProvider delayDuration={150}>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    to={
+                                      kitEntries.length === 1
+                                        ? `/kits/${kitEntries[0].kit.id}`
+                                        : "#"
+                                    }
+                                    role="link"
+                                    variant="link"
+                                    target={
+                                      kitEntries.length === 1
+                                        ? "_blank"
+                                        : undefined
+                                    }
+                                    className="shrink-0 cursor-help rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 no-underline hover:bg-blue-100 hover:text-blue-800"
+                                    onClick={
+                                      kitEntries.length > 1
+                                        ? (e) => e.preventDefault()
+                                        : undefined
+                                    }
+                                  >
+                                    {kitEntries.length === 1
+                                      ? "via kit"
+                                      : `via ${kitEntries.length} kits`}
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="max-w-xs">
+                                  <p className="text-xs font-semibold text-gray-700">
+                                    {kitEntries.length === 1
+                                      ? kitEntries[0].kit.name
+                                      : "Placed via multiple kits"}
+                                  </p>
+                                  <ul className="mt-1 flex flex-col gap-0.5 text-xs text-gray-500">
+                                    {kitEntries.map((e) => (
+                                      <li key={e.kit.id}>
+                                        {e.kit.name}
+                                        {isQuantityTracked(item) ? (
+                                          <span className="ml-1 tabular-nums">
+                                            ({e.quantity} {unit})
+                                          </span>
+                                        ) : null}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                  <p className="mt-1 text-xs text-gray-500">
+                                    These units are at this location because the
+                                    asset is in {""}
+                                    {kitEntries.length === 1
+                                      ? "this kit"
+                                      : "these kits"}
+                                    . Change the kit&apos;s location to move
+                                    them.
+                                  </p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          ) : null}
+                        </span>
+                      );
+                    })()
+                  : null}
               </span>
               {/*
                 Single metadata line: status first (glanceable color cue),
@@ -449,6 +695,7 @@ const ListAssetContent = ({
                   id={item.id}
                   status={item.status}
                   availableToBook={item.availableToBook}
+                  asset={item}
                 />
                 {displayCode ? <AssetCodeBadge {...displayCode} /> : null}
               </div>
@@ -466,8 +713,8 @@ const ListAssetContent = ({
       {/* Custodian */}
       <When truthy={extraProps.canReadCustody}>
         <Td>
-          {custody?.custodian ? (
-            <TeamMemberBadge teamMember={custody.custodian} />
+          {primaryCustody?.custodian ? (
+            <TeamMemberBadge teamMember={primaryCustody.custodian} />
           ) : (
             <EmptyTableValue />
           )}

@@ -1,11 +1,152 @@
-import { AssetStatus, BookingStatus } from "@prisma/client";
-import type { Asset, Booking, Organization, Prisma } from "@prisma/client";
+import { AssetStatus, AssetType, BookingStatus } from "@prisma/client";
+import type {
+  Asset,
+  Booking,
+  Organization,
+  Prisma,
+  User,
+} from "@prisma/client";
 import { DateTime } from "luxon";
 import { redirect } from "react-router";
 import type { ErrorLabel } from "~/utils/error";
 import { ShelfError } from "~/utils/error";
+import { ALL_SELECTED_KEY } from "~/utils/list";
+import type { RoleAccess } from "~/utils/permissions/role-access";
 
 const label: ErrorLabel = "Booking";
+
+/**
+ * Restricts a bulk booking query to the rows the caller may act on.
+ *
+ * Mirrors `validateBookingOwnership`, the gate the singular write paths
+ * use: a caller whose access does not write every booking may only act on
+ * bookings they created or hold. Read from `access.bookings.writeAll`, not from
+ * booking visibility: the workspace see-toggles show a restricted user every
+ * booking but never grant writing them, so scoping a destructive bulk action by
+ * what the user can SEE would hand them org-wide deletion.
+ *
+ * Team-member custody links are absent, matching `validateBookingOwnership`.
+ *
+ * @param access - The caller's access
+ * @param userId - The caller
+ * @returns An ownership predicate, or `null` when the caller writes every booking
+ * @throws {ShelfError} when a restricted caller has no user to scope to
+ */
+export function getBookingOwnershipScope({
+  access,
+  userId,
+}: {
+  access: RoleAccess;
+  /** Absent for system-initiated calls, which have no acting user */
+  userId?: User["id"];
+}): Prisma.BookingWhereInput | null {
+  if (access.bookings.writeAll) {
+    return null;
+  }
+
+  if (!userId) {
+    // A restricted caller with nobody to scope to. Returning `null` would hand
+    // the caller every booking in the workspace, so fail closed.
+    throw new ShelfError({
+      cause: null,
+      message:
+        "Cannot resolve which bookings this user may act on. Please contact support.",
+      additionalData: { role: access.role },
+      label,
+    });
+  }
+
+  return { OR: [{ creatorId: userId }, { custodianUserId: userId }] };
+}
+
+/**
+ * Builds the complete `where` for a bulk booking action.
+ *
+ * Shared by `bulkDeleteBookings`, `bulkArchiveBookings` and
+ * `bulkCancelBookings` so the three cannot drift — and so the ownership scope
+ * cannot be forgotten on one of them.
+ *
+ * The ownership predicate is AND-ed onto BOTH branches on purpose. Applying it
+ * only to "select all" would still let a restricted caller act on someone
+ * else's booking by posting its id directly.
+ *
+ * @param bookingIds - Explicit ids, or `[ALL_SELECTED_KEY]` for select-all
+ * @param organizationId - The caller's (validated) organization
+ * @param currentSearchParams - The list filters, for the select-all branch
+ * @param access - The caller's access
+ * @param userId - The caller
+ * @returns A `Prisma.BookingWhereInput` scoped to org, filters and ownership
+ */
+export function getBulkBookingsWhereInput({
+  bookingIds,
+  organizationId,
+  currentSearchParams,
+  access,
+  userId,
+}: {
+  bookingIds: Booking["id"][];
+  organizationId: Organization["id"];
+  currentSearchParams?: string | null;
+  access: RoleAccess;
+  /** Absent for system-initiated calls, which have no acting user */
+  userId?: User["id"];
+}): Prisma.BookingWhereInput {
+  const base: Prisma.BookingWhereInput = bookingIds.includes(ALL_SELECTED_KEY)
+    ? getBookingWhereInput({ currentSearchParams, organizationId })
+    : { id: { in: bookingIds }, organizationId };
+
+  const ownership = getBookingOwnershipScope({ access, userId });
+
+  if (!ownership) {
+    return base;
+  }
+
+  // AND rather than a spread: `base` may carry its own OR, and merging the two
+  // would union them — widening a destructive action instead of narrowing it.
+  return { AND: [base, ownership] };
+}
+
+/**
+ * Refuses a bulk action whose explicit selection reaches outside the caller's
+ * own bookings.
+ *
+ * {@link getBulkBookingsWhereInput} already narrows the query to what the
+ * caller may act on, so a foreign id is simply not found. Without this check
+ * the action then succeeds on the rest and reports success for a selection it
+ * partly ignored. Select-all is scoped by its filters and is not checked here.
+ *
+ * @param bookingIds - The submitted ids, or `[ALL_SELECTED_KEY]`
+ * @param foundIds - The ids the scoped query returned
+ * @param access - The caller's access
+ * @param action - Verb for the refusal message ("delete", "archive", ...)
+ * @throws {ShelfError} 403 when an explicitly selected booking was filtered out by ownership
+ */
+export function assertBulkSelectionWithinOwnership({
+  bookingIds,
+  foundIds,
+  access,
+  action,
+}: {
+  bookingIds: Booking["id"][];
+  foundIds: Booking["id"][];
+  access: RoleAccess;
+  action: string;
+}): void {
+  if (access.bookings.writeAll || bookingIds.includes(ALL_SELECTED_KEY)) {
+    return;
+  }
+  const found = new Set(foundIds);
+  if (bookingIds.every((id) => found.has(id))) {
+    return;
+  }
+  throw new ShelfError({
+    cause: null,
+    message: `You can only ${action} bookings you created or hold.`,
+    label,
+    status: 403,
+    shouldBeCaptured: false,
+  });
+}
 
 export function getBookingWhereInput({
   organizationId,
@@ -211,20 +352,106 @@ export function calculateUnitCheckinProgress(
   };
 }
 
-/** One asset's minimal shape for lifecycle bucketing. */
+/**
+ * One asset/row's minimal shape for lifecycle bucketing.
+ *
+ * For INDIVIDUAL assets (the legacy shape) only `id`, `kitId`, and `status` are
+ * needed — the row contributes exactly one unit, bucketed by asset status +
+ * partial-checkin records. Callers that don't supply `assetType` (or that
+ * supply `INDIVIDUAL`) keep the original behavior, preserving backwards
+ * compatibility with the existing test fixtures.
+ *
+ * For QUANTITY_TRACKED rows, the caller MUST provide `bookedQuantity` (B),
+ * `checkedOutQuantity` (C), and `dispositionedQuantity` (D) so the bucket math
+ * can split that single row's `B` units across the three buckets per the
+ * canonical formula:
+ *
+ *   D' = min(D, C)        // defensive clamp — D should never exceed C
+ *   returned   = D'
+ *   checkedOut = max(0, C - D')
+ *   booked     = max(0, B - C)
+ *
+ * For COMPLETE/ARCHIVED bookings, buckets follow the recorded dispatch and
+ * return evidence: rows whose dispatched units are covered by dispositions
+ * read Returned, rows dispatched with no recorded return stay visibly
+ * Checked out (or Partial when only some units came back) — a closed booking
+ * holding unreturned items says so. Only pure legacy data with no records of
+ * any kind keeps the historical collapse-to-Returned.
+ */
 type LifecycleAsset = {
   id: string;
   kitId: string | null;
   status: AssetStatus;
+  /** Type of the underlying asset; defaults to INDIVIDUAL when omitted. */
+  assetType?: AssetType;
+  /** Units booked on this row (BookingAsset.quantity); QT rows only. */
+  bookedQuantity?: number;
+  /**
+   * Units already checked out via PartialBookingCheckout; QT rows only.
+   *
+   * NOT `BookingAsset.checkedOutQuantity`, despite the matching name. This one
+   * is session-derived and counts only what scans recorded, so it reads 0 for a
+   * button checkout; the column is the stored cumulative counter every
+   * dispatch writer maintains. Passing the column here would silently change
+   * what the buckets below mean — feed `dispatchedQuantity` instead, which is
+   * the field that answers "how many units left" without qualification.
+   */
+  checkedOutQuantity?: number;
+  /** Units dispositioned (returned + consumed + lost + damaged); QT rows only. */
+  dispositionedQuantity?: number;
+  /**
+   * Slice dispatch markers (`BookingAsset.checkedOutAt` / `checkedInAt`),
+   * when the caller has the slice rows. These are the per-booking dispatch
+   * truth: the all-at-once checkout stamps them but writes NO
+   * `PartialBookingCheckout` rows, so session-derived inputs alone cannot
+   * tell a button-checked-out row from a never-checked-out one on a booking
+   * that also has scan records. Callers without slice rows omit them
+   * (`undefined`) and the session-based fallbacks apply — pass `undefined`,
+   * not `false`, when marker data is absent, or the legacy collapse for
+   * record-less bookings is disabled.
+   */
+  sliceCheckedOut?: boolean;
+  sliceCheckedIn?: boolean;
+  /**
+   * Units actually dispatched for this row/asset, judged slice by slice
+   * (session-attributed units per slice, else the stamped slice's booked
+   * quantity — `computeDispatchedUnitsByAsset`). QT rows only. When provided
+   * it outranks the `checkedOutQuantity`/`sliceCheckedOut` approximations,
+   * which cannot express an asset mixing button-checked-out and
+   * progressively-scanned slices.
+   *
+   * Those two exist only for callers that cannot supply this one. Once every
+   * caller does, they are redundant and this becomes the single dispatch input
+   * — keep that collapse in mind rather than adding a fourth signal beside
+   * them.
+   */
+  dispatchedQuantity?: number;
 };
 
-/** Result of {@link calculateBookingLifecycleProgress}. */
+/**
+ * Result of {@link calculateBookingLifecycleProgress}.
+ *
+ * The four bucket counts (`bookedCount`, `partialCount`, `checkedOutCount`,
+ * `returnedCount`) are MUTUALLY EXCLUSIVE asset-level (or kit-unit-level)
+ * counts — each asset contributes exactly one count to exactly one bucket.
+ */
 export type BookingLifecycleProgress = {
+  /**
+   * Total ITEMS counted (assets in asset mode; standalone assets + distinct
+   * kits in unit mode). Equals `bookedCount + partialCount + checkedOutCount
+   * + returnedCount`.
+   */
   totalUnits: number;
   bookedCount: number;
+  /**
+   * Items mid-flight — only QUANTITY_TRACKED rows can land here (some units
+   * out or some units returned, but not all). At COMPLETE/ARCHIVED this is
+   * non-zero only for bookings closed while holding partially-returned rows.
+   */
+  partialCount: number;
   checkedOutCount: number;
   returnedCount: number;
-  /** checkedOut + returned — items that have left the Booked bucket. */
+  /** partial + checkedOut + returned — items that have left the Booked bucket. */
   checkoutProgressCount: number;
   checkoutProgressPercentage: number;
   /** returned only. */
@@ -236,26 +463,48 @@ export type BookingLifecycleProgress = {
 };
 
 /**
- * Compute the three lifecycle buckets (Booked / Checked out / Returned) for a
- * booking, backing the segmented progress bar on the booking detail page.
+ * Compute the four lifecycle buckets (Booked / Partial / Checked out /
+ * Returned) for a booking, backing the segmented progress bar on the booking
+ * detail page. Every asset (or kit-unit) contributes exactly ONE count to
+ * exactly ONE bucket — there is no per-row unit splitting.
  *
- * Per-asset bucket (resolution order matters):
- * - **Checked out**: `status === CHECKED_OUT`.
- * - **Returned**: `AVAILABLE` and present in `checkedInAssetIds` (was checked
- *   out, then checked back in).
- * - **Booked**: everything else (reserved, not yet scanned out).
+ * Bucket priority chain (top wins) for a single asset:
+ * 1. **Returned**:
+ *    - INDIVIDUAL: present in `checkedInAssetIds`.
+ *    - QUANTITY_TRACKED: `dispositionedQuantity >= bookedQuantity` (every
+ *      booked unit has been returned/consumed/lost/damaged).
+ * 2. **Checked out** (fully out):
+ *    - INDIVIDUAL: `status === CHECKED_OUT`.
+ *    - QUANTITY_TRACKED: `checkedOutQuantity >= bookedQuantity` AND
+ *      `dispositionedQuantity < bookedQuantity` (every unit out, none back).
+ * 3. **Partial** (QT only — INDIVIDUAL can never land here):
+ *    - QUANTITY_TRACKED with `0 < checkedOutQuantity < bookedQuantity` OR
+ *      `0 < dispositionedQuantity < bookedQuantity` (mid-flight).
+ * 4. **Booked**: anything else (reserved, nothing out yet).
  *
- * In unit mode (`countKitsAsSingleUnit`), each standalone asset is one unit and
- * each distinct kit is one unit that falls into a bucket ONLY when every one of
- * its assets shares that bucket; a kit split across buckets counts as Booked.
+ * In unit mode (`countKitsAsSingleUnit`), each standalone asset is one item
+ * and each distinct kit is one item bucketed by its member labels:
+ * - If ANY member is Partial → the kit is Partial.
+ * - Else if all members share a single label → that label.
+ * - Else (members disagree across Booked/CheckedOut/Returned) → Booked.
  *
- * For COMPLETE/ARCHIVED bookings, live status is no longer meaningful (all
- * assets are AVAILABLE), so a unit is "Returned" only if it was actually
- * checked out (`checkedOutAssetIds`); never-checked-out assets — which only
- * exist when progressive checkout was used — stay in the Booked bucket.
- * Percentages reflect that split rather than being forced to 100%.
+ * For COMPLETE/ARCHIVED bookings, an asset is Returned only when a return is
+ * recorded for it (slice `checkedInAt` / checkin session for INDIVIDUAL,
+ * dispositions covering the dispatched units for QT). Dispatched assets with
+ * no recorded return stay Checked out (or Partial for a QT row with some
+ * units back); never-dispatched rows stay Booked. Pure legacy data — no
+ * slice markers and no session records at all — collapses to Returned as it
+ * historically did.
  *
- * @returns bucket counts, checkout/check-in counts + percentages, and flags.
+ * For pre-checkout bookings (DRAFT/RESERVED/CANCELLED) no checkout has happened
+ * in THIS booking — only ONGOING/OVERDUE own a live checkout — so every unit is
+ * forced into the Booked bucket. This prevents the global asset `status` (which
+ * may be CHECKED_OUT because the asset is out in a DIFFERENT booking — e.g.
+ * after duplicating an ongoing booking, or reserving an asset that's checked out
+ * elsewhere for a future window) from leaking into this booking's progress bar.
+ *
+ * @returns bucket counts (Booked / Partial / CheckedOut / Returned),
+ *   checkout/check-in progress counts + percentages, and convenience flags.
  */
 export function calculateBookingLifecycleProgress({
   bookingAssets,
@@ -282,6 +531,22 @@ export function calculateBookingLifecycleProgress({
   const isFinal =
     bookingStatus === BookingStatus.COMPLETE ||
     bookingStatus === BookingStatus.ARCHIVED;
+  // Only ONGOING/OVERDUE bookings own a live checkout, so only there is an
+  // asset's global `status === CHECKED_OUT` attributable to THIS booking
+  // (conflict detection guarantees an asset can't be live-checked-out in two
+  // overlapping bookings). Every pre-checkout state — DRAFT, RESERVED, CANCELLED
+  // — has never had any of its own assets checked out: progressive checkout's
+  // first scan already flips RESERVED → ONGOING, and a cancelled booking has
+  // released its assets. Their assets may still read CHECKED_OUT because they're
+  // physically out in a DIFFERENT booking (e.g. after duplicating an ongoing
+  // booking into a fresh DRAFT, or reserving an asset for a future window while
+  // it's checked out elsewhere now). Force every unit to Booked so cross-booking
+  // status never leaks into this booking's progress bar. (COMPLETE/ARCHIVED is
+  // handled separately below via `checkedOutAssetIds`, not live status.)
+  const isPreCheckout =
+    bookingStatus === BookingStatus.DRAFT ||
+    bookingStatus === BookingStatus.RESERVED ||
+    bookingStatus === BookingStatus.CANCELLED;
 
   // An asset "was actually checked out" iff it has a checkout record. When no
   // records exist at all (empty array), every asset was checked out.
@@ -289,46 +554,160 @@ export function calculateBookingLifecycleProgress({
   const wasCheckedOut = (id: string) =>
     checkedOutAssetIds.length === 0 || checkedOutSet.has(id);
 
-  // Live-status bucketing for non-final bookings.
-  const bucketOf = (
+  /** Mutually-exclusive bucket label for a single asset (or kit-unit). */
+  type Bucket = "booked" | "partial" | "checkedOut" | "returned";
+
+  /**
+   * INDIVIDUAL-asset bucket label. Only three buckets are reachable — an
+   * individual asset is never `partial` (it is one indivisible unit).
+   */
+  const individualBucketOf = (
     a: LifecycleAsset
-  ): "checkedOut" | "returned" | "booked" => {
+  ): Exclude<Bucket, "partial"> => {
+    if (isFinal) {
+      // Final bookings: a recorded return (slice `checkedInAt`, or a
+      // partial-checkin session) is what makes an asset "Returned". An asset
+      // that went out but has no recorded return stays "Checked out" — a
+      // closed booking holding unreturned items must say so rather than
+      // report them Returned (or, worse, Booked). Never-dispatched assets
+      // stay Booked. With no per-asset records at all (pure all-at-once
+      // legacy data: empty `checkedOutAssetIds`, no sessions, no slice
+      // markers), everything collapses to Returned as before.
+      const reconciled = (a.sliceCheckedIn ?? false) || checkedInSet.has(a.id);
+      if (reconciled) return "returned";
+      // Dispatch truth: the slice marker when the caller supplied it,
+      // otherwise session records with the empty-set-means-all-at-once
+      // convention.
+      const dispatched = a.sliceCheckedOut ?? wasCheckedOut(a.id);
+      if (!dispatched) return "booked";
+      // Dispatched with no recorded return. When per-asset records exist
+      // (slice markers supplied, or session rows present) this is a real
+      // unreturned item and must show as still out. Pure legacy data — no
+      // records of any kind — keeps the old collapse to Returned.
+      const hasPerAssetRecords =
+        a.sliceCheckedOut !== undefined || !wasAllAtOnceCheckout;
+      return hasPerAssetRecords ? "checkedOut" : "returned";
+    }
     if (a.status === AssetStatus.CHECKED_OUT) return "checkedOut";
     if (checkedInSet.has(a.id)) return "returned";
     return "booked";
   };
 
-  // Final (COMPLETE/ARCHIVED) bucketing. Live status is AVAILABLE for every
-  // asset at this point, so it carries no signal — instead, an asset is
-  // "Returned" only if it was ever checked out; never-checked-out assets fall
-  // into "Booked". (CHECKED_OUT live status, if somehow present, is treated as
-  // returned defensively since nothing should still be out at COMPLETE.)
-  const finalBucketOf = (
-    a: LifecycleAsset
-  ): "checkedOut" | "returned" | "booked" =>
-    a.status === AssetStatus.CHECKED_OUT || wasCheckedOut(a.id)
-      ? "returned"
-      : "booked";
+  /**
+   * QUANTITY_TRACKED-asset bucket label. The priority chain on (B, C, D)
+   * collapses one row to one of the four labels — no per-unit splitting.
+   *
+   * - B = bookedQuantity, C = checkedOutQuantity, D = dispositionedQuantity
+   * - Returned:    D >= B (every booked unit accounted for as returned/etc.)
+   * - CheckedOut:  C >= B AND D < B  (every unit out, none returned yet)
+   * - Partial:     0 < C < B  OR  0 < D < B  (mid-flight)
+   * - Booked:      everything else (nothing out, nothing returned)
+   *
+   * At COMPLETE/ARCHIVED, rows where any units were ever checked out collapse
+   * to Returned; rows that were never out stay Booked. Partial and CheckedOut
+   * are unreachable in the final branch by construction.
+   *
+   * QUICK-CHECKOUT CAVEAT: `checkedOutQuantity` (C) is sourced ONLY from
+   * `PartialBookingCheckout` rows (progressive checkout). A quick / all-at-once
+   * checkout writes NO such rows, so C stays 0 even though every booked unit is
+   * physically out. Relying on C alone would mis-bucket such a row as Booked.
+   * The reliable "all-at-once happened" signal is `checkedOutAssetIds` being
+   * EMPTY (its only source is those same records) — a PER-BOOKING signal. We do
+   * NOT use the asset's global `status`: a QUANTITY_TRACKED asset shared across
+   * overlapping bookings can read CHECKED_OUT because of a DIFFERENT booking
+   * (conflict detection only bars INDIVIDUAL assets from overlapping). We also
+   * do NOT use asset-level `wasCheckedOut` for the per-row math — it would
+   * over-mark a never-scanned slice of a multi-slice QT asset once ANY sibling
+   * slice was checked out.
+   */
+  const wasAllAtOnceCheckout = checkedOutAssetIds.length === 0;
+  const qtyBucketOf = (a: LifecycleAsset): Bucket => {
+    const B = Math.max(0, a.bookedQuantity ?? 0);
+    let C = Math.max(0, a.checkedOutQuantity ?? 0);
+    const D = Math.max(0, a.dispositionedQuantity ?? 0);
+    // Quick checkout: a checkout that recorded no per-unit sessions still put
+    // this row's booked units out — signalled by the caller-computed
+    // `dispatchedQuantity` when provided, per row by the slice marker (the
+    // button checkout stamps `checkedOutAt` but writes no session rows), or
+    // booking-wide by the empty-records convention when no slice info was
+    // supplied. Only ever raises C toward the dispatched count, so
+    // progressive partial counts are untouched.
+    if (!isFinal && D === 0 && C < B) {
+      const dispatchedNow =
+        a.dispatchedQuantity !== undefined
+          ? Math.min(a.dispatchedQuantity, B)
+          : a.sliceCheckedOut === true || wasAllAtOnceCheckout
+          ? B
+          : C;
+      if (dispatchedNow > C) C = dispatchedNow;
+    }
+    if (isFinal) {
+      // Dispatched units for this row: the caller-computed per-slice count
+      // when provided; otherwise the session counter when units were
+      // recorded, otherwise the whole row if its slice was stamped (an
+      // all-at-once stamp dispatches the full slice). Never-dispatched rows
+      // stay Booked.
+      const dispatchedUnits =
+        a.dispatchedQuantity !== undefined
+          ? Math.min(a.dispatchedQuantity, B)
+          : C > 0
+          ? Math.min(C, B)
+          : a.sliceCheckedOut === true
+          ? B
+          : 0;
+      if (dispatchedUnits === 0) {
+        // No per-row dispatch evidence. Pure legacy data (no records
+        // anywhere) keeps the old collapse to Returned.
+        return wasAllAtOnceCheckout && a.sliceCheckedOut === undefined
+          ? "returned"
+          : "booked";
+      }
+      // Recorded dispositions covering the dispatch → Returned. Otherwise
+      // the row still holds unreturned dispatched units, and a closed
+      // booking must show them: Partial when some units came back on
+      // record, Checked out when none did.
+      if (D >= dispatchedUnits) return "returned";
+      return D > 0 ? "partial" : "checkedOut";
+    }
+    if (B > 0 && D >= B) return "returned";
+    if (B > 0 && C >= B && D < B) return "checkedOut";
+    if ((C > 0 && C < B) || (D > 0 && D < B)) return "partial";
+    return "booked";
+  };
 
-  const resolveBucket = isFinal ? finalBucketOf : bucketOf;
+  /** Dispatch by asset type to the correct single-label resolver. */
+  const bucketOf = (a: LifecycleAsset): Bucket => {
+    if (a.assetType === AssetType.QUANTITY_TRACKED) return qtyBucketOf(a);
+    return individualBucketOf(a);
+  };
+
+  // Pre-checkout bookings (DRAFT/RESERVED/CANCELLED): force every unit to
+  // Booked, ignoring the global asset status that may belong to another
+  // booking (main fix merged 2026-06-29). Skips main's `: isFinal ?
+  // finalBucketOf : bucketOf` arm because HEAD's `bucketOf` is the QT-aware
+  // dispatcher that already handles the isFinal case inside qtyBucketOf and
+  // individualBucketOf — no separate finalBucketOf is defined here.
+  const resolveBucket = isPreCheckout ? (): "booked" => "booked" : bucketOf;
 
   let booked = 0;
+  let partial = 0;
   let checkedOut = 0;
   let returned = 0;
 
+  /** Increment the running totals from a single bucket label. */
+  const tally = (bucket: Bucket) => {
+    if (bucket === "booked") booked += 1;
+    else if (bucket === "partial") partial += 1;
+    else if (bucket === "checkedOut") checkedOut += 1;
+    else returned += 1;
+  };
+
   if (!countKitsAsSingleUnit) {
-    for (const a of bookingAssets) {
-      const b = resolveBucket(a);
-      if (b === "checkedOut") checkedOut += 1;
-      else if (b === "returned") returned += 1;
-      else booked += 1;
-    }
+    for (const a of bookingAssets) tally(resolveBucket(a));
   } else {
+    // Standalone rows always bucket per-asset (no kit collapse to consider).
     for (const a of bookingAssets.filter((x) => x.kitId === null)) {
-      const b = resolveBucket(a);
-      if (b === "checkedOut") checkedOut += 1;
-      else if (b === "returned") returned += 1;
-      else booked += 1;
+      tally(resolveBucket(a));
     }
     const kitGroups = new Map<string, LifecycleAsset[]>();
     for (const a of bookingAssets) {
@@ -339,30 +718,40 @@ export function calculateBookingLifecycleProgress({
     }
     for (const group of kitGroups.values()) {
       const buckets = new Set(group.map(resolveBucket));
-      if (buckets.size === 1) {
-        const only = [...buckets][0];
-        if (only === "checkedOut") checkedOut += 1;
-        else if (only === "returned") returned += 1;
-        else booked += 1;
-      } else {
-        booked += 1;
+      // Any partial member promotes the whole kit to Partial — a kit with a
+      // mid-flight QT member is itself mid-flight regardless of its peers.
+      if (buckets.has("partial")) {
+        tally("partial");
+        continue;
       }
+      // All members agree → that label collapses for the kit-unit.
+      if (buckets.size === 1) {
+        tally([...buckets][0]);
+        continue;
+      }
+      // Members disagree across the remaining (non-partial) labels → Booked.
+      tally("booked");
     }
   }
 
-  const totalUnits = booked + checkedOut + returned;
+  // `totalUnits` is the number of ITEMS counted (assets in asset mode,
+  // standalone assets + distinct kits in unit mode) — NOT a sum of physical
+  // unit quantities. Each item contributes exactly one count to one bucket.
+  const totalUnits = booked + partial + checkedOut + returned;
 
   if (isFinal) {
-    // No asset is still CHECKED_OUT at COMPLETE — finalBucketOf only yields
-    // "returned" or "booked", so checkedOut is 0 and progress is derived from
-    // the returned/booked split (NOT hard-coded to 100%).
-    const checkoutProgressCount = checkedOut + returned;
+    // At COMPLETE/ARCHIVED most bookings emit only Booked/Returned, but a
+    // booking closed while holding unreturned items keeps those in the
+    // Checked-out/Partial buckets deliberately. Progress is derived from the
+    // actual split — never hard-coded to 100%.
+    const checkoutProgressCount = partial + checkedOut + returned;
     const pctFinal = (n: number) =>
       totalUnits > 0 ? Math.round((n / totalUnits) * 100) : 0;
 
     return {
       totalUnits,
       bookedCount: booked,
+      partialCount: partial,
       checkedOutCount: checkedOut,
       returnedCount: returned,
       checkoutProgressCount,
@@ -375,13 +764,14 @@ export function calculateBookingLifecycleProgress({
     };
   }
 
-  const checkoutProgressCount = checkedOut + returned;
+  const checkoutProgressCount = partial + checkedOut + returned;
   const pct = (n: number) =>
     totalUnits > 0 ? Math.round((n / totalUnits) * 100) : 0;
 
   return {
     totalUnits,
     bookedCount: booked,
+    partialCount: partial,
     checkedOutCount: checkedOut,
     returnedCount: returned,
     checkoutProgressCount,
@@ -406,7 +796,7 @@ export function getBookingStatusRedirect({
 }: {
   bookingId: string;
   booking: Pick<Booking, "id" | "status"> & {
-    assets: Pick<Asset, "status">[];
+    bookingAssets: { asset: Pick<Asset, "status"> }[];
   };
   currentStatusParam: string | null;
   isMainBookingPage: boolean;
@@ -418,8 +808,8 @@ export function getBookingStatusRedirect({
   // Case 1: ONGOING/OVERDUE booking with no status param
   // -> Redirect to CHECKED_OUT if there are assets to show
   if (!currentStatusParam && ["ONGOING", "OVERDUE"].includes(booking.status)) {
-    const hasCheckedOutAssets = booking.assets.some(
-      (asset) => asset.status === AssetStatus.CHECKED_OUT
+    const hasCheckedOutAssets = booking.bookingAssets.some(
+      (ba) => ba.asset.status === AssetStatus.CHECKED_OUT
     );
 
     if (hasCheckedOutAssets) {
@@ -444,8 +834,14 @@ export function getBookingStatusRedirect({
 }
 
 /**
- * Creates standardized booking conflict query conditions for asset.bookings includes
- * This implements Pattern 1 from booking-conflict-queries.md documentation
+ * Creates standardized booking conflict query conditions for the
+ * `asset.bookingAssets` pivot relation. The conditions filter through
+ * `BookingAsset` to the related `Booking`, matching the explicit M2M
+ * schema (`BookingAsset { booking, asset, quantity }`).
+ *
+ * Previously this returned `Prisma.Asset$bookingsArgs` for the implicit
+ * M2M. Now it returns `Prisma.Asset$bookingAssetsArgs` with the booking
+ * conditions nested under `booking: { ... }`.
  */
 export function createBookingConflictConditions({
   currentBookingId,
@@ -457,50 +853,290 @@ export function createBookingConflictConditions({
   fromDate?: Date | string | null;
   toDate?: Date | string | null;
   includeCurrentBooking?: boolean;
-}): Prisma.Asset$bookingsArgs {
+}): Prisma.Asset$bookingAssetsArgs {
+  /** Booking-level where clause for date-overlap & status filtering */
+  const bookingWhere: Prisma.BookingWhereInput =
+    fromDate && toDate
+      ? {
+          OR: [
+            // Rule 1: RESERVED bookings always conflict
+            {
+              status: BookingStatus.RESERVED,
+              ...(includeCurrentBooking
+                ? {}
+                : { id: { not: currentBookingId } }),
+              OR: [
+                {
+                  from: { lte: toDate },
+                  to: { gte: fromDate },
+                },
+                {
+                  from: { gte: fromDate },
+                  to: { lte: toDate },
+                },
+              ],
+            },
+            // Rule 2: ONGOING/OVERDUE bookings (filtered by asset status in helpers)
+            {
+              status: { in: [BookingStatus.ONGOING, BookingStatus.OVERDUE] },
+              ...(includeCurrentBooking
+                ? {}
+                : { id: { not: currentBookingId } }),
+              OR: [
+                {
+                  from: { lte: toDate },
+                  to: { gte: fromDate },
+                },
+                {
+                  from: { gte: fromDate },
+                  to: { lte: toDate },
+                },
+              ],
+            },
+          ],
+        }
+      : {};
+
   return {
     where: {
-      ...(fromDate && toDate
-        ? {
-            OR: [
-              // Rule 1: RESERVED bookings always conflict
-              {
-                status: BookingStatus.RESERVED,
-                ...(includeCurrentBooking
-                  ? {}
-                  : { id: { not: currentBookingId } }),
-                OR: [
-                  {
-                    from: { lte: toDate },
-                    to: { gte: fromDate },
-                  },
-                  {
-                    from: { gte: fromDate },
-                    to: { lte: toDate },
-                  },
-                ],
-              },
-              // Rule 2: ONGOING/OVERDUE bookings (filtered by asset status in helpers)
-              {
-                status: { in: [BookingStatus.ONGOING, BookingStatus.OVERDUE] },
-                ...(includeCurrentBooking
-                  ? {}
-                  : { id: { not: currentBookingId } }),
-                OR: [
-                  {
-                    from: { lte: toDate },
-                    to: { gte: fromDate },
-                  },
-                  {
-                    from: { gte: fromDate },
-                    to: { lte: toDate },
-                  },
-                ],
-              },
-            ],
-          }
-        : {}),
+      booking: bookingWhere,
     },
-    select: { id: true, status: true, name: true },
+    select: {
+      id: true,
+      quantity: true,
+      booking: {
+        select: { id: true, status: true, name: true },
+      },
+    },
   };
+}
+
+/**
+ * Matches a kit-driven slice that is still out on another OVERDUE booking,
+ * whatever that booking's dates.
+ *
+ * An overdue kit has no known return date, so it holds the kit for every
+ * window, not only the one its stale `to` happens to overlap. Date overlap
+ * (`createBookingConflictConditions`) cannot see it once the due date has
+ * passed. Pair this with that window, ORed at the `BookingAsset` level, wherever
+ * a kit's own slices decide whether another booking holds it. Quantity
+ * availability applies the same rule to OVERDUE reservations
+ * (`buildActiveBookingWhere`).
+ *
+ * Scoped to kit-driven slices on purpose: whether an overdue INDIVIDUAL or
+ * standalone asset blocks other bookings is decided by the asset rules.
+ *
+ * @param args.currentBookingId - The booking being judged; its own slices never hold
+ * @param args.organizationId - Scopes the booking; omit where the caller is
+ *   already scoped through an org-scoped parent
+ * @returns A `BookingAssetWhereInput` for still-out overdue kit slices
+ */
+export function stillOutOnOverdueKitSlice({
+  currentBookingId,
+  organizationId,
+}: {
+  currentBookingId: string;
+  organizationId?: string;
+}): Prisma.BookingAssetWhereInput {
+  return {
+    // Kit-driven only. Callers place this directly under an asset's
+    // `bookingAssets`, so without it a member's overdue standalone slice would
+    // reach the asset rules, which stay date-windowed.
+    assetKitId: { not: null },
+    checkedOutAt: { not: null },
+    checkedInAt: null,
+    booking: {
+      ...(organizationId ? { organizationId } : {}),
+      status: BookingStatus.OVERDUE,
+      id: { not: currentBookingId },
+    },
+  };
+}
+
+/**
+ * Normalizes BookingAsset pivot records into a flat asset array
+ * with bonus booking quantity info. Used at the boundary between
+ * the service layer and UI components for backward compatibility.
+ */
+export function normalizeBookingAssets<
+  T extends { asset: Record<string, unknown>; quantity: number; id: string },
+>(bookingAssets: T[]) {
+  return bookingAssets.map((ba) => ({
+    ...ba.asset,
+    bookingQuantity: ba.quantity,
+    bookingAssetId: ba.id,
+  }));
+}
+
+/**
+ * Booking statuses in which the booking is a CLOSED record.
+ *
+ * A closed booking is history: its assets have been returned (COMPLETE), the
+ * reservation was called off (CANCELLED), or it has been filed away
+ * (ARCHIVED). Nothing about it may change afterwards, or the audit trail stops
+ * describing what actually happened.
+ *
+ * This is the same set `canUserRemoveBookingAssets` treats as closed and the
+ * inverse of `ADDABLE_BOOKING_STATUSES` — kept in one place so the server-side
+ * assertions below cannot drift from the client-side affordances.
+ *
+ * @see {@link file://./../../utils/bookings.ts} `canUserRemoveBookingAssets`
+ * @see {@link file://./constants.ts} `ADDABLE_BOOKING_STATUSES`
+ */
+export const CLOSED_BOOKING_STATUSES: BookingStatus[] = [
+  BookingStatus.COMPLETE,
+  BookingStatus.ARCHIVED,
+  BookingStatus.CANCELLED,
+];
+
+/**
+ * Statuses in which a booking is physically in flight — its assets are out
+ * with a custodian right now. Only these can be checked back in.
+ */
+export const IN_FLIGHT_BOOKING_STATUSES: BookingStatus[] = [
+  BookingStatus.ONGOING,
+  BookingStatus.OVERDUE,
+];
+
+/**
+ * Refuses a mutation against a booking that is already closed.
+ *
+ * Call this from the SERVICE layer, inside the same transaction as the write,
+ * reading the status from a row loaded in that transaction. Routes checking
+ * the status themselves is not equivalent, for two reasons:
+ *
+ * 1. A route that forgets is simply unguarded, and a loader's rule only
+ *    decides what to render: a direct POST skips it.
+ * 2. A route that checks before calling the service leaves a window open. The
+ *    four `updateBookingAssets` callers all validated the status, but each did
+ *    so in a read of its own — so a booking completed in between was still
+ *    written to. Reading inside the write's transaction closes that window by
+ *    construction rather than by narrowing it.
+ *
+ * @param status - The booking's current status, read inside the transaction
+ * @param operation - Verb phrase for the message, e.g. "add items to"
+ * @param bookingId - Included in `additionalData` for debugging
+ * @throws {ShelfError} 400 when the booking is COMPLETE, ARCHIVED or CANCELLED
+ */
+export function assertBookingIsOpen({
+  status,
+  operation,
+  bookingId,
+}: {
+  status: BookingStatus;
+  operation: string;
+  bookingId: Booking["id"];
+}): void {
+  if (CLOSED_BOOKING_STATUSES.includes(status)) {
+    throw new ShelfError({
+      cause: null,
+      message: `You cannot ${operation} a booking that is ${status.toLowerCase()}. Completed, archived and cancelled bookings are closed records and can no longer be changed.`,
+      additionalData: { bookingId, status },
+      label,
+      status: 400,
+      // User-input class, not a server fault: a stale tab whose booking was
+      // completed elsewhere lands here legitimately.
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/**
+ * Refuses a check-in against a booking that was never checked out.
+ *
+ * `checkinBooking` writes `status: COMPLETE` unconditionally, so without this
+ * a direct POST against a DRAFT or RESERVED booking marked it COMPLETE while
+ * checking in nothing — the asset filter drops every asset that is not
+ * CHECKED_OUT, which for those statuses is all of them. The result is a
+ * booking that reads as finished but never happened.
+ *
+ * @param status - The booking's current status, read inside the transaction
+ * @param bookingId - Included in `additionalData` for debugging
+ * @throws {ShelfError} 400 unless the booking is ONGOING or OVERDUE
+ */
+export function assertBookingIsCheckinable({
+  status,
+  bookingId,
+}: {
+  status: BookingStatus;
+  bookingId: Booking["id"];
+}): void {
+  if (!IN_FLIGHT_BOOKING_STATUSES.includes(status)) {
+    throw new ShelfError({
+      cause: null,
+      message: `You cannot check in a booking that is ${status.toLowerCase()}. Only ongoing or overdue bookings — the ones whose assets are actually out — can be checked in.`,
+      additionalData: { bookingId, status },
+      label,
+      status: 400,
+      shouldBeCaptured: false,
+    });
+  }
+}
+
+/**
+ * The only capability {@link lockBookingForStatusCheck} needs from a client.
+ *
+ * Structural rather than `any`: the extended Prisma client has no exported
+ * interactive-transaction type, but the helper does not need one — it issues a
+ * single tagged-template raw query. Naming just that keeps the compiler able to
+ * reject anything that is not a query-capable client, which `any` cannot do.
+ *
+ * `unknown[]` for the interpolated values: they are bound as parameters, so
+ * their static types are irrelevant here, and `unknown` does not silently
+ * accept a value the caller meant to narrow.
+ */
+type RawQueryClient = {
+  $queryRaw<T = unknown>(
+    query: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<T>;
+};
+
+/**
+ * Takes a row-level lock on a booking, then returns its status.
+ *
+ * **Must be called inside a `db.$transaction()` interactive transaction**, and
+ * before any write that depends on the booking still being in a given status.
+ *
+ * A plain `SELECT` inside a transaction is NOT enough. Under PostgreSQL's
+ * default READ COMMITTED isolation it takes no lock, so a concurrent check-in,
+ * archive or cancellation can commit between the read and the write and this
+ * transaction still succeeds — mutating a booking that is closed by the time
+ * it commits. Reading inside the transaction narrows that window; only the
+ * lock closes it.
+ *
+ * The predicate is **org-scoped**, matching `lockAssetForQuantityUpdate`: a
+ * caller passing a foreign-org booking id matches zero rows, so it takes no
+ * lock and learns nothing about whether the id exists. Locking on `id` alone
+ * would hand an attacker a cross-tenant lock oracle and a contention vector.
+ *
+ * @param tx - Prisma interactive transaction client
+ * @param bookingId - Booking to lock
+ * @param organizationId - Caller's validated organization; scopes the lock
+ * @returns The locked booking's current status
+ * @throws {ShelfError} 404 when the booking is missing or cross-org
+ * @see {@link file://./../consumption-log/quantity-lock.server.ts} the asset equivalent
+ */
+export async function lockBookingForStatusCheck(
+  tx: RawQueryClient,
+  bookingId: Booking["id"],
+  organizationId: Booking["organizationId"]
+): Promise<BookingStatus> {
+  // `Booking.status` carries no `@map`, so the Prisma field name IS the column
+  // name here — checked against the schema, per the raw-SQL rule.
+  const rows = await tx.$queryRaw<{ status: BookingStatus }[]>`
+    SELECT status FROM "Booking" WHERE id = ${bookingId} AND "organizationId" = ${organizationId} FOR UPDATE
+  `;
+
+  if (!rows || rows.length === 0) {
+    throw new ShelfError({
+      cause: null,
+      message: "Booking not found",
+      additionalData: { bookingId, organizationId },
+      label,
+      status: 404,
+    });
+  }
+
+  return rows[0].status;
 }

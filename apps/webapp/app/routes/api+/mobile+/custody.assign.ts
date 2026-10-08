@@ -6,7 +6,8 @@ import {
   requireOrganizationAccess,
   getMobileUserContext,
 } from "~/modules/api/mobile-auth.server";
-import { bulkAssignCustody } from "~/modules/asset/service.server";
+import { mobileIdSchema } from "~/modules/api/mobile-bulk-ids.server";
+import { bulkCheckOutAssets } from "~/modules/asset/service.server";
 import { getAssetIndexSettings } from "~/modules/asset-index-settings/service.server";
 import { getTeamMember } from "~/modules/team-member/service.server";
 import { makeShelfError, ShelfError } from "~/utils/error";
@@ -19,7 +20,7 @@ import {
  * POST /api/mobile/custody/assign
  *
  * Assigns custody of a single asset to a team member.
- * Uses the same `bulkAssignCustody` service as the webapp to ensure
+ * Uses the same `bulkCheckOutAssets` service as the webapp to ensure
  * consistent behavior (status updates, notes, validation).
  *
  * Body: { assetId: string, custodianId: string }
@@ -41,16 +42,33 @@ export async function action({ request }: ActionFunctionArgs) {
       action: PermissionAction.custody,
     });
 
-    const body = await request.json();
-    const { assetId, custodianId } = z
+    // safeParse, not parse: a raw ZodError reaches `makeShelfError`'s unknown
+    // branch and surfaces as a captured 500. A crafted body is a client error.
+    const parsed = z
       .object({
-        assetId: z.string().min(1),
+        // NOT a bare z.string(): this is wrapped as `assetIds: [assetId]` below
+        // and handed to `bulkCheckOutAssets`, which treats `["all-selected"]`
+        // as "every asset matching the filters" — and mobile sends no filters.
+        assetId: mobileIdSchema("assetId"),
         custodianId: z.string().min(1),
       })
-      .parse(body);
+      .safeParse(await request.json().catch(() => null));
 
-    // Get user context (role + barcode access) for asset index settings
-    const { role, canUseBarcodes } = await getMobileUserContext(
+    if (!parsed.success) {
+      throw new ShelfError({
+        cause: parsed.error,
+        message: "Invalid request body",
+        additionalData: { validationErrors: parsed.error.flatten() },
+        label: "Assets",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const { assetId, custodianId } = parsed.data;
+
+    // Caller's access (effective role, custody scope) and barcode access
+    const { canUseBarcodes, access } = await getMobileUserContext(
       user.id,
       organizationId
     );
@@ -59,7 +77,7 @@ export async function action({ request }: ActionFunctionArgs) {
       userId: user.id,
       organizationId,
       canUseBarcodes,
-      role,
+      role: access.role,
     });
 
     // Validate custodian belongs to the organization
@@ -78,15 +96,24 @@ export async function action({ request }: ActionFunctionArgs) {
       });
     });
 
-    await bulkAssignCustody({
+    await bulkCheckOutAssets({
       userId: user.id,
-      role,
+      custodyAssign: access.custody.assign,
       assetIds: [assetId],
       custodianId,
       custodianName: teamMember.name,
       organizationId,
       currentSearchParams: "",
       settings,
+      /**
+       * Mobile sends no list filters (`currentSearchParams` is empty above), so
+       * this never narrows anything today — the where-builder returns before it
+       * is read. It still tracks the caller's real visibility so the day mobile
+       * starts forwarding filters, a restricted user does not silently gain a
+       * custodian filter. Swap in `scopeCustodianFilterIds` at that point, so
+       * they can still filter by their OWN custody.
+       */
+      allowedTeamMemberIds: access.custody.seeAll ? "all" : [],
     });
 
     return data({ success: true });

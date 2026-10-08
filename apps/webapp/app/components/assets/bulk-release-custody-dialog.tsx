@@ -1,14 +1,31 @@
+import { useAtomValue } from "jotai";
 import { useZorm } from "react-zorm";
 import { z } from "zod";
+import { selectedBulkItemsAtom } from "~/atoms/list";
+import { isQuantityTracked } from "~/modules/asset/utils";
+import { AssetQuantitiesSchema } from "~/utils/asset-quantities-schema";
 import { BulkUpdateDialogContent } from "../bulk-update-dialog/bulk-update-dialog";
 import { Button } from "../shared/button";
+import { WarningBox } from "../shared/warning-box";
 
 export const BulkReleaseCustodySchema = z.object({
   assetIds: z.array(z.string()).min(1),
+  /**
+   * Units per quantity-tracked asset, sent only by the scanner, which shows a
+   * quantity input on each scanned row. This dialog selects rows on the assets
+   * index, where there is nowhere to say how many units come back, so it sends
+   * nothing and those assets keep being skipped.
+   */
+  quantities: AssetQuantitiesSchema,
 });
 
 export default function BulkReleaseCustodyDialog() {
   const zo = useZorm("BulkReleaseCustody", BulkReleaseCustodySchema);
+
+  const selectedItems = useAtomValue(selectedBulkItemsAtom);
+  const quantityTrackedCount = selectedItems.filter((item) =>
+    isQuantityTracked(item)
+  ).length;
 
   return (
     <BulkUpdateDialogContent
@@ -21,6 +38,17 @@ export default function BulkReleaseCustodyDialog() {
     >
       {({ disabled, handleCloseDialog, fetcherError }) => (
         <div className="modal-content-wrapper">
+          {quantityTrackedCount > 0 ? (
+            <div className="mb-4">
+              <WarningBox>
+                <span>
+                  {quantityTrackedCount} quantity-tracked asset(s) in your
+                  selection will be skipped. Quantity-tracked assets must have
+                  custody released individually.
+                </span>
+              </WarningBox>
+            </div>
+          ) : null}
           {fetcherError ? (
             <p className="mb-2 text-sm text-error-500">{fetcherError}</p>
           ) : null}

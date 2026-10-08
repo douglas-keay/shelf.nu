@@ -1,7 +1,34 @@
+/**
+ * Booking Assets Sidebar
+ *
+ * Right-side sheet that lists the concrete `BookingAsset` rows for a
+ * booking (kits + individual assets) along with qty-progress indicators
+ * for partial check-ins.
+ *
+ * The rows are fetched from `/api/bookings/:bookingId/assets-sidebar` when the
+ * sheet OPENS, not shipped with the bookings list. That payload is the
+ * heaviest thing on the five bookings-list routes and most users never expand
+ * a row, so the list ships a count (`booking._count.bookingAssets`) and this
+ * component asks for the rest on demand. Re-opening refetches, so a drawer
+ * reflects check-in/out activity since the last look; the previous payload
+ * stays rendered meanwhile, so there is no spinner flash on a re-open.
+ *
+ * Renders an "Unassigned model reservations" section (Book-by-Model)
+ * above the asset list whenever the booking has outstanding
+ * `BookingModelRequest` rows (quantity > 0). Those come with the list — they
+ * are small, and the drawer trigger needs them to know whether a pure
+ * book-by-model booking has anything worth opening.
+ *
+ * @see {@link file://./../../routes/api+/bookings.$bookingId.assets-sidebar.ts}
+ * @see {@link file://./../../modules/booking/constants.ts} BOOKINGS_LIST_ASSETS_INCLUDE
+ * @see {@link file://./../../modules/booking-model-request/service.server.ts}
+ */
 import React, { useState } from "react";
 import type { ReactNode } from "react";
-import type { Prisma } from "@prisma/client";
+import { AssetStatus } from "@prisma/client";
+import type { BookingStatus, Prisma } from "@prisma/client";
 import { ChevronDownIcon } from "lucide-react";
+import { Link, useFetcher } from "react-router";
 import { Button } from "~/components/shared/button";
 import {
   Sheet,
@@ -10,53 +37,105 @@ import {
   SheetHeader,
   SheetTitle,
 } from "~/components/shared/sheet";
+import { Spinner } from "~/components/shared/spinner";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "~/components/shared/tooltip";
 import { useCurrentOrganization } from "~/hooks/use-current-organization";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { isQuantityTracked } from "~/modules/asset/utils";
 import { resolveDisplayCode } from "~/modules/barcode/display";
+import { resolveQtyStockBadgeVariant } from "~/utils/booking-assets";
+import {
+  canAssignModelUnits,
+  getOutstandingModelRequests,
+} from "~/utils/booking-model-requests";
+import { describeBookingRows } from "~/utils/booking-rows";
+import { canManageBookingItems } from "~/utils/permissions/role-access";
 import { tw } from "~/utils/tw";
+import {
+  InsufficientStockBadge,
+  PendingReturnBadge,
+} from "./availability-label";
+import { BookingModelReservationsSection } from "./booking-model-reservations-section";
 import { AssetCodeBadge } from "../assets/asset-code-badge";
 import { AssetImage } from "../assets/asset-image";
 import { AssetStatusBadge } from "../assets/asset-status-badge";
 import { CategoryBadge } from "../assets/category-badge";
+import { ConsumptionTypeBadge } from "../assets/consumption-type-badge";
 import KitImage from "../kits/kit-image";
 
+/**
+ * Mirror of `BOOKINGS_LIST_ASSETS_INCLUDE` — the shape
+ * `/api/bookings/:bookingId/assets-sidebar` returns. Declared as a
+ * `BookingGetPayload` rather than imported from the server module so this
+ * component stays free of server-only imports.
+ */
 type BookingWithAssets = Prisma.BookingGetPayload<{
   include: {
-    assets: {
+    bookingAssets: {
       select: {
         id: true;
-        title: true;
-        availableToBook: true;
-        custody: true;
-        kitId: true;
-        status: true;
-        mainImage: true;
-        thumbnailImage: true;
-        mainImageExpiration: true;
-        // Code-resolution fields — mirror of getBookings' assets select.
-        // Enables the asset-code chip on every row, matching the booking
-        // overview list and other code-bearing surfaces.
-        sequentialId: true;
-        preferredBarcodeId: true;
-        qrCodes: { take: 1; select: { id: true } };
-        barcodes: { select: { id: true; type: true; value: true } };
-        category: {
+        quantity: true;
+        // Per-row kit-source discriminator so the sidebar can group
+        // rows accurately rather than using `asset.assetKits[0]` as
+        // a fallback.
+        assetKitId: true;
+        asset: {
           select: {
             id: true;
-            name: true;
-            color: true;
-          };
-        };
-        kit: {
-          select: {
-            id: true;
-            name: true;
-            image: true;
-            imageExpiration: true;
+            title: true;
+            type: true;
+            consumptionType: true;
+            availableToBook: true;
+            custody: true;
+            status: true;
+            mainImage: true;
+            thumbnailImage: true;
+            mainImageExpiration: true;
+            // Model cover image for assets with no image of their own.
+            // Type literal, so it mirrors ASSET_MODEL_IMAGE_SELECT by hand.
+            assetModel: { select: { image: true; thumbnailImage: true } };
+            // Code-resolution fields — mirror of getBookings' assets select.
+            // Enables the asset-code chip on every row, matching the booking
+            // overview list and other code-bearing surfaces.
+            sequentialId: true;
+            preferredBarcodeId: true;
+            qrCodes: { take: 1; select: { id: true } };
+            barcodes: { select: { id: true; type: true; value: true } };
             category: {
               select: {
                 id: true;
                 name: true;
                 color: true;
+              };
+            };
+            assetKits: {
+              select: {
+                // `id` lets the sidebar match BookingAsset's
+                // `assetKitId` against the asset's set of memberships
+                // so multi-kit qty-tracked assets surface under the
+                // right kit (or stay standalone when assetKitId IS NULL).
+                id: true;
+                kitId: true;
+                kit: {
+                  select: {
+                    id: true;
+                    name: true;
+                    image: true;
+                    imageExpiration: true;
+                    category: {
+                      select: {
+                        id: true;
+                        name: true;
+                        color: true;
+                      };
+                    };
+                  };
+                };
               };
             };
           };
@@ -66,46 +145,196 @@ type BookingWithAssets = Prisma.BookingGetPayload<{
   };
 }>;
 
-interface BookingAssetsSidebarProps {
-  booking: BookingWithAssets;
-  trigger?: ReactNode;
-}
-
-/** Single asset row inferred from the Prisma payload — preserves the full
- * shape (including `qrCodes`, `barcodes`, etc.) for downstream callers like
- * the AssetCodeBadge resolver. */
-type BookingAsset = BookingWithAssets["assets"][number];
-
-/** The asset's `kit` sub-shape from the include above, narrowed to non-null. */
-type BookingAssetKit = NonNullable<BookingAsset["kit"]>;
-
-/** Discriminated union for the grouped paginated items. Lets the consumer
- * narrow on `item.type` to get `kit` automatically and asset arrays typed. */
-type GroupedItem =
-  | {
-      id: string;
-      type: "kit";
-      assets: BookingAsset[];
-      kit: BookingAssetKit;
-    }
-  | {
-      id: string;
-      type: "asset";
-      assets: BookingAsset[];
-    };
+/** The `bookingAssets` rows the resource route returns. */
+export type SidebarBookingAssets = BookingWithAssets["bookingAssets"];
 
 /**
- * Groups booking assets by kit (kit-grouped item) or by themselves
- * (individual asset item). Preserves the full Prisma payload on each asset
- * so the row renderer has access to code-resolution fields.
+ * Shape of a single `BookingModelRequest` row as consumed by this
+ * sidebar. Matches the `BOOKING_WITH_ASSETS_INCLUDE` model-requests
+ * selector but is declared structurally so callers that load bookings
+ * with a narrower inline include (without `modelRequests`) can still
+ * pass their object through without widening the prop type.
  */
-function groupAssets(assets: BookingWithAssets["assets"]): GroupedItem[] {
-  const itemsMap = new Map<string, GroupedItem>();
-  const individualAssets: BookingAsset[] = [];
+export type SidebarModelRequest = {
+  id: string;
+  assetModelId: string;
+  /** Total reserved units (original intent). Does not decrease on scan. */
+  quantity: number;
+  /** Units already materialised into `BookingAsset` rows via scan. */
+  fulfilledQuantity: number;
+  /** Set when `fulfilledQuantity === quantity`. `null` means outstanding. */
+  fulfilledAt: Date | string | null;
+  assetModel: { id: string; name: string };
+};
 
-  assets.forEach((asset) => {
+/**
+ * Per-asset disposition split used by the qty progress tooltip. Each
+ * field is a cumulative total of ConsumptionLog rows for the
+ * corresponding category for this booking+asset.
+ */
+export type DispositionBreakdown = {
+  returned: number;
+  consumed: number;
+  lost: number;
+  damaged: number;
+};
+
+/**
+ * The payload `/api/bookings/:bookingId/assets-sidebar` returns.
+ *
+ * Declared here rather than inferred from the route module: importing the
+ * route's `typeof loader` would pull a server module into this component's
+ * import graph.
+ */
+type SidebarPayload = {
+  bookingAssets: SidebarBookingAssets;
+  /**
+   * `assetId → dispositionedQuantity` (sum of RETURN + CONSUME + LOSS +
+   * DAMAGE ConsumptionLog rows). Drives the `N / M` qty progress column and
+   * the "Partially checked in" badge for qty-tracked assets with some units
+   * dispositioned but a non-zero remaining.
+   */
+  dispositionedByAsset: Record<string, number>;
+  /**
+   * `assetId → per-category split`, so the tooltip can show Returned /
+   * Consumed / Lost / Damaged separately — lost and damaged units shouldn't
+   * read the same as units back in the pool.
+   */
+  dispositionBreakdownByAsset: Record<string, DispositionBreakdown>;
+  /**
+   * `assetId → checkedOutQuantity` (sum of progressive
+   * PartialBookingCheckout slices across every row of that asset). Drives the
+   * `PARTIALLY_CHECKED_OUT_QTY_PENDING_RETURN` (amber, "partially checked
+   * out, no returns yet") badge, mirroring the per-row treatment on the
+   * booking overview. Aggregated at the asset level because the sidebar
+   * renders one row per asset.
+   *
+   * Multi-slice tie-break: if a multi-slice asset has one slice partly IN
+   * (any disposition) and another still fully OUT, the check-IN signal wins
+   * at this aggregate level — consistent with the existing
+   * `PARTIALLY_CHECKED_OUT_QTY` precedence in this component.
+   */
+  checkedOutByAsset: Record<string, number>;
+  /**
+   * Always `null` on the success path — `payload()` stamps it onto every
+   * response it builds. Modelled explicitly so the discriminant below reads as
+   * the deliberate choice it is: this key is present either way, so it cannot
+   * tell success from failure.
+   */
+  error: null;
+};
+
+/**
+ * Either half of what the resource route can return: `payload()` on success,
+ * `error()` on a 404 / 403 / 500. Only the success half carries
+ * `bookingAssets`, which is what makes it a usable discriminant.
+ */
+type SidebarResponse = SidebarPayload | { error: { message: string } };
+
+interface BookingAssetsSidebarProps {
+  /**
+   * The list row this drawer hangs off. Carries no asset rows — only the
+   * count the trigger shows and the model reservations the trigger gates on.
+   * Everything else arrives from the resource route when the sheet opens.
+   */
+  booking: {
+    id: string;
+    name: string;
+    status: BookingStatus;
+    /** Concrete `BookingAsset` rows, from the list loader's `_count`. */
+    _count: { bookingAssets: number };
+    /**
+     * Outstanding model-level reservations. Optional so a caller that does
+     * not select them can still render the drawer — the "Unassigned model
+     * reservations" section simply doesn't appear.
+     */
+    modelRequests?: SidebarModelRequest[] | null;
+  };
+  trigger?: ReactNode;
+  /**
+   * Optional map of `assetId → { bookable, physicalNow, reserved }` units
+   * available across the workspace pool (after subtracting operator
+   * custody + other-booking reservations + active checkouts elsewhere).
+   * Drives the `InsufficientStockBadge` (RED, `bookedQuantity > bookable`)
+   * and `PendingReturnBadge` (AMBER, not-started booking + `bookedQuantity
+   * > physicalNow` while still `<= bookable`) rendered alongside the
+   * status badge on QT rows — see `resolveQtyStockBadgeVariant`. `reserved`
+   * (units held by OTHER bookings) isn't consumed by this sidebar today —
+   * it's carried through the shared shape for parity with
+   * `list-asset-content.tsx`, which threads it into the "Adjust booked
+   * quantity" dialog's messaging.
+   *
+   * Optional so callers that don't ship the map (e.g. the bookings index
+   * sidebar trigger) keep working — the badge condition short-circuits
+   * when the lookup is `undefined`. INDIVIDUAL assets are never surfaced
+   * regardless (the builder only populates QT entries).
+   */
+  availableUnitsByAsset?: Record<
+    string,
+    { bookable: number; physicalNow: number; reserved: number }
+  >;
+}
+
+/**
+ * Asset enriched with the booked quantity from the BookingAsset pivot,
+ * plus a synthesised singular `kit` / `kitId` derived from the
+ * AssetKit pivot. An asset has at most one kit (enforced by
+ * `@@unique([assetId])` on AssetKit), so `kit`/`kitId` are scalars.
+ */
+type SidebarAssetBase = BookingWithAssets["bookingAssets"][number]["asset"];
+type SidebarAsset = SidebarAssetBase & {
+  bookedQuantity: number;
+  kit: NonNullable<SidebarAssetBase["assetKits"][number]["kit"]> | null;
+  kitId: string | null;
+  /**
+   * Live kit-driven slice (`BookingAsset.assetKitId` set). Its units come
+   * out of the kit's allocation, not the loose pool, so the stock badges
+   * skip it. Read off the pivot row rather than `kitId`, which also stays
+   * null when the membership cannot be resolved for display.
+   */
+  isKitDriven: boolean;
+};
+
+/**
+ * Groups assets by kits and individual assets, similar to the original
+ * pagination structure. Preserves booked quantity from the pivot row.
+ */
+function groupAssets(bookingAssets: BookingWithAssets["bookingAssets"]) {
+  const itemsMap = new Map<
+    string,
+    {
+      id: string;
+      type: "kit" | "asset";
+      assets: SidebarAsset[];
+      kit?: SidebarAsset["kit"];
+    }
+  >();
+  const individualAssets: SidebarAsset[] = [];
+
+  bookingAssets.forEach((ba) => {
+    // Pick the kit by matching `BookingAsset.assetKitId` against the
+    // asset's `assetKits` set (mirror of the same logic in the booking
+    // detail loader). Standalone slices have `ba.assetKitId == null`
+    // and render in the individual bucket regardless of whether the
+    // asset happens to be in any kit.
+    //
+    // why: out of this rule — unlike the booking overview, this surface does
+    // NOT fall back to `BookingAsset.sourceKitId`, so a slice whose asset has
+    // left the kit shows here as a loose asset. `getBookings` feeds this list
+    // through an explicit `select` that omits `sourceKitId`, and there is no
+    // kit lookup on the path — resolving the snapshot would need the select,
+    // both hand-written payload types and a new query, for a compact sidebar.
+    const sourceKit = ba.assetKitId
+      ? ba.asset.assetKits.find((ak) => ak.id === ba.assetKitId)?.kit ?? null
+      : null;
+    const asset: SidebarAsset = {
+      ...ba.asset,
+      bookedQuantity: ba.quantity,
+      kit: sourceKit,
+      kitId: sourceKit?.id ?? null,
+      isKitDriven: ba.assetKitId != null,
+    };
     if (asset.kitId && asset.kit) {
-      // Asset belongs to a kit
       const kitId = asset.kitId;
       const existing = itemsMap.get(kitId);
       if (existing && existing.type === "kit") {
@@ -119,12 +348,10 @@ function groupAssets(assets: BookingWithAssets["assets"]): GroupedItem[] {
         });
       }
     } else {
-      // Individual asset
       individualAssets.push(asset);
     }
   });
 
-  // Add individual assets as separate items
   individualAssets.forEach((asset) => {
     itemsMap.set(`asset-${asset.id}`, {
       id: `asset-${asset.id}`,
@@ -136,17 +363,345 @@ function groupAssets(assets: BookingWithAssets["assets"]): GroupedItem[] {
   return Array.from(itemsMap.values());
 }
 
-export function BookingAssetsSidebar({
-  booking,
-  trigger,
-}: BookingAssetsSidebarProps) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [expandedKits, setExpandedKits] = useState<Record<string, boolean>>({});
+/**
+ * Render the asset title + status stack used by both the standalone
+ * asset rows and the kit-expanded asset rows. Extracted because both
+ * paths share the exact same treatment and we want the qty-progress
+ * tooltip + partial-checkin badge in both places without duplication.
+ */
+function AssetTitleAndStatus({
+  asset,
+  bookingStatus,
+  dispositionedByAsset,
+  dispositionBreakdownByAsset,
+  checkedOutByAsset,
+  availableUnitsByAsset,
+}: {
+  asset: SidebarAsset;
+  bookingStatus: BookingStatus;
+  dispositionedByAsset?: Record<string, number>;
+  dispositionBreakdownByAsset?: Record<string, DispositionBreakdown>;
+  checkedOutByAsset?: Record<string, number>;
+  /**
+   * Per-asset workspace-availability lookup (`{ bookable, physicalNow }`).
+   * Drives the `InsufficientStockBadge` / `PendingReturnBadge` rendered
+   * alongside the status badge for QT rows — see
+   * `resolveQtyStockBadgeVariant`. Optional — missing map short-circuits
+   * the badge condition.
+   */
+  availableUnitsByAsset?: Record<
+    string,
+    { bookable: number; physicalNow: number; reserved: number }
+  >;
+}) {
   // Workspace pref + addon entitlement — resolveDisplayCode short-circuits to
   // QR when the org has lost the barcode add-on, so this read is always safe.
   const currentOrganization = useCurrentOrganization();
+  const displayCode = currentOrganization
+    ? resolveDisplayCode({
+        entity: asset,
+        organization: currentOrganization,
+        entityKind: "asset",
+      })
+    : null;
+  const qtyBooked = asset.bookedQuantity ?? 0;
+  const qtyDispositioned = dispositionedByAsset?.[asset.id] ?? 0;
+  // Total units progressively checked OUT across every slice of this asset
+  // in this booking. Aggregated at the asset level because the sidebar
+  // collapses multi-slice assets into one row.
+  const qtyCheckedOut = checkedOutByAsset?.[asset.id] ?? 0;
+  const qtyRemaining = Math.max(0, qtyBooked - qtyDispositioned);
+  const qtyBreakdown: DispositionBreakdown | undefined =
+    dispositionBreakdownByAsset?.[asset.id];
 
-  const paginatedItems = groupAssets(booking.assets);
+  const isActiveBooking =
+    bookingStatus === "ONGOING" || bookingStatus === "OVERDUE";
+  const isQtyFullyCheckedIn =
+    isQuantityTracked(asset) &&
+    qtyBooked > 0 &&
+    qtyDispositioned >= qtyBooked &&
+    isActiveBooking;
+  const isQtyPartial =
+    isQuantityTracked(asset) &&
+    qtyBooked > 0 &&
+    qtyDispositioned > 0 &&
+    qtyRemaining > 0 &&
+    isActiveBooking;
+  /**
+   * Pending-return signal: units are progressively checked out but
+   * no disposition has been recorded yet. Mirrors the per-row branch
+   * in `list-asset-content.tsx` (`isQtyPartiallyCheckedOut`) but
+   * resolved at the asset level here because the sidebar aggregates
+   * slices. Suppressed once any disposition exists — at that point
+   * `PARTIALLY_CHECKED_OUT_QTY` (violet, "returns underway") wins.
+   */
+  const isQtyPartiallyCheckedOut =
+    isQuantityTracked(asset) &&
+    qtyBooked > 0 &&
+    qtyCheckedOut > 0 &&
+    // Upper guard: ONLY when SOME but not all booked units are out — the
+    // service flips `asset.status = CHECKED_OUT` when all are out, so the
+    // row falls through to the base status (violet "Checked out") instead
+    // of being shadowed by the amber pending-return badge.
+    qtyCheckedOut < qtyBooked &&
+    qtyDispositioned === 0 &&
+    isActiveBooking;
+
+  /**
+   * Sidebar mirrors the booking-row badge precedence:
+   *  1. Fully reconciled → `PARTIALLY_CHECKED_IN` ("Already checked in",
+   *     blue).
+   *  2. Partly reconciled (some disposition, more outstanding) →
+   *     `PARTIALLY_CHECKED_OUT_QTY` (violet, "returns underway").
+   *  3. Progressively checked out, NO returns yet →
+   *     `PARTIALLY_CHECKED_OUT_QTY_PENDING_RETURN` (amber, "action
+   *     required").
+   *  4. Otherwise the asset's raw status, except that `IN_CUSTODY` on a
+   *     quantity-tracked asset reads `AVAILABLE`: custody covers units held
+   *     by a team member outside this booking, so it says nothing about
+   *     the units this booking took. This matches the quantity-tracked
+   *     custody rule in `getBookingContextAssetStatus`, but not its
+   *     DRAFT/RESERVED override to `AVAILABLE`, which the sidebar does not
+   *     apply.
+   *
+   * Order matters: the check-IN branches must win at the aggregate
+   * level so a multi-slice asset with mixed in/out slices reads
+   * "checked in" rather than "still out".
+   */
+  const effectiveStatus = isQtyFullyCheckedIn
+    ? "PARTIALLY_CHECKED_IN"
+    : isQtyPartial
+    ? "PARTIALLY_CHECKED_OUT_QTY"
+    : isQtyPartiallyCheckedOut
+    ? "PARTIALLY_CHECKED_OUT_QTY_PENDING_RETURN"
+    : isQuantityTracked(asset) && asset.status === AssetStatus.IN_CUSTODY
+    ? AssetStatus.AVAILABLE
+    : asset.status;
+
+  /**
+   * Workspace-availability lookup for this row's asset (sidebar version).
+   * `undefined` for INDIVIDUAL assets (the builder only populates QT
+   * entries) or when the caller doesn't ship the map.
+   */
+  const availability = availableUnitsByAsset?.[asset.id];
+
+  /**
+   * Three-state QT stock badge, resolved by the SAME shared decision
+   * helper `list-asset-content.tsx` uses, so this aggregated sidebar row
+   * and the per-slice booking-overview row can never disagree. Gated on
+   * `effectiveStatus` (this component's equivalent of `contextStatus`) so
+   * an asset that's already checked out / fulfilled gets neither badge.
+   */
+  const stockBadgeVariant = resolveQtyStockBadgeVariant({
+    rowQty: qtyBooked,
+    availability,
+    contextStatus: effectiveStatus,
+    bookingStatus,
+    isKitDriven: asset.isKitDriven,
+  });
+
+  return (
+    <div className="min-w-[180px]">
+      <span className="word-break mb-1 block">
+        <Button
+          to={`/assets/${asset.id}`}
+          variant="link"
+          className="text-left font-medium text-gray-900 hover:text-gray-700"
+          target="_blank"
+          onlyNewTabIconOnHover={true}
+        >
+          {asset.title}
+        </Button>
+        {/* Quantity for qty-tracked assets:
+            - `N / M` (disposition over booked) with tooltip when there's
+              been check-in activity (`qtyDispositioned > 0`).
+            - `N / M` (checkedOut over booked) when units are progressively
+              checked out but nothing returned yet — surfaces the
+              "partially out, no returns yet" progress without inventing
+              a third visual.
+            - plain `× N` otherwise (DRAFT/RESERVED rows, fully out + no
+              activity, etc.). */}
+        {isQuantityTracked(asset) && qtyBooked > 0 ? (
+          qtyDispositioned > 0 ? (
+            <TooltipProvider delayDuration={150}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    className={tw(
+                      "ml-1.5 inline-flex cursor-help items-center gap-1 text-xs tabular-nums",
+                      qtyRemaining === 0 ? "text-emerald-700" : "text-gray-700"
+                    )}
+                  >
+                    <span className="font-medium">{qtyDispositioned}</span>
+                    <span className="text-gray-400">/ {qtyBooked}</span>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" align="center" className="max-w-xs">
+                  <div className="flex flex-col gap-1 text-xs">
+                    <div className="font-semibold text-gray-900">
+                      {qtyRemaining === 0
+                        ? "All units checked in"
+                        : "Partially checked in"}
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-gray-600">Booked</span>
+                      <span className="tabular-nums text-gray-900">
+                        {qtyBooked}
+                      </span>
+                    </div>
+                    {/* Per-category split when the loader ships it.
+                        Rows are conditional so ONE_WAY assets don't
+                        show "Returned: 0" and vice versa. */}
+                    {qtyBreakdown ? (
+                      <>
+                        {qtyBreakdown.returned > 0 ? (
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-gray-600">Returned</span>
+                            <span className="tabular-nums text-emerald-700">
+                              {qtyBreakdown.returned}
+                            </span>
+                          </div>
+                        ) : null}
+                        {qtyBreakdown.consumed > 0 ? (
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-gray-600">Consumed</span>
+                            <span className="tabular-nums text-gray-900">
+                              {qtyBreakdown.consumed}
+                            </span>
+                          </div>
+                        ) : null}
+                        {qtyBreakdown.lost > 0 ? (
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-gray-600">Lost</span>
+                            <span className="tabular-nums text-rose-700">
+                              {qtyBreakdown.lost}
+                            </span>
+                          </div>
+                        ) : null}
+                        {qtyBreakdown.damaged > 0 ? (
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-gray-600">Damaged</span>
+                            <span className="tabular-nums text-amber-700">
+                              {qtyBreakdown.damaged}
+                            </span>
+                          </div>
+                        ) : null}
+                      </>
+                    ) : (
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-gray-600">Checked in</span>
+                        <span className="tabular-nums text-gray-900">
+                          {qtyDispositioned}
+                        </span>
+                      </div>
+                    )}
+                    <div className="mt-1 flex items-center justify-between gap-3 border-t border-gray-100 pt-1">
+                      <span className="text-gray-600">Remaining</span>
+                      <span
+                        className={tw(
+                          "tabular-nums",
+                          qtyRemaining === 0
+                            ? "text-gray-400"
+                            : "font-medium text-amber-700"
+                        )}
+                      >
+                        {qtyRemaining}
+                      </span>
+                    </div>
+                  </div>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : qtyCheckedOut > 0 && qtyCheckedOut < qtyBooked ? (
+            // Progressive checkout in flight, no returns yet — show the
+            // out-side progress (`checkedOut / booked`) so the user can
+            // see how far along the row is. Distinct from the
+            // `qtyDispositioned > 0` branch above, which counts what's
+            // already back in.
+            <span className="ml-1.5 inline-flex items-center gap-1 text-xs tabular-nums text-gray-700">
+              <span className="font-medium">{qtyCheckedOut}</span>
+              <span className="text-gray-400">/ {qtyBooked}</span>
+            </span>
+          ) : (
+            <span className="ml-1.5 text-xs font-medium text-gray-500">
+              &times; {qtyBooked}
+            </span>
+          )
+        ) : null}
+      </span>
+      <div className="flex flex-wrap items-center gap-1">
+        <AssetStatusBadge
+          id={asset.id}
+          status={effectiveStatus}
+          availableToBook={asset.availableToBook}
+          asset={asset}
+        />
+        {stockBadgeVariant === "insufficient" ? (
+          <InsufficientStockBadge
+            bookedQuantity={qtyBooked}
+            availableUnits={availability?.bookable ?? 0}
+          />
+        ) : stockBadgeVariant === "pending-return" ? (
+          <PendingReturnBadge
+            bookedQuantity={qtyBooked}
+            physicalUnitsNow={availability?.physicalNow ?? 0}
+          />
+        ) : null}
+        {displayCode ? <AssetCodeBadge {...displayCode} /> : null}
+        <ConsumptionTypeBadge consumptionType={asset.consumptionType ?? null} />
+      </div>
+    </div>
+  );
+}
+
+export function BookingAssetsSidebar({
+  booking,
+  trigger,
+  availableUnitsByAsset,
+}: BookingAssetsSidebarProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [expandedKits, setExpandedKits] = useState<Record<string, boolean>>({});
+
+  /**
+   * The drawer's payload, fetched on open. `fetcher.data` survives the sheet
+   * closing, so a re-open renders the previous rows immediately while the
+   * refetch is in flight rather than flashing a spinner.
+   */
+  const fetcher = useFetcher<SidebarResponse>();
+  /**
+   * Discriminate on the presence of `bookingAssets`, NOT on the absence of an
+   * `error` key. The route's success path goes through `payload()`
+   * (`~/utils/http.server`), which returns `{ error: null, ...data }` — so
+   * `"error" in data` is true for a perfectly good response, and keying off it
+   * puts the drawer in its error state every single time.
+   */
+  const settled =
+    fetcher.data && "bookingAssets" in fetcher.data ? fetcher.data : undefined;
+  const bookingAssets = settled?.bookingAssets;
+  const dispositionedByAsset = settled?.dispositionedByAsset;
+  const dispositionBreakdownByAsset = settled?.dispositionBreakdownByAsset;
+  const checkedOutByAsset = settled?.checkedOutByAsset;
+
+  /**
+   * A settled error has to surface instead of the spinner. The fetch is only
+   * retried on a user action, so without this a failed load (booking deleted
+   * or permission lost since the page rendered) would spin forever.
+   */
+  const hasFetchError = fetcher.state === "idle" && !!fetcher.data && !settled;
+  const isLoadingAssets = !bookingAssets && !hasFetchError;
+
+  const loadSidebarAssets = () => {
+    // Don't stack a second request while one is in flight.
+    if (fetcher.state !== "idle") return;
+    void fetcher.load(`/api/bookings/${booking.id}/assets-sidebar`);
+  };
+
+  const handleOpenChange = (open: boolean) => {
+    setIsOpen(open);
+    if (open) loadSidebarAssets();
+  };
+
+  const paginatedItems = groupAssets(bookingAssets ?? []);
 
   const toggleKitExpansion = (kitId: string) => {
     setExpandedKits((prev) => ({
@@ -155,20 +710,59 @@ export function BookingAssetsSidebar({
     }));
   };
 
-  const hasItems = booking.assets.length > 0;
+  // The drawer is worth opening whenever the booking contains anything
+  // worth showing — concrete assets OR outstanding model-level
+  // reservations. Pure book-by-model bookings legitimately have
+  // zero concrete assets but still carry content.
+  const outstandingModelRequestCount = getOutstandingModelRequests(
+    booking.modelRequests
+  ).length;
+  /**
+   * The list loader's count, not `bookingAssets.length`: it revalidates with
+   * every navigation, while a previously fetched payload can be stale from an
+   * earlier open, and before the first open there is no payload at all.
+   */
+  const assetCount = booking._count.bookingAssets;
+  const hasItems = assetCount > 0 || outstandingModelRequestCount > 0;
+
+  /**
+   * Whether units can still be matched to physical assets on this booking.
+   *
+   * Drives both the section's copy and whether each row links to the scanner,
+   * so the two can never disagree — a row offering "Scan to assign" under a
+   * heading that says the units were never assigned reads as a bug. The
+   * server-side guards in `booking-model-request/service.server` are what
+   * actually enforce it.
+   */
+  const canAssignUnits = canAssignModelUnits(booking.status);
+
+  /**
+   * Whether this member may open the scanner to assign them: the scan page
+   * takes the same add rule as every other add path, so a role that only adds
+   * items to a DRAFT gets no link on a reserved or running booking. A DRAFT is
+   * only ever listed to its creator, so the status rule also settles ownership.
+   */
+  const roleAccess = useRoleAccess();
+  const canScanToAssign =
+    canAssignUnits &&
+    canManageBookingItems({
+      access: roleAccess,
+      bookingStatus: booking.status,
+    });
+
   const defaultTrigger = (
     <Button
       type="button"
       variant="link-gray"
-      onClick={hasItems ? () => setIsOpen(true) : undefined}
+      onClick={hasItems ? () => handleOpenChange(true) : undefined}
       className={!hasItems ? "hover:text-gray cursor-default no-underline" : ""}
     >
-      {booking.assets.length} assets
+      {assetCount} assets
     </Button>
   );
 
   return (
-    <Sheet open={isOpen} onOpenChange={setIsOpen}>
+    <Sheet open={isOpen} onOpenChange={handleOpenChange}>
       {trigger || defaultTrigger}
 
       <SheetContent className="w-full border-l-0 bg-white p-0 md:w-[85vw] md:max-w-[85vw]">
@@ -178,262 +772,282 @@ export function BookingAssetsSidebar({
               Assets in "{booking.name}"
             </SheetTitle>
             <SheetDescription className="text-left">
-              {booking.assets.length}{" "}
-              {booking.assets.length === 1 ? "asset" : "assets"} in this booking
+              {assetCount} {assetCount === 1 ? "asset" : "assets"} in this
+              booking
             </SheetDescription>
           </SheetHeader>
 
           <div className="flex flex-1 flex-col overflow-hidden">
-            {/* Header matching BookingAssetsColumn */}
-            <div className="border border-b-0 bg-white px-4 pb-3 pt-4 text-left font-normal text-gray-600 md:mx-0 md:px-6">
-              <h5 className="text-left capitalize">Assets & kits</h5>
-              <p>
-                <span>{paginatedItems.length} items</span>
-              </p>
-            </div>
+            {/* Same component the booking overview renders, so the two
+                surfaces cannot drift. The drawer is launched from the
+                bookings index and is read-oriented, so its row affordance is
+                a plain scan link rather than the overview's full actions
+                dropdown — presentation identical, capability scoped to the
+                surface. */}
+            <BookingModelReservationsSection
+              modelRequests={booking.modelRequests}
+              canAssign={canAssignUnits}
+              className="rounded-none border-x-0 border-t-0"
+              renderAction={
+                canScanToAssign
+                  ? () => (
+                      <Link
+                        to={`/bookings/${booking.id}/overview/scan-assets`}
+                        className="whitespace-nowrap text-[12px] font-medium text-primary-700 hover:text-primary-800 hover:underline"
+                      >
+                        Scan to assign
+                      </Link>
+                    )
+                  : undefined
+              }
+            />
+            {isLoadingAssets ? (
+              <div
+                className="flex flex-1 items-center justify-center"
+                role="status"
+                aria-live="polite"
+              >
+                <Spinner />
+                <span className="sr-only">Loading assets</span>
+              </div>
+            ) : hasFetchError ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+                <p className="text-gray-600">
+                  We couldn&apos;t load the assets for this booking.
+                </p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={loadSidebarAssets}
+                >
+                  Try again
+                </Button>
+              </div>
+            ) : (
+              <>
+                <div className="border border-b-0 bg-white px-4 pb-3 pt-4 text-left font-normal text-gray-600 md:mx-0 md:px-6">
+                  <h5 className="text-left capitalize">Assets & kits</h5>
+                  <p>
+                    {/* Same helper the booking overview uses. This drawer groups
+                    kits into one row exactly as the overview does, so a bare
+                    "N items" here disagreed with the "N assets" in this very
+                    drawer's own header one line above. */}
+                    <span>{describeBookingRows(paginatedItems)}</span>
+                  </p>
+                </div>
 
-            {/* Table structure matching BookingAssetsColumn */}
-            <div className="flex-1 overflow-auto border border-b-0 border-gray-200 bg-white md:mx-0">
-              <table className="w-full border-collapse">
-                <thead>
-                  <tr className="border-b border-gray-200 text-left ">
-                    <th className="px-6 py-3 font-normal text-gray-600">
-                      Name
-                    </th>
-                    <th className="px-6 py-3"> </th>
-                    <th className="px-6 py-3 font-normal text-gray-600">
-                      Category
-                    </th>
-                    <th className="px-6 py-3"> </th>
-                  </tr>
-                </thead>
-                <tbody className="">
-                  {paginatedItems.map((item) => {
-                    if (item.type === "kit") {
-                      const kit = item.kit;
-                      const isExpanded = expandedKits[item.id] ?? false;
+                <div className="flex-1 overflow-auto border border-b-0 border-gray-200 bg-white md:mx-0">
+                  <table className="w-full border-collapse">
+                    <thead>
+                      <tr className="border-b border-gray-200 text-left ">
+                        <th className="px-6 py-3 font-normal text-gray-600">
+                          Name
+                        </th>
+                        <th className="px-6 py-3"> </th>
+                        <th className="px-6 py-3 font-normal text-gray-600">
+                          Category
+                        </th>
+                        <th className="px-6 py-3"> </th>
+                      </tr>
+                    </thead>
+                    <tbody className="">
+                      {paginatedItems.map((item) => {
+                        if (item.type === "kit") {
+                          const kit = item.kit;
+                          const isExpanded = expandedKits[item.id] ?? false;
 
-                      if (!kit) {
-                        return null;
-                      }
+                          if (!kit) {
+                            return null;
+                          }
 
-                      return (
-                        <React.Fragment key={`kit-${item.id}`}>
-                          {/* Kit Row */}
-                          <tr className="relative border-b border-gray-200 bg-gray-50">
-                            <td className="w-full whitespace-normal p-0 md:p-0">
-                              <div className="flex items-center gap-3 px-6 py-4 md:justify-normal md:pr-6">
-                                <KitImage
-                                  kit={{
-                                    image: kit.image,
-                                    imageExpiration: kit.imageExpiration,
-                                    alt: kit.name,
-                                    kitId: kit.id,
-                                  }}
-                                  className="size-12 rounded-[4px] border object-cover"
-                                />
-                                <div>
-                                  <Button
-                                    to={`/kits/${kit.id}`}
-                                    variant="link"
-                                    className="text-gray-900 hover:text-gray-700"
-                                    target="_blank"
-                                    onlyNewTabIconOnHover={true}
-                                    aria-label="Go to kit"
-                                  >
-                                    <div className="max-w-[200px] truncate sm:max-w-[250px] md:max-w-[350px] lg:max-w-[450px]">
-                                      {kit.name}
+                          return (
+                            <React.Fragment key={`kit-${item.id}`}>
+                              {/* Kit Row */}
+                              <tr className="relative border-b border-gray-200 bg-gray-50">
+                                <td className="w-full whitespace-normal p-0 md:p-0">
+                                  <div className="flex items-center gap-3 px-6 py-4 md:justify-normal md:pr-6">
+                                    <KitImage
+                                      kit={{
+                                        image: kit.image,
+                                        imageExpiration: kit.imageExpiration,
+                                        alt: kit.name,
+                                        kitId: kit.id,
+                                      }}
+                                      className="size-12 rounded-[4px] border object-cover"
+                                    />
+                                    <div>
+                                      <Button
+                                        to={`/kits/${kit.id}`}
+                                        variant="link"
+                                        className="text-gray-900 hover:text-gray-700"
+                                        target="_blank"
+                                        onlyNewTabIconOnHover={true}
+                                        aria-label="Go to kit"
+                                      >
+                                        <div className="max-w-[200px] truncate sm:max-w-[250px] md:max-w-[350px] lg:max-w-[450px]">
+                                          {kit.name}
+                                        </div>
+                                      </Button>
+                                      <p className="text-sm text-gray-600">
+                                        {item.assets.length} assets
+                                      </p>
                                     </div>
-                                  </Button>
-                                  <p className="text-sm text-gray-600">
-                                    {item.assets.length} assets
-                                  </p>
+                                  </div>
+                                </td>
+                                <td className="px-6 py-4"> </td>
+                                <td className="px-6 py-4">
+                                  <CategoryBadge
+                                    category={kit.category}
+                                    className="whitespace-nowrap"
+                                  />
+                                </td>
+                                <td className="px-6 py-4 pr-4 text-right align-middle">
+                                  <div className="flex items-center justify-end gap-5">
+                                    <Button
+                                      type="button"
+                                      onClick={() => toggleKitExpansion(kit.id)}
+                                      variant="link"
+                                      className="text-center font-bold text-gray-600 hover:text-gray-900"
+                                      aria-label="Toggle kit expand"
+                                    >
+                                      <ChevronDownIcon
+                                        className={tw(
+                                          `size-6 ${
+                                            !isExpanded ? "rotate-180" : ""
+                                          }`
+                                        )}
+                                      />
+                                    </Button>
+                                  </div>
+                                </td>
+                              </tr>
+
+                              {/* Kit Assets (when expanded) */}
+                              {isExpanded &&
+                                item.assets.map((asset) => (
+                                  <tr
+                                    key={`kit-asset-${asset.id}`}
+                                    className="relative border-b border-gray-200"
+                                  >
+                                    <td className="w-full whitespace-normal p-0 md:p-0">
+                                      <div className="absolute inset-y-0 left-0 h-full w-2 bg-gray-100" />
+                                      <div className="flex justify-between gap-3 bg-gray-50/50 px-6 py-4 md:justify-normal md:pr-6">
+                                        <div className="flex items-center gap-3">
+                                          <div className="relative flex size-12 shrink-0 items-center justify-center">
+                                            <AssetImage
+                                              asset={{
+                                                id: asset.id,
+                                                mainImage: asset.mainImage,
+                                                thumbnailImage:
+                                                  asset.thumbnailImage,
+                                                mainImageExpiration:
+                                                  asset.mainImageExpiration,
+                                                assetModel:
+                                                  asset.assetModel ?? null,
+                                              }}
+                                              alt={`Image of ${asset.title}`}
+                                              className="size-full rounded-[4px] border border-gray-300 object-cover"
+                                              withPreview
+                                            />
+                                          </div>
+                                          <AssetTitleAndStatus
+                                            asset={asset}
+                                            bookingStatus={booking.status}
+                                            dispositionedByAsset={
+                                              dispositionedByAsset
+                                            }
+                                            dispositionBreakdownByAsset={
+                                              dispositionBreakdownByAsset
+                                            }
+                                            checkedOutByAsset={
+                                              checkedOutByAsset
+                                            }
+                                            availableUnitsByAsset={
+                                              availableUnitsByAsset
+                                            }
+                                          />
+                                        </div>
+                                      </div>
+                                    </td>
+                                    <td className="bg-gray-50/50 px-6 py-4">
+                                      {" "}
+                                    </td>
+                                    <td className="bg-gray-50/50 px-6 py-4">
+                                      <CategoryBadge
+                                        category={asset.category}
+                                        className="whitespace-nowrap"
+                                      />
+                                    </td>
+                                    <td className="bg-gray-50/50 px-6 py-4 pr-4 text-right">
+                                      {" "}
+                                    </td>
+                                  </tr>
+                                ))}
+
+                              <tr className="kit-separator h-1 bg-gray-100">
+                                <td colSpan={4} className="h-1 p-0"></td>
+                              </tr>
+                            </React.Fragment>
+                          );
+                        }
+
+                        // Individual asset
+                        const asset = item.assets[0];
+                        return (
+                          <tr
+                            key={`asset-${asset.id}`}
+                            className="border-b border-gray-200"
+                          >
+                            <td className="w-full whitespace-normal p-0 md:p-0">
+                              <div className="flex justify-between gap-3 px-6 py-4 md:justify-normal md:pr-6">
+                                <div className="flex items-center gap-3">
+                                  <div className="relative flex size-12 shrink-0 items-center justify-center">
+                                    <AssetImage
+                                      asset={{
+                                        id: asset.id,
+                                        mainImage: asset.mainImage,
+                                        thumbnailImage: asset.thumbnailImage,
+                                        mainImageExpiration:
+                                          asset.mainImageExpiration,
+                                        assetModel: asset.assetModel ?? null,
+                                      }}
+                                      alt={`Image of ${asset.title}`}
+                                      className="size-full rounded-[4px] border object-cover"
+                                      withPreview
+                                    />
+                                  </div>
+                                  <AssetTitleAndStatus
+                                    asset={asset}
+                                    bookingStatus={booking.status}
+                                    dispositionedByAsset={dispositionedByAsset}
+                                    dispositionBreakdownByAsset={
+                                      dispositionBreakdownByAsset
+                                    }
+                                    checkedOutByAsset={checkedOutByAsset}
+                                    availableUnitsByAsset={
+                                      availableUnitsByAsset
+                                    }
+                                  />
                                 </div>
                               </div>
                             </td>
                             <td className="px-6 py-4"> </td>
                             <td className="px-6 py-4">
                               <CategoryBadge
-                                category={kit.category}
+                                category={asset.category}
                                 className="whitespace-nowrap"
                               />
                             </td>
-                            <td className="px-6 py-4 pr-4 text-right align-middle">
-                              <div className="flex items-center justify-end gap-5">
-                                <Button
-                                  type="button"
-                                  onClick={() => toggleKitExpansion(kit.id)}
-                                  variant="link"
-                                  className="text-center font-bold text-gray-600 hover:text-gray-900"
-                                  aria-label="Toggle kit expand"
-                                >
-                                  <ChevronDownIcon
-                                    className={tw(
-                                      `size-6 ${
-                                        !isExpanded ? "rotate-180" : ""
-                                      }`
-                                    )}
-                                  />
-                                </Button>
-                              </div>
-                            </td>
+                            <td className="px-6 py-4 pr-4 text-right"> </td>
                           </tr>
-
-                          {/* Kit Assets (when expanded) */}
-                          {isExpanded &&
-                            item.assets.map((asset) => {
-                              const displayCode = currentOrganization
-                                ? resolveDisplayCode({
-                                    entity: asset,
-                                    organization: currentOrganization,
-                                  })
-                                : null;
-                              return (
-                                <tr
-                                  key={`kit-asset-${asset.id}`}
-                                  className="relative border-b border-gray-200"
-                                >
-                                  <td className="w-full whitespace-normal p-0 md:p-0">
-                                    <div className="absolute inset-y-0 left-0 h-full w-2 bg-gray-100" />
-                                    <div className="flex justify-between gap-3 bg-gray-50/50 px-6 py-4 md:justify-normal md:pr-6">
-                                      <div className="flex items-center gap-3">
-                                        <div className="relative flex size-12 shrink-0 items-center justify-center">
-                                          <AssetImage
-                                            asset={{
-                                              id: asset.id,
-                                              mainImage: asset.mainImage,
-                                              thumbnailImage:
-                                                asset.thumbnailImage,
-                                              mainImageExpiration:
-                                                asset.mainImageExpiration,
-                                            }}
-                                            alt={`Image of ${asset.title}`}
-                                            className="size-full rounded-[4px] border border-gray-300 object-cover"
-                                            withPreview
-                                          />
-                                        </div>
-                                        <div className="min-w-[180px]">
-                                          <span className="word-break mb-1 block">
-                                            <Button
-                                              to={`/assets/${asset.id}`}
-                                              variant="link"
-                                              className="text-left font-medium text-gray-900 hover:text-gray-700"
-                                              target="_blank"
-                                              onlyNewTabIconOnHover={true}
-                                            >
-                                              {asset.title}
-                                            </Button>
-                                          </span>
-                                          <div className="flex flex-wrap items-center gap-2">
-                                            <AssetStatusBadge
-                                              id={asset.id}
-                                              status={asset.status}
-                                              availableToBook={
-                                                asset.availableToBook
-                                              }
-                                            />
-                                            {displayCode ? (
-                                              <AssetCodeBadge
-                                                {...displayCode}
-                                              />
-                                            ) : null}
-                                          </div>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </td>
-                                  <td className="bg-gray-50/50 px-6 py-4"> </td>
-                                  <td className="bg-gray-50/50 px-6 py-4">
-                                    <CategoryBadge
-                                      category={asset.category}
-                                      className="whitespace-nowrap"
-                                    />
-                                  </td>
-                                  <td className="bg-gray-50/50 px-6 py-4 pr-4 text-right">
-                                    {" "}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-
-                          {/* Separator row after kit assets */}
-                          <tr className="kit-separator h-1 bg-gray-100">
-                            <td colSpan={4} className="h-1 p-0"></td>
-                          </tr>
-                        </React.Fragment>
-                      );
-                    }
-
-                    // Individual asset
-                    const asset = item.assets[0];
-                    const displayCode = currentOrganization
-                      ? resolveDisplayCode({
-                          entity: asset,
-                          organization: currentOrganization,
-                        })
-                      : null;
-                    return (
-                      <tr
-                        key={`asset-${asset.id}`}
-                        className="border-b border-gray-200"
-                      >
-                        <td className="w-full whitespace-normal p-0 md:p-0">
-                          <div className="flex justify-between gap-3 px-6 py-4 md:justify-normal md:pr-6">
-                            <div className="flex items-center gap-3">
-                              <div className="relative flex size-12 shrink-0 items-center justify-center">
-                                <AssetImage
-                                  asset={{
-                                    id: asset.id,
-                                    mainImage: asset.mainImage,
-                                    thumbnailImage: asset.thumbnailImage,
-                                    mainImageExpiration:
-                                      asset.mainImageExpiration,
-                                  }}
-                                  alt={`Image of ${asset.title}`}
-                                  className="size-full rounded-[4px] border object-cover"
-                                  withPreview
-                                />
-                              </div>
-                              <div className="min-w-[180px]">
-                                <span className="word-break mb-1 block">
-                                  <Button
-                                    to={`/assets/${asset.id}`}
-                                    variant="link"
-                                    className="text-left font-medium text-gray-900 hover:text-gray-700"
-                                    target="_blank"
-                                    onlyNewTabIconOnHover={true}
-                                  >
-                                    {asset.title}
-                                  </Button>
-                                </span>
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <AssetStatusBadge
-                                    id={asset.id}
-                                    status={asset.status}
-                                    availableToBook={asset.availableToBook}
-                                  />
-                                  {displayCode ? (
-                                    <AssetCodeBadge {...displayCode} />
-                                  ) : null}
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        </td>
-                        <td className="px-6 py-4"> </td>
-                        <td className="px-6 py-4">
-                          <CategoryBadge
-                            category={asset.category}
-                            className="whitespace-nowrap"
-                          />
-                        </td>
-                        <td className="px-6 py-4 pr-4 text-right"> </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </SheetContent>

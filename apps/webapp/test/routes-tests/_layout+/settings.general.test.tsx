@@ -1,10 +1,12 @@
 import { Currency, OrganizationRoles, OrganizationType } from "@prisma/client";
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { accessFor } from "@helpers/role-access";
 import { createLoaderArgs, createActionArgs } from "@mocks/remix";
 
 import { db } from "~/database/db.server";
 import {
   getOrganizationAdmins,
+  transferOwnership,
   updateOrganization,
 } from "~/modules/organization/service.server";
 import { getOrganizationTierLimit } from "~/modules/tier/service.server";
@@ -125,10 +127,8 @@ describe("settings.general loader", () => {
       organizations: [baseOrganization()],
       currentOrganization: baseOrganization(),
       role: OrganizationRoles.OWNER,
-      isSelfServiceOrBase: false,
+      access: accessFor([OrganizationRoles.OWNER]),
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -195,10 +195,8 @@ describe("settings.general loader", () => {
       organizations: [personalOrg],
       currentOrganization: personalOrg,
       role: OrganizationRoles.OWNER,
-      isSelfServiceOrBase: false,
+      access: accessFor([OrganizationRoles.OWNER]),
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -235,10 +233,8 @@ describe("settings.general loader", () => {
       organizations: [personalOrg],
       currentOrganization: personalOrg,
       role: OrganizationRoles.OWNER,
-      isSelfServiceOrBase: false,
+      access: accessFor([OrganizationRoles.OWNER]),
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -297,11 +293,9 @@ describe("settings.general action", () => {
       organizationId: "org-1",
       currentOrganization: baseOrganization(),
       role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
       organizations: [baseOrganization()],
-      isSelfServiceOrBase: false,
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -408,11 +402,9 @@ describe("settings.general action", () => {
       organizationId: "org-1",
       currentOrganization: orgWithBrandingOff,
       role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
       organizations: [orgWithBrandingOff],
-      isSelfServiceOrBase: false,
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -463,11 +455,9 @@ describe("settings.general action", () => {
       organizationId: "org-1",
       currentOrganization: personalOrg,
       role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
       organizations: [personalOrg],
-      isSelfServiceOrBase: false,
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -521,11 +511,9 @@ describe("settings.general action", () => {
       organizationId: "org-1",
       currentOrganization: personalOrg,
       role: OrganizationRoles.OWNER,
+      access: accessFor([OrganizationRoles.OWNER]),
       organizations: [personalOrg],
-      isSelfServiceOrBase: false,
       userOrganizations: [],
-      canSeeAllBookings: true,
-      canSeeAllCustody: true,
       canUseBarcodes: false,
     } as any);
 
@@ -567,5 +555,139 @@ describe("settings.general action", () => {
     expect(updateOrganizationMock).toHaveBeenCalledWith(
       expect.objectContaining({ showShelfBranding: false })
     );
+  });
+});
+
+describe("settings.general transfer-ownership authorization", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    getOrganizationTierLimitMock.mockResolvedValue({
+      id: "tier_2",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      canImportAssets: true,
+      canExportAssets: true,
+      canImportNRM: true,
+      canHideShelfBranding: true,
+      maxCustomFields: 0,
+      maxOrganizations: 1,
+    } as any);
+    canHideShelfBrandingMock.mockReturnValue(true);
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({ tierId: "tier_2" });
+  });
+
+  /** Builds the POST body an attacker would hand-craft */
+  function transferRequest() {
+    const body = new URLSearchParams();
+    body.append("intent", "transfer-ownership");
+    body.append("newOwner", "user-2");
+    body.append("agreeConditions", "on");
+
+    return new Request("http://localhost/settings/general", {
+      method: "POST",
+      body,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+  }
+
+  function mockRole(role: OrganizationRoles) {
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: baseOrganization(),
+      role,
+      access: accessFor([role]),
+      organizations: [baseOrganization()],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+  }
+
+  it("rejects a direct POST from a workspace ADMIN", async () => {
+    // ADMIN passes requirePermission — ADMIN and OWNER share every permission —
+    // so only the explicit role check in the action can stop this.
+    mockRole(OrganizationRoles.ADMIN);
+
+    const response = (await action(
+      createActionArgs({
+        context: mockContext,
+        request: transferRequest(),
+        params: {},
+      })
+      // The action funnels thrown ShelfErrors through `data(error(reason), {
+      // status })`, which returns a DataWithResponseInit rather than a Response.
+    )) as { init?: { status?: number } };
+
+    expect(response.init?.status).toBe(403);
+    expect(transferOwnership).not.toHaveBeenCalled();
+  });
+
+  it("allows the OWNER to transfer ownership", async () => {
+    mockRole(OrganizationRoles.OWNER);
+    vi.mocked(transferOwnership).mockResolvedValue({
+      newOwner: { id: "user-2", email: "new@example.com" },
+    } as any);
+
+    await action(
+      createActionArgs({
+        context: mockContext,
+        request: transferRequest(),
+        params: {},
+      })
+    );
+
+    expect(transferOwnership).toHaveBeenCalledWith(
+      expect.objectContaining({ newOwnerId: "user-2" })
+    );
+  });
+});
+
+describe("settings.general SSO settings refusals", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbMock.user.findUniqueOrThrow.mockResolvedValue({ tierId: "tier_2" });
+  });
+
+  /** Posts the SSO group-mapping form as the given role. */
+  async function postSso(role: OrganizationRoles) {
+    requirePermissionMock.mockResolvedValue({
+      organizationId: "org-1",
+      currentOrganization: baseOrganization(),
+      role,
+      access: accessFor([role]),
+      organizations: [baseOrganization()],
+      userOrganizations: [],
+      canUseBarcodes: false,
+    } as any);
+
+    const body = new URLSearchParams({
+      intent: "sso",
+      id: "sso-1",
+      adminGroupId: "grp-admin",
+    });
+
+    return (await action(
+      createActionArgs({
+        context: mockContext,
+        request: new Request("http://localhost/settings/general", {
+          method: "POST",
+          body,
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        }),
+        params: {},
+      })
+    )) as { init?: { status?: number } };
+  }
+
+  it("answers an ADMIN with 403: only the owner edits SSO settings", async () => {
+    const response = await postSso(OrganizationRoles.ADMIN);
+
+    expect(response.init?.status).toBe(403);
+  });
+
+  it("answers the OWNER of a workspace without SSO with 400", async () => {
+    const response = await postSso(OrganizationRoles.OWNER);
+
+    expect(response.init?.status).toBe(400);
   });
 });

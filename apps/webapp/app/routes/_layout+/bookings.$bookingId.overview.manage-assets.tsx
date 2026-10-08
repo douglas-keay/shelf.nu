@@ -1,4 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+/**
+ * Booking "Add assets" picker: `/bookings/:bookingId/overview/manage-assets`.
+ *
+ * The loader lists the workspace's assets for the picker (paginated and
+ * filterable) with each row's fitness for THIS booking: kit membership that
+ * blocks a direct add, overlap with other bookings, and the windowed
+ * free-unit count for quantity-tracked assets. The action writes the
+ * selection to the booking through `updateBookingAssets`, which owns the
+ * conflict and quantity guards. Also exports `AssetWithBooking`, the row
+ * shape the booking overview list renders.
+ */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   Asset,
   BarcodeType,
@@ -8,7 +19,7 @@ import type {
   Prisma,
   Tag,
 } from "@prisma/client";
-import { AssetStatus, BookingStatus } from "@prisma/client";
+import { AssetStatus, AssetType, BookingStatus } from "@prisma/client";
 import { useAtomValue, useSetAtom } from "jotai";
 import type {
   ActionFunctionArgs,
@@ -18,6 +29,7 @@ import type {
 import {
   data,
   redirect,
+  useActionData,
   useLoaderData,
   useNavigate,
   useNavigation,
@@ -30,15 +42,18 @@ import {
   selectedBulkItemsCountAtom,
   setDisabledBulkItemsAtom,
   setSelectedBulkItemAtom,
-  setSelectedBulkItemsAtom,
+  seedFormSelectionAtom,
 } from "~/atoms/list";
 import { AssetCodeBadge } from "~/components/assets/asset-code-badge";
 import { AssetImage } from "~/components/assets/asset-image/component";
 import { AssetStatusBadge } from "~/components/assets/asset-status-badge";
 import { ListItemTagsColumn } from "~/components/assets/assets-index/list-item-tags-column";
 import { CategoryBadge } from "~/components/assets/category-badge";
+import { ConsumptionTypeBadge } from "~/components/assets/consumption-type-badge";
 import { AvailabilityLabel } from "~/components/booking/availability-label";
 import { AvailabilitySelect } from "~/components/booking/availability-select";
+import { ManageModelRequests } from "~/components/booking/manage-model-requests";
+import { assetIdsBlockedByModelHeadroom } from "~/components/booking/model-headroom";
 import { StatusFilter } from "~/components/booking/status-filter";
 import styles from "~/components/booking/styles.css?url";
 import { Form } from "~/components/custom-form";
@@ -49,6 +64,7 @@ import { List } from "~/components/list";
 import { Filters } from "~/components/list/filters";
 import type { ListItemData } from "~/components/list/list-item";
 import { LocationBadge } from "~/components/location/location-badge";
+import { Badge } from "~/components/shared/badge";
 import { Button } from "~/components/shared/button";
 import { GrayBadge } from "~/components/shared/gray-badge";
 
@@ -61,27 +77,42 @@ import {
 import { Td, Th } from "~/components/table";
 import UnsavedChangesAlert from "~/components/unsaved-changes-alert";
 
-import When from "~/components/when/when";
 import { db } from "~/database/db.server";
+import { useSearchParams } from "~/hooks/search-params";
 import { useCurrentOrganization } from "~/hooks/use-current-organization";
+import { getAssetAvailabilityBatch } from "~/modules/asset/availability.server";
 import { LOCATION_WITH_HIERARCHY } from "~/modules/asset/fields";
 import { getPaginatedAndFilterableAssets } from "~/modules/asset/service.server";
 import type { AssetsFromViewItem } from "~/modules/asset/types";
+import { isQuantityTracked } from "~/modules/asset/utils";
 import { getAssetsWhereInput } from "~/modules/asset/utils.server";
 import { resolveDisplayCode } from "~/modules/barcode/display";
 import { sendBookingUpdatedEmail } from "~/modules/booking/email-helpers";
+import { buildAddToActiveBookingBlockerWhere } from "~/modules/booking/helpers";
 import {
   getBooking,
   getDetailedPartialCheckinData,
-  getKitIdsByAssets,
+  getKitIdsByBookingSlices,
   removeAssets,
   updateBookingAssets,
 } from "~/modules/booking/service.server";
+import {
+  findModelsReservedByOtherBookings,
+  getAssetModelAvailability,
+  getBookingModelTabData,
+  readOwnNamedUnits,
+} from "~/modules/booking-model-request/service.server";
+import { createSystemBookingNote } from "~/modules/booking-note/service.server";
 import { createNotes } from "~/modules/note/service.server";
+import { scopeCustodianFilterIds } from "~/modules/team-member/service.server";
 import { getUserByID } from "~/modules/user/service.server";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { BADGE_COLORS } from "~/utils/badge-colors";
 import { isAssetPartiallyCheckedIn } from "~/utils/booking-assets";
+import { validateBookingOwnership } from "~/utils/booking-authorization.server";
 import { getClientHint } from "~/utils/client-hints";
+import { redactCustodianForViewer } from "~/utils/custody-visibility.server";
+import type { RowWithCustody } from "~/utils/custody-visibility.server";
 import { makeShelfError, ShelfError } from "~/utils/error";
 import { isFormProcessing } from "~/utils/form";
 import {
@@ -90,29 +121,159 @@ import {
   getCurrentSearchParams,
   getParams,
   parseData,
+  safeRedirect,
 } from "~/utils/http.server";
+import type { DataOrErrorResponse } from "~/utils/http.server";
 import { ALL_SELECTED_KEY, isSelectingAllItems } from "~/utils/list";
-import { wrapLinkForNote, wrapUserLinkForNote } from "~/utils/markdoc-wrappers";
+import { Logger } from "~/utils/logger";
+import { stripMarkdocDelimiters } from "~/utils/markdoc-sanitize";
+import {
+  wrapAssetsWithDataForNote,
+  wrapAssetWithCountForNote,
+  wrapLinkForNote,
+  wrapUserLinkForNote,
+} from "~/utils/markdoc-wrappers";
+import { numberInputWheelGuard } from "~/utils/number-input-wheel-guard";
 import {
   PermissionAction,
   PermissionEntity,
 } from "~/utils/permissions/permission.data";
+import { canManageBookingItems } from "~/utils/permissions/role-access";
 import { requirePermission } from "~/utils/roles.server";
+import { tw } from "~/utils/tw";
 
 export type AssetWithBooking = Asset & {
-  bookings: Booking[];
+  /** Cover image of the asset's model, rendered when the asset has no image
+   * of its own. See `~/modules/asset/image-resolution`. */
+  assetModel: { image: string | null; thumbnailImage: string | null } | null;
+  bookingAssets: {
+    booking: Booking;
+    /**
+     * `assetKitId` / `sourceKitId` / `checkedOutAt` / `checkedInAt` below are
+     * populated by the booking-overview loader (`bookings.$bookingId.overview.tsx`)
+     * for its kit-conflict checks. The manage-assets picker builds its own
+     * `AssetWithBooking` rows and leaves this group unset — those rows reach
+     * consumers only through casts that never read it, so the gap is silent
+     * rather than a type error.
+     *
+     * Discriminates a standalone slice (`null`) from a kit-driven one (the
+     * live `AssetKit` membership id this row was booked under) — mirrors
+     * `BookingAsset.assetKitId`. Scopes a kit's conflict check to slices
+     * booked under ONE of its memberships, never a standalone row of the
+     * same asset on another booking.
+     */
+    assetKitId: string | null;
+    /**
+     * The kit this slice was booked under, surviving the membership itself
+     * being removed (`BookingAsset.sourceKitId`) — the durable "which kit"
+     * key `hasKitBookingConflicts` callers match a kit's own id against.
+     */
+    sourceKitId: string | null;
+    /**
+     * The slice's own dispatch markers, read by `hasKitBookingConflicts` —
+     * see `KitBookingSlice` in `~/modules/booking/helpers`.
+     */
+    checkedOutAt: Date | string | null;
+    checkedInAt: Date | string | null;
+  }[];
   custody: Custody | null;
   category: Category;
   tags: Pick<Tag, "id" | "name" | "color">[];
-  kitId?: string | null;
+  assetKits: {
+    id: string;
+    kitId: string;
+    kit?: { id: string; name: string };
+  }[];
   qrScanned: string;
-  // Pickup location rendered in the booking Location column.
+  /** Quantity booked from the BookingAsset pivot (present for QUANTITY_TRACKED assets) */
+  bookedQuantity?: number | null;
+  /**
+   * Units already dispositioned on this booking via check-in activity —
+   * sum of `RETURN + CONSUME + LOSS + DAMAGE` ConsumptionLog rows for
+   * this (booking, asset) pair. Used by the booking overview to render
+   * the "Partially checked in" status and the `remaining / booked` qty
+   * progress indicator. 0 when no check-in activity has happened yet.
+   * Only meaningful for QUANTITY_TRACKED assets.
+   */
+  dispositionedQuantity?: number | null;
+  /**
+   * Per-category disposition split for the same (booking, asset) pair.
+   * Lets the qty tooltip show Returned / Consumed / Lost / Damaged
+   * separately — treating lost / damaged as "checked in" is misleading
+   * because those units are gone from the pool, not back in it.
+   */
+  dispositionBreakdown?: {
+    returned: number;
+    consumed: number;
+    lost: number;
+    damaged: number;
+  } | null;
+  /**
+   * Units already checked out on this booking via PartialBookingCheckout —
+   * sum of quantities[] attributed to this BookingAsset row via
+   * kit-driven-first greedy fill (mirrors dispositionedQuantity but reads
+   * from PartialBookingCheckout, not ConsumptionLog). Used by the booking
+   * overview to render the "Partially checked out (pending return)" status
+   * and the checked-out/booked progress in the Qty column. 0 when no
+   * progressive checkout has happened (e.g. all-at-once checkout, or DRAFT
+   * booking). Only meaningful for QUANTITY_TRACKED assets.
+   */
+  checkedOutQuantity?: number | null;
+  /**
+   * True when this row is detached kit residue: the booking slice was created
+   * as part of a kit (`BookingAsset.sourceKitId`) but its membership row is
+   * gone (`assetKitId IS NULL`, `ON DELETE SET NULL`). The row still renders
+   * grouped under its original kit — this flag lets the row explain WHY, since
+   * it would otherwise be indistinguishable from a live kit member.
+   *
+   * Resolved by the booking-overview loader (planning-status bookings delete
+   * such slices outright, so only ONGOING/OVERDUE/COMPLETE/ARCHIVED/CANCELLED
+   * bookings ever see it). Absent on surfaces that don't project it.
+   */
+  isRemovedFromKit?: boolean | null;
+  /**
+   * True when this row is a live kit-driven slice (`BookingAsset.assetKitId`
+   * set): its units come out of the kit's allocation (`AssetKit.quantity`),
+   * not the loose pool, so the workspace-availability stock badges do not
+   * apply to it. Resolved by the booking-overview loader; absent on surfaces
+   * that don't project it.
+   */
+  isKitDriven?: boolean | null;
+  /**
+   * The reserved model this row answered, when it answered one — the name
+   * behind `BookingAsset.bookingModelRequestId`.
+   *
+   * A model reservation promises N units without naming them, so a row that
+   * discharged one is on the booking BECAUSE of that promise rather than in
+   * addition to it. Resolved by the booking-overview loader (the stamp is a
+   * plain column with no relation accessor, so the name cannot be joined from
+   * the row); absent on surfaces that don't project it.
+   */
+  fulfilsModelName?: string | null;
+  /**
+   * The location a checked-out pool slice's units left from
+   * (`BookingAsset.sourceLocationId`), shown as "from <Location>" under the
+   * title. Resolved by the booking-overview loader, and only for standalone
+   * slices of pools at two or more placements; absent on surfaces that don't
+   * project it.
+   */
+  sourceLocation?: { id: string; name: string } | null;
+  // Pickup location rendered in the booking Location column. On the
+  // pivot model this comes from `assetLocations[0].location` via the
+  // loader's `getPrimaryLocation` normalisation.
   location?: Prisma.LocationGetPayload<typeof LOCATION_WITH_HIERARCHY> | null;
   // Fields required by `resolveDisplayCode` for the asset-code badge.
   // Loader-included relations — see `ASSET_CODE_RESOLUTION_SELECT` and
   // `BOOKING_WITH_ASSETS_INCLUDE`.
   qrCodes: { id: string }[];
   barcodes: { id: string; type: BarcodeType; value: string }[];
+  /**
+   * True when every free unit of this asset's model is promised to other
+   * bookings by a model reservation for the booking's window, so this unit
+   * cannot be booked by name here. Set by the manage-assets loader only;
+   * surfaces that do not compute it never show the matching badge.
+   */
+  modelReservedElsewhere?: boolean;
 };
 
 export const meta = () => [{ title: appendToMetaTitle("Manage assets") }];
@@ -131,7 +292,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
   );
 
   try {
-    const { organizationId, userOrganizations, isSelfServiceOrBase } =
+    const { organizationId, userOrganizations, access } =
       await requirePermission({
         userId: authSession?.userId,
         request,
@@ -139,44 +300,225 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
         action: PermissionAction.update,
       });
 
-    const {
-      search,
-      totalAssets,
-      perPage,
-      page,
-      categories,
-      tags,
-      assets,
-      totalPages,
-      totalCategories,
-      totalTags,
-      locations,
-      totalLocations,
-    } = await getPaginatedAndFilterableAssets({
-      request,
-      organizationId,
-      extraInclude: {
-        location: LOCATION_WITH_HIERARCHY,
+    // getPaginatedAndFilterableAssets + getBooking both only need
+    // `organizationId` (from requirePermission above). They're
+    // independent — parallelise to cut a serial DB round-trip.
+    const [
+      {
+        search,
+        totalAssets,
+        perPage,
+        page,
+        categories,
+        tags,
+        assets,
+        totalPages,
+        totalCategories,
+        totalTags,
+        locations,
+        totalLocations,
       },
+      booking,
+    ] = await Promise.all([
+      getPaginatedAndFilterableAssets({
+        request,
+        organizationId,
+        // Ignores the custodian-filter seed — scope it rather than fetch a
+        // roster nobody renders.
+        canSeeAllCustody: false,
+        extraInclude: {
+          assetLocations: {
+            select: { quantity: true, location: LOCATION_WITH_HIERARCHY },
+          },
+        },
+      }),
+      getBooking({
+        id,
+        organizationId,
+        userOrganizations,
+        request,
+      }),
+    ]);
+
+    /**
+     * `booking: update` is held by every role, so it settles nothing about
+     * THIS booking: a caller who does not write every booking may only change
+     * one they created or hold. Judged before the status, so a caller with no
+     * claim on the booking does not learn what state it is in.
+     */
+    validateBookingOwnership({
+      booking,
+      userId,
+      access,
+      action: "manage assets for",
     });
+
+    /**
+     * For QUANTITY_TRACKED assets, compute available quantity via the
+     * shared `getAssetAvailabilityBatch` primitive — the SAME formula
+     * `getAssetAvailability` uses (kit allocations, custody, checked-out,
+     * and windowed reservations), batched across every candidate asset in
+     * ONE round of queries so listing N qty-tracked assets doesn't turn
+     * into N per-asset lookups. Exclude the current booking so its own
+     * reservation doesn't reduce the displayed availability.
+     *
+     * Reserved rows are restricted to standalone (`assetKitId: null`)
+     * slices inside the primitive — kit-driven slices are already counted
+     * via `inKits`, so this also fixes the double-count the old inline
+     * `groupBy` had (it summed EVERY overlapping `BookingAsset` row,
+     * including kit-driven ones, on top of subtracting `inKits`
+     * separately). The window is peak-concurrent swept rather than
+     * plain-summed, so two non-overlapping bookings inside the query
+     * window no longer stack (the bb1/bb2 bug).
+     */
+    const qtyAssetIds = assets
+      .filter((a) => a.type === "QUANTITY_TRACKED")
+      .map((a) => a.id);
+
+    const availabilityByAsset = await getAssetAvailabilityBatch(qtyAssetIds, {
+      organizationId,
+      window:
+        booking.from && booking.to
+          ? { from: booking.from, to: booking.to }
+          : null,
+      excludeBookingId: id,
+    });
+
+    /**
+     * Models of which this booking cannot take one more unit by name, because
+     * other bookings' model reservations leave the pool no room for it in
+     * this window. Mirrors the write-time guard for a single added unit:
+     * a draft must fit everything it would then hold (its named units plus
+     * the units of its own request still unassigned); an active booking
+     * already holds its units and its request, so a unit that fulfils that
+     * request is never refused and never flagged. A unit already on the
+     * booking claims nothing new. One availability read per distinct model
+     * on the page, through the same primitive the write paths use.
+     */
+    const isDraft = booking.status === BookingStatus.DRAFT;
+    const remainingByModel = new Map<string, number>();
+    for (const request of booking.modelRequests) {
+      if (request.fulfilledAt !== null) continue;
+      remainingByModel.set(
+        request.assetModelId,
+        (remainingByModel.get(request.assetModelId) ?? 0) +
+          Math.max(0, request.quantity - request.fulfilledQuantity)
+      );
+    }
+    const ownStandaloneAssetIds = new Set(
+      booking.bookingAssets
+        .filter((ba) => ba.assetKitId === null)
+        .map((ba) => ba.assetId)
+    );
+    const candidateModelIds = [
+      ...new Set(
+        assets.flatMap((a) =>
+          a.type === AssetType.INDIVIDUAL &&
+          a.assetModelId &&
+          !ownStandaloneAssetIds.has(a.id) &&
+          (isDraft || (remainingByModel.get(a.assetModelId) ?? 0) === 0)
+            ? [a.assetModelId]
+            : []
+        )
+      ),
+    ];
+    /**
+     * How many more units of a model this booking may still take by name.
+     * Only models another booking is owed unnamed units of appear here — no
+     * other model can be over-committed by naming units, so the page says
+     * nothing about them and reads nothing for them.
+     */
+    const modelHeadroom: Record<string, number> = {};
+    const exhaustedModelIds = new Set<string>();
+    if (booking.from && booking.to && candidateModelIds.length > 0) {
+      // One read that usually ends the work: a workspace that never reserves
+      // by model gets an empty set here and no per-model reads at all, which
+      // is what keeps a page of N models off N availability lookups.
+      const contestedModelIds = await findModelsReservedByOtherBookings({
+        assetModelIds: candidateModelIds,
+        excludeBookingId: id,
+        organizationId,
+        from: booking.from,
+        to: booking.to,
+      });
+      const contested = candidateModelIds.filter((assetModelId) =>
+        contestedModelIds.has(assetModelId)
+      );
+
+      if (contested.length > 0) {
+        const [availabilities, heldByModel] = await Promise.all([
+          Promise.all(
+            contested.map((assetModelId) =>
+              getAssetModelAvailability({
+                assetModelId,
+                organizationId,
+                bookingId: id,
+                from: booking.from,
+                to: booking.to,
+              })
+            )
+          ),
+          // Units of these models already on the booking, which `availability`
+          // excludes and which therefore count on the booking's side. Same
+          // primitive the write guard uses, so the badge and the refusal can
+          // never disagree about what the booking holds.
+          readOwnNamedUnits({
+            bookingId: id,
+            assetModelIds: contested,
+            organizationId,
+            tx: db,
+          }),
+        ]);
+
+        contested.forEach((assetModelId, index) => {
+          const held = heldByModel.get(assetModelId);
+          // Units a custodian holds were never in the pool, so naming one
+          // takes nothing from it — the write guard discounts them the same
+          // way.
+          const base = (held?.unitIds.size ?? 0) - (held?.inCustody ?? 0);
+          const remaining = remainingByModel.get(assetModelId) ?? 0;
+          const { available } = availabilities[index];
+          // Up to `remaining`, each unit named fulfils one unit of the
+          // booking's own reservation, so the footprint does not move: either
+          // the whole reservation fits beside what the booking holds, or
+          // nothing more can be named at all.
+          modelHeadroom[assetModelId] =
+            base + remaining > available ? 0 : available - base;
+          if (modelHeadroom[assetModelId] === 0) {
+            exhaustedModelIds.add(assetModelId);
+          }
+        });
+      }
+    }
+
+    /**
+     * Attach the model flag, attach availableQuantity to qty-tracked rows and
+     * drop qty-tracked rows with nothing left to book.
+     */
+    const assetsWithAvailability = assets
+      .map((a) => {
+        const modelReservedElsewhere =
+          a.type === AssetType.INDIVIDUAL &&
+          !!a.assetModelId &&
+          !ownStandaloneAssetIds.has(a.id) &&
+          exhaustedModelIds.has(a.assetModelId);
+        if (a.type !== "QUANTITY_TRACKED")
+          return { ...a, modelReservedElsewhere };
+        const availableQuantity = availabilityByAsset.get(a.id)?.bookable ?? 0;
+        return { ...a, modelReservedElsewhere, availableQuantity };
+      })
+      .filter((a) => {
+        if (a.type !== "QUANTITY_TRACKED") return true;
+        return (a as { availableQuantity: number }).availableQuantity > 0;
+      });
 
     const modelName = {
       singular: "asset",
       plural: "assets",
     };
 
-    const booking = await getBooking({
-      id,
-      organizationId,
-      userOrganizations,
-      request,
-    });
-
-    /** Self service can only manage assets for bookings that are DRAFT */
-    const cantManageAssetsAsBaseOrSelfService =
-      isSelfServiceOrBase && booking.status !== BookingStatus.DRAFT;
-
-    /** Changing assets is not allowed at this stage */
+    // Items can be changed while the booking is open; roles whose policy does
+    // not allow adding after DRAFT are held to DRAFT.
     const isNotAllowedStatus = (
       [
         BookingStatus.CANCELLED,
@@ -185,26 +527,55 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       ] as BookingStatus[]
     ).includes(booking.status);
 
-    if (cantManageAssetsAsBaseOrSelfService || isNotAllowedStatus) {
+    if (!canManageBookingItems({ access, bookingStatus: booking.status })) {
       throw new ShelfError({
         cause: null,
         label: "Booking",
         message: isNotAllowedStatus
           ? "Changing of assets is not allowed for current status of booking."
-          : isSelfServiceOrBase
-          ? "You are unable to add assets at this point because the booking is already reserved. Cancel this booking and create another one if you need to make changes."
-          : "Changing of assets is not allowed for current status of booking.",
+          : "You are unable to add assets at this point because the booking is already reserved. Cancel this booking and create another one if you need to make changes.",
         shouldBeCaptured: false,
-        additionalData: {
-          booking,
-          userId,
-          organizationId,
-          isSelfServiceOrBase,
-        },
+        additionalData: { booking, userId, organizationId, role: access.role },
       });
     }
 
-    const bookingKitIds = getKitIdsByAssets(booking.assets);
+    /**
+     * The kits this booking holds, from the slices booked under them — see the
+     * twin in the manage-kits loader. Membership would count a kit whose
+     * `QUANTITY_TRACKED` member is only on the booking as a standalone slice.
+     */
+    const bookingKitIds = [
+      ...(
+        await getKitIdsByBookingSlices({
+          slices: booking.bookingAssets,
+          organizationId,
+        })
+      ).keys(),
+    ];
+
+    /**
+     * Strip kit-driven slices from `booking.bookingAssets` so the picker's
+     * pre-selection + qty pre-fill reflect standalone state only. Kit-driven
+     * slices are managed by removing the kit (action handler at the bottom
+     * of this file already scopes its bookingAssets fetch to
+     * `assetKitId: null` for the same reason). `bookingKitIds` above
+     * captured the kit presence already, so downstream kit-detection logic
+     * is unaffected by this filter.
+     */
+    booking.bookingAssets = booking.bookingAssets.filter(
+      (ba) => ba.assetKitId === null
+    );
+
+    /**
+     * Book-by-Model — Models tab payload. Shared with the manage-kits
+     * loader via `getBookingModelTabData` so both surfaces compute
+     * model availability identically (see the helper's JSDoc for the
+     * "total − inCustody − reserved" formula).
+     */
+    const modelTabData = await getBookingModelTabData({
+      organizationId,
+      booking,
+    });
 
     return payload({
       header: {
@@ -219,7 +590,19 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       showSidebar: true,
       noScroll: true,
       booking,
-      items: assets,
+      // `assetIndexFields()` selects the whole `custody.custodian.user`,
+      // `email` included, and this picker is reachable with `booking: update`
+      // — which BASE and SELF_SERVICE both hold on their own DRAFT booking.
+      // Scoping the custodian FILTER does not shape the rows, so the identity
+      // has to be redacted here too. The cast mirrors `asset/data.server.ts`:
+      // the declared row type resolves `custody` to the raw Prisma model with
+      // no `custodian`, while the runtime include nests one.
+      items: redactCustodianForViewer(
+        assetsWithAvailability as unknown as Array<
+          (typeof assetsWithAvailability)[number] & RowWithCustody
+        >,
+        { canSeeAllCustody: access.custody.seeAll, userId: authSession?.userId }
+      ),
       categories,
       tags,
       search,
@@ -233,12 +616,32 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       locations,
       totalLocations,
       bookingKitIds,
+      modelHeadroom,
+      ...modelTabData,
     });
   } catch (cause) {
     const reason = makeShelfError(cause, { userId, id });
     throw data(error(reason), { status: reason.status });
   }
 }
+
+/**
+ * Runtime validation schema for the decoded `quantities` payload.
+ *
+ * The form submits quantities as a JSON-encoded string (see the hidden
+ * input in the footer form), so after `JSON.parse` we still need to
+ * validate the shape to reject negative, zero, non-integer, Infinity,
+ * or absurdly large values — any of which would otherwise flow into
+ * `BookingAsset.quantity` via the raw SQL upsert in `updateBookingAssets`
+ * and break availability math and check-in accounting.
+ *
+ * Upper bound of 1,000,000 is a sanity cap; real bookings never come
+ * close to this.
+ */
+const quantitiesSchema = z.record(
+  z.string(),
+  z.number().int().positive().max(1_000_000)
+);
 
 export async function action({ context, request, params }: ActionFunctionArgs) {
   const authSession = context.getSession();
@@ -248,24 +651,79 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
   });
 
   try {
-    const { organizationId, isSelfServiceOrBase } = await requirePermission({
+    const { organizationId, access } = await requirePermission({
       userId: authSession?.userId,
       request,
       entity: PermissionEntity.booking,
       action: PermissionAction.update,
     });
 
-    let { assetIds, removedAssetIds, redirectTo } = parseData(
+    let {
+      assetIds,
+      removedAssetIds,
+      redirectTo,
+      quantities: rawQuantities,
+    } = parseData(
       await request.formData(),
       z.object({
         assetIds: z.array(z.string()).optional().default([]),
         removedAssetIds: z.array(z.string()).optional().default([]),
         redirectTo: z.string().optional().nullable(),
+        /** JSON-encoded map of assetId → quantity for QUANTITY_TRACKED assets */
+        quantities: z.string().optional().nullable(),
       }),
       {
         additionalData: { userId, bookingId },
       }
     );
+
+    /**
+     * Parse and validate the quantities JSON string into a
+     * Record<string, number>. A blind cast here is unsafe because any
+     * authenticated user with `booking.update` could submit negative,
+     * zero, non-integer, Infinity, or absurdly large values that would
+     * then persist to `BookingAsset.quantity` and break availability
+     * math + check-in accounting.
+     *
+     * We:
+     *   1. `JSON.parse` inside a try/catch so malformed JSON becomes a
+     *      clean 400 instead of a 500 from an uncaught SyntaxError.
+     *   2. Run the parsed value through `quantitiesSchema` so each
+     *      entry is guaranteed to be a positive integer within a sane
+     *      upper bound (see schema above).
+     *
+     * Both failure branches throw a ShelfError, which the outer
+     * try/catch converts into the action's standard 400 JSON response
+     * via `makeShelfError` + `data(error(reason), { status })`.
+     */
+    let quantities: Record<string, number> = {};
+    if (rawQuantities) {
+      try {
+        const parsed = JSON.parse(rawQuantities);
+        const result = quantitiesSchema.safeParse(parsed);
+        if (!result.success) {
+          throw new ShelfError({
+            cause: null,
+            status: 400,
+            label: "Booking",
+            message:
+              "Invalid quantities payload — each quantity must be a positive integer.",
+            additionalData: { issues: result.error.issues },
+            shouldBeCaptured: false,
+          });
+        }
+        quantities = result.data;
+      } catch (cause) {
+        if (cause instanceof ShelfError) throw cause;
+        throw new ShelfError({
+          cause,
+          status: 400,
+          label: "Booking",
+          message: "Invalid quantities JSON — could not parse.",
+          shouldBeCaptured: false,
+        });
+      }
+    }
 
     /**
      * If user has selected all assets, then we have to get ids of all those assets
@@ -277,19 +735,28 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       const assetsWhere = getAssetsWhereInput({
         organizationId,
         currentSearchParams: searchParams.toString(),
+        // `booking: update` is held by BASE and SELF_SERVICE. Select-all here
+        // ADDS the matched assets to the booking, which then lists them — so an
+        // unscoped custodian filter would hand a restricted user a readable
+        // copy of exactly what a colleague holds.
+        allowedTeamMemberIds: await scopeCustodianFilterIds({
+          teamMemberIds: searchParams.getAll("teamMember"),
+          canSeeAllCustody: access.custody.seeAll,
+          userId: authSession?.userId,
+          organizationId,
+        }),
       });
 
       const allAssets = await db.asset.findMany({
         where: assetsWhere,
         select: { id: true },
       });
-      const bookingAssets = await db.asset.findMany({
+      const bookingAssetRows = await db.bookingAsset.findMany({
         where: {
-          id: { notIn: removedAssetIds },
-          organizationId,
-          bookings: { some: { id: bookingId } },
+          bookingId,
+          assetId: { notIn: removedAssetIds },
         },
-        select: { id: true },
+        select: { assetId: true },
       });
 
       /**
@@ -300,7 +767,7 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       assetIds = [
         ...new Set([
           ...allAssets.map((asset) => asset.id),
-          ...bookingAssets.map((asset) => asset.id),
+          ...bookingAssetRows.map((ba) => ba.assetId),
         ]),
       ];
     }
@@ -319,10 +786,29 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
         where: { id: bookingId, organizationId },
         select: {
           id: true,
+          name: true,
           status: true,
-          /** We need to get the original assets that were part of the booking before the update so we can compare */
-          assets: {
-            select: { id: true },
+          // Both custody links, needed by the ownership check below.
+          creatorId: true,
+          custodianUserId: true,
+          /**
+           * We need the original assets and their quantities so we can
+           * compare and detect changes. Asset `title` and `type` are
+           * needed to generate qty-aware activity notes (e.g. "set
+           * quantity for \"Screwdriver\" to 5").
+           */
+          bookingAssets: {
+            // The picker manages STANDALONE booking slices
+            // (`assetKitId IS NULL`). Kit-driven slices coexist for the
+            // same asset under partial unique `BookingAsset_kit_unique`
+            // and are managed by removing the kit from the booking,
+            // not by editing the qty here.
+            where: { assetKitId: null },
+            select: {
+              assetId: true,
+              quantity: true,
+              asset: { select: { id: true, title: true, type: true } },
+            },
           },
         },
       })
@@ -335,29 +821,33 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
         });
       });
 
-    /** Self service can only manage assets for bookings that are DRAFT */
-    const cantManageAssetsAsBase =
-      isSelfServiceOrBase && booking.status !== BookingStatus.DRAFT;
+    /**
+     * `booking: update` is held by every role, so it settles nothing about
+     * THIS booking: a caller who does not write every booking may only change
+     * one they created or hold. Judged before the status, so a caller with no
+     * claim on the booking does not learn what state it is in.
+     */
+    validateBookingOwnership({
+      booking,
+      userId,
+      access,
+      action: "manage assets for",
+    });
 
-    /** Changing assets is not allowed at this stage */
-    const notAllowedStatus: BookingStatus[] = [
-      BookingStatus.CANCELLED,
-      BookingStatus.ARCHIVED,
-      BookingStatus.COMPLETE,
-    ];
-
-    if (cantManageAssetsAsBase || notAllowedStatus.includes(booking.status)) {
+    if (!canManageBookingItems({ access, bookingStatus: booking.status })) {
       throw new ShelfError({
         cause: null,
         label: "Booking",
-        message: isSelfServiceOrBase
-          ? "You are unable to manage assets at this point because the booking is already reserved. Cancel this booking and create another one if you need to make changes."
-          : "Changing of assets is not allowed for current status of booking.",
+        // The message names the rule that applies to this caller: members
+        // held to DRAFT get the "already reserved" explanation.
+        message: access.policy.bookings.manageItemsAfterDraft
+          ? "Changing of assets is not allowed for current status of booking."
+          : "You are unable to manage assets at this point because the booking is already reserved. Cancel this booking and create another one if you need to make changes.",
         shouldBeCaptured: false,
       });
     }
     // Get existing asset IDs from the booking
-    const existingAssetIds = booking.assets.map((asset) => asset.id);
+    const existingAssetIds = booking.bookingAssets.map((ba) => ba.assetId);
 
     // Filter out existing assets to get only newly added ones
     const newAssetIds = assetIds.filter(
@@ -368,13 +858,16 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
     const { partialCheckinDetails } =
       await getDetailedPartialCheckinData(bookingId);
 
-    // Query to get potentially checked out assets
+    /**
+     * Assets that physically block this add. INDIVIDUAL only — see
+     * {@link buildAddToActiveBookingBlockerWhere}; a qty-tracked pool's
+     * per-unit capacity is checked inside `updateBookingAssets`.
+     */
     const potentiallyCheckedOutAssets = await db.asset.findMany({
-      where: {
-        id: { in: newAssetIds },
+      where: buildAddToActiveBookingBlockerWhere({
+        assetIds: newAssetIds,
         organizationId,
-        status: AssetStatus.CHECKED_OUT,
-      },
+      }),
       select: { id: true, title: true, status: true },
     });
 
@@ -401,29 +894,302 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
           bookingId,
           newAssetIds,
         },
+        status: 400,
         shouldBeCaptured: false,
       });
     }
 
+    /**
+     * Build a lookup of existing bookingAsset rows (assetId → {quantity, asset})
+     * so the add- and adjust-quantity flows below can generate qty-aware
+     * activity notes without re-querying the asset table.
+     */
+    const existingBookingAssetMap = new Map(
+      booking.bookingAssets.map((ba) => [ba.assetId, ba])
+    );
+
+    const actor = wrapUserLinkForNote(user!);
+    const bookingLink = wrapLinkForNote(
+      `/bookings/${booking.id}`,
+      booking.name
+    );
+
     /** We only update the booking if there are NEW assets to add */
     if (newAssetIds.length > 0) {
+      /**
+       * Filter the quantities map to only include entries for newly added assets.
+       * This avoids attempting to update quantities for assets already in the booking.
+       */
+      const newQuantities: Record<string, number> = {};
+      for (const assetId of newAssetIds) {
+        if (quantities[assetId] != null) {
+          newQuantities[assetId] = quantities[assetId];
+        }
+      }
+
       /** We update the booking with ONLY the new assets to avoid connecting already-connected assets */
-      const b = await updateBookingAssets({
+      await updateBookingAssets({
         id: bookingId,
         organizationId,
         assetIds: newAssetIds, // Only the newly added assets
         userId,
+        quantities: newQuantities,
+        // This route writes its own booking-side note below (the one that
+        // carries the quantity annotations). Without this the service writes
+        // a second one that is byte-identical for a single INDIVIDUAL asset,
+        // so the feed reports one add twice. `userId` is still passed — it
+        // attributes the BOOKING_ASSETS_ADDED events and the model-request
+        // assignment notes, which are separate concerns.
+        skipBookingNote: true,
+        // Re-checks the add rule against the locked booking status.
+        access,
       });
 
-      /** We create notes for the newly added assets */
-      const bookingLink = wrapLinkForNote(`/bookings/${b.id}`, b.name);
-      await createNotes({
-        content: `${wrapUserLinkForNote(user!)} added asset to ${bookingLink}.`,
-        type: "UPDATE",
-        userId: authSession.userId,
-        assetIds: newAssetIds,
-        organizationId,
+      /**
+       * Fetch the newly added assets so we can generate notes that reference
+       * each asset by title and that include the chosen quantity for
+       * QUANTITY_TRACKED assets. We fetch here rather than letting
+       * `updateBookingAssets` return them, because the service doesn't
+       * include asset detail.
+       */
+      const newAssets = await db.asset.findMany({
+        where: { id: { in: newAssetIds }, organizationId },
+        select: { id: true, title: true, type: true },
       });
+      const newAssetById = new Map(newAssets.map((a) => [a.id, a]));
+
+      /**
+       * Activity logging for the add flow.
+       *
+       * Wrapped in a best-effort try/catch: the assets have already been
+       * written to the booking at this point, so a failure to log activity
+       * must NOT bubble up and roll back the user's change. Errors are
+       * logged server-side for investigation.
+       *
+       * We write:
+       *   1. One asset-side note per added asset (shows "added to <booking>"
+       *      plus the reserved quantity for qty-tracked assets).
+       *   2. One booking-side system note summarizing everything that was
+       *      added, using `wrapAssetsWithDataForNote` (same helper
+       *      `removeAssets` uses — handles single and multi-asset cases
+       *      consistently with the rest of the activity feed). Quantity
+       *      info is appended as a readable suffix rather than stuffed
+       *      into markdoc tags.
+       */
+      try {
+        await Promise.all(
+          newAssetIds.map(async (assetId) => {
+            const assetInfo = newAssetById.get(assetId);
+            if (!assetInfo) return;
+            const reservedQty = newQuantities[assetId];
+            // Mirror the qty-aware per-asset wording the Phase 4e sweep
+            // landed on `addAssetsToBooking` in `booking/service.server.ts`:
+            // QUANTITY_TRACKED → "added 50 units of {asset} to {booking}";
+            // INDIVIDUAL → "added asset to {booking}" (byte-for-byte
+            // unchanged). The previous inline " with quantity **N**"
+            // suffix bypassed `wrapAssetWithCountForNote` and rendered as
+            // legacy-shaped text on the asset's own timeline.
+            const fragment = wrapAssetWithCountForNote(assetInfo, reservedQty);
+            const content = isQuantityTracked(assetInfo)
+              ? `${actor} added ${fragment} to ${bookingLink}.`
+              : `${actor} added asset to ${bookingLink}.`;
+            await createNotes({
+              content,
+              type: "UPDATE",
+              userId: authSession.userId,
+              assetIds: [assetId],
+              organizationId,
+            });
+          })
+        );
+      } catch (noteError) {
+        Logger.error(
+          makeShelfError(noteError, {
+            userId,
+            bookingId,
+            newAssetIds,
+            context: "manage-assets per-asset add-note creation",
+          })
+        );
+      }
+
+      try {
+        const assetListContent = wrapAssetsWithDataForNote(newAssets, "added");
+        const qtyAnnotations = newAssets
+          .filter((a) => isQuantityTracked(a) && newQuantities[a.id] != null)
+          // Asset titles are user input rendered as literal text here.
+          .map(
+            (a) =>
+              `**${stripMarkdocDelimiters(a.title)}** (x${newQuantities[a.id]})`
+          )
+          .join(", ");
+        const qtySuffix = qtyAnnotations
+          ? ` with quantities: ${qtyAnnotations}`
+          : "";
+
+        await createSystemBookingNote({
+          bookingId,
+          organizationId,
+          content: `${actor} added ${assetListContent} to the booking${qtySuffix}.`,
+        });
+      } catch (noteError) {
+        Logger.error(
+          makeShelfError(noteError, {
+            userId,
+            bookingId,
+            newAssetIds,
+            newQuantities,
+            context: "manage-assets add-note creation",
+          })
+        );
+      }
+    }
+
+    /**
+     * Update quantities for existing QUANTITY_TRACKED assets whose quantity changed.
+     * We build a map of the old quantities and compare against the submitted values.
+     * updateBookingAssets uses ON CONFLICT … DO UPDATE, so passing existing asset IDs
+     * with new quantities will upsert the quantity on the pivot row.
+     */
+    const changedQuantities: Record<string, number> = {};
+    const changedAssetIds: string[] = [];
+    for (const assetId of existingAssetIds) {
+      const submitted = quantities[assetId];
+      const current = existingBookingAssetMap.get(assetId)?.quantity ?? 1;
+      if (submitted != null && submitted !== current) {
+        changedQuantities[assetId] = submitted;
+        changedAssetIds.push(assetId);
+      }
+    }
+
+    /**
+     * Quantity-shrink guardrail: for any qty-tracked asset whose
+     * quantity is being reduced, make sure the new value isn't lower
+     * than the sum of what's already been dispositioned via
+     * ConsumptionLog (RETURN / CONSUME / LOSS / DAMAGE) for this
+     * booking.
+     *
+     * Without this check, remaining = BookingAsset.quantity − Σ(logs)
+     * could go negative and the check-in math would break.
+     */
+    if (changedAssetIds.length > 0) {
+      const loggedSums = await db.consumptionLog.groupBy({
+        by: ["assetId"],
+        where: {
+          bookingId,
+          assetId: { in: changedAssetIds },
+          category: { in: ["RETURN", "CONSUME", "LOSS", "DAMAGE"] },
+        },
+        _sum: { quantity: true },
+      });
+      const loggedByAsset = new Map<string, number>(
+        loggedSums.map((row) => [row.assetId, row._sum.quantity ?? 0])
+      );
+      for (const assetId of changedAssetIds) {
+        const logged = loggedByAsset.get(assetId) ?? 0;
+        const newQty = changedQuantities[assetId];
+        if (logged > 0 && newQty < logged) {
+          const ba = existingBookingAssetMap.get(assetId);
+          const title = ba?.asset?.title ?? "asset";
+          throw new ShelfError({
+            cause: null,
+            status: 400,
+            label: "Booking",
+            message: `Cannot reduce booked quantity for "${title}" below ${logged} — ${logged} unit${
+              logged === 1 ? " has" : "s have"
+            } already been dispositioned on this booking.`,
+            shouldBeCaptured: false,
+          });
+        }
+      }
+    }
+
+    if (changedAssetIds.length > 0) {
+      await updateBookingAssets({
+        id: bookingId,
+        organizationId,
+        assetIds: changedAssetIds,
+        userId,
+        quantities: changedQuantities,
+        // These assets are ALREADY on the booking — this is a pure quantity
+        // edit. The service derives `addedAssetIds` from everything the call
+        // touched, not from what is new, so without this it logs a phantom
+        // "added X to the booking." for an asset that was already there. The
+        // route's own "adjusted booked quantity" note below is the truthful
+        // record of what happened.
+        skipBookingNote: true,
+        // Re-checks the add rule against the locked booking status.
+        access,
+      });
+
+      /**
+       * Activity notes for quantity adjustments on existing assets.
+       * One per-asset note and one booking-side summary note so the
+       * change is visible from both activity feeds — matches the behavior
+       * of the single-asset adjust dialog
+       * (`routes/api+/bookings.$bookingId.adjust-asset-quantity.ts`).
+       *
+       * Wrapped in a best-effort try/catch for the same reason as the add
+       * flow above: the quantity update is already persisted and the user
+       * shouldn't see the save fail because an activity log couldn't be
+       * written.
+       */
+      try {
+        const adjustments = changedAssetIds
+          .map((assetId) => {
+            const ba = existingBookingAssetMap.get(assetId);
+            if (!ba) return null;
+            return {
+              assetId,
+              asset: ba.asset,
+              from: ba.quantity,
+              to: changedQuantities[assetId],
+            };
+          })
+          .filter(
+            (a): a is NonNullable<typeof a> => a !== null && a.asset !== null
+          );
+
+        await Promise.all(
+          adjustments.map((adj) =>
+            createNotes({
+              content: `${actor} adjusted booked quantity for ${bookingLink} from **${adj.from}** to **${adj.to}**.`,
+              type: "UPDATE",
+              userId: authSession.userId,
+              assetIds: [adj.assetId],
+              organizationId,
+            })
+          )
+        );
+
+        const bookingAdjustSummary = adjustments
+          .map(
+            (adj) =>
+              // Use the shared wrapper rather than hand-rolling the tag: it is
+              // the one place that guarantees the title lands inside a quoted,
+              // escaped attribute.
+              `${wrapLinkForNote(
+                `/assets/${adj.asset!.id}`,
+                adj.asset!.title
+              )} (**${adj.from}** → **${adj.to}**)`
+          )
+          .join(", ");
+        await createSystemBookingNote({
+          bookingId,
+          organizationId,
+          content: `${actor} adjusted booked quantity for ${bookingAdjustSummary}.`,
+        });
+      } catch (noteError) {
+        Logger.error(
+          makeShelfError(noteError, {
+            userId,
+            bookingId,
+            changedAssetIds,
+            changedQuantities,
+            context: "manage-assets adjust-note creation",
+          })
+        );
+      }
     }
 
     /** If some assets were removed, we also need to handle those */
@@ -441,6 +1207,7 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
         booking: { id: bookingId, assetIds: removedAssetIds },
         firstName: user?.firstName || "",
         lastName: user?.lastName || "",
+        displayName: user?.displayName ?? null,
         userId: authSession.userId,
         organizationId,
         assets: removedAssets,
@@ -468,10 +1235,12 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
 
     /**
      * If redirectTo is in form that means user has submitted the form through alert,
-     * so we have to redirect to manage-kits url
+     * so we have to redirect to manage-kits url. `redirectTo` is a
+     * client-supplied form value, so route it through `safeRedirect` to block
+     * open-redirects to another origin — falling back to the booking page.
      */
     if (redirectTo) {
-      return redirect(redirectTo);
+      return redirect(safeRedirect(redirectTo, `/bookings/${bookingId}`));
     }
 
     return redirect(`/bookings/${bookingId}`);
@@ -481,12 +1250,92 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
   }
 }
 
+/**
+ * Manages the asset selection flow for a booking.
+ * Users can select individual and quantity-tracked assets,
+ * specifying how many units to reserve for QUANTITY_TRACKED assets.
+ */
 export default function AddAssetsToNewBooking() {
+  const {
+    booking,
+    bookingKitIds,
+    items,
+    totalItems,
+    showModelsTab,
+    assetModels,
+    modelRequests,
+    modelHeadroom,
+  } = useLoaderData<typeof loader>();
+
+  /**
+   * Local state for the active tab value. Only "models" is rendered
+   * inline on this route — switching to "kits" navigates away via the
+   * existing `onValueChange` handler. "assets" is the default on mount.
+   *
+   * Seeded from the `tab` search param so callers (e.g. the Reserved
+   * Models section on the booking overview) can deep-link straight
+   * into the Models tab rather than forcing a manual click.
+   */
+  const [searchParams] = useSearchParams();
+  const initialTab = searchParams.get("tab") === "models" ? "models" : "assets";
+  const [activeTab, setActiveTab] = useState<"assets" | "models">(initialTab);
+
+  /**
+   * A rejected save returns `data(error(reason))` instead of the redirect.
+   * Render the reason in the footer so a refused add states why in the dialog
+   * itself, rather than only in the SSE toast `error()` emits — that toast
+   * needs a live event stream, and the dialog stays open either way.
+   */
+  const actionData = useActionData<DataOrErrorResponse>();
+  const actionError =
+    actionData && "error" in actionData && actionData.error?.message
+      ? actionData.error.message
+      : null;
+
   const [isAlertOpen, setIsAlertOpen] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
 
-  const { booking, bookingKitIds, items, totalItems } =
-    useLoaderData<typeof loader>();
+  /**
+   * Stores the selected quantity for each QUANTITY_TRACKED asset.
+   * Keys are asset IDs, values are the number of units to reserve.
+   * Only populated for QUANTITY_TRACKED assets; INDIVIDUAL assets are excluded.
+   *
+   * Initialized from existing booking data so that qty-tracked assets
+   * already in the booking show their current booked quantity rather
+   * than defaulting to 1.
+   */
+  const [quantities, setQuantities] = useState<Record<string, number>>(() => {
+    const initial: Record<string, number> = {};
+    // Loader scopes `bookingAssets` to standalone rows
+    // (`assetKitId IS NULL`), so the kit-membership exclusion that used
+    // to live here is redundant. Qty-tracked-in-kit assets can have an
+    // editable standalone slice alongside their kit-driven slice
+    // (managed separately via kit removal).
+    for (const ba of booking.bookingAssets) {
+      if (isQuantityTracked(ba.asset)) {
+        initial[ba.asset.id] = ba.quantity;
+      }
+    }
+    return initial;
+  });
+
+  /** Updates the quantity for a specific QUANTITY_TRACKED asset */
+  const handleQuantityChange = useCallback(
+    (assetId: string, quantity: number) => {
+      setQuantities((prev) => ({ ...prev, [assetId]: quantity }));
+    },
+    []
+  );
+
+  /** Removes a quantity entry when an asset is deselected */
+  const removeQuantity = useCallback((assetId: string) => {
+    setQuantities((prev) => {
+      const next = { ...prev };
+      delete next[assetId];
+      return next;
+    });
+  }, []);
+
   const navigate = useNavigate();
   const navigation = useNavigation();
   const isSearching = isFormProcessing(navigation.state);
@@ -494,16 +1343,21 @@ export default function AddAssetsToNewBooking() {
 
   const selectedBulkItems = useAtomValue(selectedBulkItemsAtom);
   const updateItem = useSetAtom(setSelectedBulkItemAtom);
-  const setSelectedBulkItems = useSetAtom(setSelectedBulkItemsAtom);
+  const seedFormSelection = useSetAtom(seedFormSelectionAtom);
   const selectedBulkItemsCount = useAtomValue(selectedBulkItemsCountAtom);
   const hasSelectedAllItems = isSelectingAllItems(selectedBulkItems);
   const disabledBulkItems = useAtomValue(disabledBulkItemsAtom);
   const setDisabledBulkItems = useSetAtom(setDisabledBulkItemsAtom);
 
-  /** Assets with kits has to be handled from manage-kits */
+  /**
+   * Picker's view of the booking — standalone slices only. The loader
+   * scopes its `bookingAssets` query to `assetKitId IS NULL` so
+   * kit-driven rows (managed by removing the kit from the booking
+   * directly) don't surface here.
+   */
   const bookingAssets = useMemo(
-    () => booking.assets.filter((asset) => !asset.kitId),
-    [booking.assets]
+    () => booking.bookingAssets.map((ba) => ba.asset),
+    [booking.bookingAssets]
   );
 
   const removedAssets = useMemo(
@@ -517,7 +1371,36 @@ export default function AddAssetsToNewBooking() {
     [bookingAssets, selectedBulkItems]
   );
 
-  const hasUnsavedChanges = selectedBulkItemsCount !== bookingAssets.length;
+  /**
+   * Build a stable map of the initial booked quantities so we can
+   * detect whether the user changed any quantity values.
+   */
+  const initialQuantities = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const ba of booking.bookingAssets) {
+      // Loader scopes to standalone rows; see comment on the
+      // `quantities` state initializer above.
+      if (isQuantityTracked(ba.asset)) {
+        m[ba.asset.id] = ba.quantity;
+      }
+    }
+    return m;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const hasQuantityChanges = useMemo(() => {
+    const keys = new Set([
+      ...Object.keys(initialQuantities),
+      ...Object.keys(quantities),
+    ]);
+    for (const k of keys) {
+      if ((initialQuantities[k] ?? 1) !== (quantities[k] ?? 1)) return true;
+    }
+    return false;
+  }, [initialQuantities, quantities]);
+
+  const hasUnsavedChanges =
+    selectedBulkItemsCount !== bookingAssets.length || hasQuantityChanges;
 
   const manageKitsUrl = `/bookings/${
     booking.id
@@ -543,15 +1426,58 @@ export default function AddAssetsToNewBooking() {
   const didInitializeSelectedItemsRef = useRef(false);
   if (!didInitializeSelectedItemsRef.current) {
     didInitializeSelectedItemsRef.current = true;
-    setSelectedBulkItems(bookingAssets);
+    seedFormSelection(bookingAssets);
   }
 
+  const modelIdByAssetId = useRef(new Map<string, string>());
+
   /**
-   * Set disabled items for assets
+   * Set disabled items for assets.
+   * QUANTITY_TRACKED assets are never disabled — they support partial
+   * reservations, so the user must always be able to select/deselect
+   * them and adjust the quantity picker. An INDIVIDUAL unit whose model is
+   * fully reserved by other bookings for this window is disabled like an
+   * unbookable one: the write path refuses it.
+   *
+   * A model with room for some but not all of its units is capped as the
+   * selection grows. The server measures the whole batch, so without this the
+   * rows all look selectable and Confirm returns a 400 naming a limit the
+   * page never showed. Rows already on the booking do not consume headroom —
+   * the server counts them on the booking's side, not as an addition.
    */
   useEffect(() => {
+    // Which model each asset the picker has shown belongs to, kept across
+    // pages and searches because the selection is: a unit selected under one
+    // search still holds a slot of its model after the search is cleared.
+    // Built from `items`, the typed loader payload — a selected row is
+    // `ListItemData`, whose index signature types every field access as
+    // `any`, so reading the model off the selection would go unchecked.
+    // Entries are a plain id-to-model fact, so they never need clearing;
+    // stale ones are inert because only selected ids are ever counted.
+    for (const item of items) {
+      if (item.assetModelId) {
+        modelIdByAssetId.current.set(item.id, item.assetModelId);
+      }
+    }
+
+    const blockedByHeadroom = assetIdsBlockedByModelHeadroom({
+      rows: items,
+      modelIdByAssetId: modelIdByAssetId.current,
+      selectedAssetIds: new Set(selectedBulkItems.map((asset) => asset.id)),
+      alreadyOnBookingIds: new Set(bookingAssets.map((asset) => asset.id)),
+      modelHeadroom,
+    });
+
     const _disabledBulkItems = items.reduce<ListItemData[]>((acc, asset) => {
-      if (!asset.availableToBook || !!asset.kitId) {
+      /** Qty-tracked assets can always be selected to adjust quantity */
+      if (isQuantityTracked(asset)) return acc;
+
+      if (
+        !asset.availableToBook ||
+        asset.assetKits.length > 0 ||
+        asset.modelReservedElsewhere ||
+        blockedByHeadroom.has(asset.id)
+      ) {
         acc.push(asset);
       }
 
@@ -559,20 +1485,44 @@ export default function AddAssetsToNewBooking() {
     }, []);
 
     setDisabledBulkItems(_disabledBulkItems);
-  }, [items, setDisabledBulkItems]);
+  }, [
+    items,
+    setDisabledBulkItems,
+    selectedBulkItems,
+    modelHeadroom,
+    bookingAssets,
+  ]);
+
+  /**
+   * Total quantity reserved via model-level requests — shown as a count
+   * badge on the Models tab trigger so users see at a glance whether
+   * they have outstanding reservations.
+   */
+  const totalModelRequestUnits = useMemo(
+    () => modelRequests.reduce((acc, req) => acc + req.quantity, 0),
+    [modelRequests]
+  );
 
   return (
     <Tabs
       className="flex h-full max-h-full flex-col"
-      value="assets"
+      value={activeTab}
       activationMode="manual"
-      onValueChange={() => {
-        if (hasUnsavedChanges) {
-          setIsAlertOpen(true);
+      onValueChange={(nextValue) => {
+        // "kits" always navigates away (existing route). "assets" and
+        // "models" render inline on this route — just update the
+        // active-tab state.
+        if (nextValue === "kits") {
+          if (hasUnsavedChanges) {
+            setIsAlertOpen(true);
+            return;
+          }
+          void navigate(manageKitsUrl);
           return;
         }
-
-        void navigate(manageKitsUrl);
+        if (nextValue === "models" || nextValue === "assets") {
+          setActiveTab(nextValue);
+        }
       }}
     >
       <div className="border-b px-6 py-2">
@@ -611,63 +1561,91 @@ export default function AddAssetsToNewBooking() {
               </GrayBadge>
             ) : null}
           </TabsTrigger>
+          {showModelsTab ? (
+            <TabsTrigger
+              className="flex-1 gap-x-2"
+              value="models"
+              aria-label={`Models tab${
+                totalModelRequestUnits > 0
+                  ? ` (${totalModelRequestUnits} reserved)`
+                  : ""
+              }`}
+            >
+              Models
+              {totalModelRequestUnits > 0 ? (
+                <GrayBadge className="size-[20px] border border-primary-200 bg-primary-50 text-[10px] leading-[10px] text-primary-700">
+                  {totalModelRequestUnits}
+                </GrayBadge>
+              ) : null}
+            </TabsTrigger>
+          ) : null}
         </TabsList>
       </div>
 
-      <Filters
-        slots={{
-          "left-of-search": <StatusFilter statusItems={AssetStatus} />,
-          "right-of-search": <AvailabilitySelect />,
-        }}
-        className="justify-between !border-t-0 border-b px-6 md:flex"
-      />
+      {/*
+       * Asset filters + filter dropdowns only make sense on the Assets
+       * tab. The Models tab uses its own picker + availability hints.
+       */}
+      {activeTab === "assets" ? (
+        <>
+          <Filters
+            slots={{
+              "left-of-search": <StatusFilter statusItems={AssetStatus} />,
+              "right-of-search": <AvailabilitySelect />,
+            }}
+            className="justify-between !border-t-0 border-b px-6 md:flex"
+          />
 
-      <div className="flex justify-around gap-2 border-b p-3 lg:gap-4">
-        <DynamicDropdown
-          trigger={
-            <div className="flex h-6 cursor-pointer items-center gap-2">
-              Categories <ChevronRight className="hidden rotate-90 md:inline" />
-            </div>
-          }
-          model={{ name: "category", queryKey: "name" }}
-          label="Filter by category"
-          placeholder="Search categories"
-          initialDataKey="categories"
-          countKey="totalCategories"
-        />
-        <DynamicDropdown
-          trigger={
-            <div className="flex h-6 cursor-pointer items-center gap-2">
-              Tags <ChevronRight className="hidden rotate-90 md:inline" />
-            </div>
-          }
-          model={{ name: "tag", queryKey: "name" }}
-          label="Filter by tag"
-          initialDataKey="tags"
-          countKey="totalTags"
-        />
-        <DynamicDropdown
-          trigger={
-            <div className="flex h-6 cursor-pointer items-center gap-2">
-              Locations <ChevronRight className="hidden rotate-90 md:inline" />
-            </div>
-          }
-          model={{ name: "location", queryKey: "name" }}
-          label="Filter by location"
-          initialDataKey="locations"
-          countKey="totalLocations"
-          renderItem={({ metadata }) => (
-            <div className="flex items-center gap-2">
-              <ImageWithPreview
-                thumbnailUrl={metadata.thumbnailUrl}
-                alt={metadata.name}
-                className="size-6 rounded-[2px]"
-              />
-              <div>{metadata.name}</div>
-            </div>
-          )}
-        />
-      </div>
+          <div className="flex justify-around gap-2 border-b p-3 lg:gap-4">
+            <DynamicDropdown
+              trigger={
+                <div className="flex h-6 cursor-pointer items-center gap-2">
+                  Categories{" "}
+                  <ChevronRight className="hidden rotate-90 md:inline" />
+                </div>
+              }
+              model={{ name: "category", queryKey: "name" }}
+              label="Filter by category"
+              placeholder="Search categories"
+              initialDataKey="categories"
+              countKey="totalCategories"
+            />
+            <DynamicDropdown
+              trigger={
+                <div className="flex h-6 cursor-pointer items-center gap-2">
+                  Tags <ChevronRight className="hidden rotate-90 md:inline" />
+                </div>
+              }
+              model={{ name: "tag", queryKey: "name" }}
+              label="Filter by tag"
+              initialDataKey="tags"
+              countKey="totalTags"
+            />
+            <DynamicDropdown
+              trigger={
+                <div className="flex h-6 cursor-pointer items-center gap-2">
+                  Locations{" "}
+                  <ChevronRight className="hidden rotate-90 md:inline" />
+                </div>
+              }
+              model={{ name: "location", queryKey: "name" }}
+              label="Filter by location"
+              initialDataKey="locations"
+              countKey="totalLocations"
+              renderItem={({ metadata }) => (
+                <div className="flex items-center gap-2">
+                  <ImageWithPreview
+                    thumbnailUrl={metadata.thumbnailUrl}
+                    alt={metadata.name}
+                    className="size-6 rounded-[2px]"
+                  />
+                  <div>{metadata.name}</div>
+                </div>
+              )}
+            />
+          </div>
+        </>
+      ) : null}
 
       <TabsContent value="assets" asChild>
         <List
@@ -680,6 +1658,22 @@ export default function AddAssetsToNewBooking() {
               return;
             }
 
+            /**
+             * Check if the asset is currently selected so we know
+             * whether we are adding or removing it.
+             */
+            const isCurrentlySelected = selectedBulkItems.some(
+              (item) => item.id === asset.id
+            );
+
+            if (isCurrentlySelected) {
+              /** Clean up quantity state when a QUANTITY_TRACKED asset is deselected */
+              removeQuantity(asset.id);
+            } else if (isQuantityTracked(asset)) {
+              /** Initialize quantity to 1 when a QUANTITY_TRACKED asset is first selected */
+              handleQuantityChange(asset.id, 1);
+            }
+
             updateItem(asset);
           }}
           emptyStateClassName="py-10"
@@ -688,6 +1682,10 @@ export default function AddAssetsToNewBooking() {
             text: "What are you waiting for? Create your first asset now!",
             newButtonRoute: "/assets/new",
             newButtonContent: "New asset",
+          }}
+          extraItemComponentProps={{
+            quantities,
+            onQuantityChange: handleQuantityChange,
           }}
           bulkActions={<> </>}
           disableSelectAllItems
@@ -701,12 +1699,55 @@ export default function AddAssetsToNewBooking() {
         />
       </TabsContent>
 
-      {/* Footer of the modal */}
-      <footer className="item-center mt-auto flex shrink-0 justify-between border-t px-6 py-3">
-        <p>
-          {hasSelectedAllItems ? totalItems : selectedBulkItemsCount} assets
-          selected
-        </p>
+      {showModelsTab ? (
+        <TabsContent
+          value="models"
+          className="mt-0 flex min-h-0 flex-1 flex-col"
+        >
+          <ManageModelRequests
+            bookingId={booking.id}
+            assetModels={assetModels}
+            modelRequests={modelRequests}
+          />
+        </TabsContent>
+      ) : null}
+
+      {/*
+       * Footer of the modal. The `<Form ref={formRef}>` (and every hidden
+       * input in it) is ALWAYS mounted, regardless of `activeTab` — it used
+       * to render only on the Assets tab, which left `formRef.current` null
+       * while on the Models tab. Switching Assets → Models → Kits then
+       * opened the "Unsaved changes" alert, but its `onYes` handler submits
+       * `formRef.current` directly (see below), so against a null ref that
+       * submit silently no-opped: no assets were added and no redirect to
+       * manage-kits happened. Only the visible "N selected" text and the
+       * Confirm button stay Assets-tab-only: the Models tab has no
+       * standalone save of its own (each reservation posts inline via the
+       * model-requests API route), and a visible/enabled Confirm there
+       * could post asset changes without the `redirectTo` the alert needs.
+       */}
+      <footer
+        className={tw(
+          "mt-auto flex shrink-0 items-center border-t px-6 py-3",
+          activeTab === "assets" ? "justify-between" : "justify-end"
+        )}
+      >
+        {activeTab === "assets" ? (
+          <div className="min-w-0 pr-3">
+            <p>
+              {hasSelectedAllItems ? totalItems : selectedBulkItemsCount} assets
+              selected
+            </p>
+            {/* `role="alert"` is what makes a submit-time rejection audible —
+                the message appears after the user has already pressed Confirm,
+                so nothing else moves focus to it. */}
+            {actionError ? (
+              <p role="alert" className="text-[12px] text-error-500">
+                {actionError}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="flex gap-3">
           <Button variant="secondary" to={".."}>
@@ -731,17 +1772,26 @@ export default function AddAssetsToNewBooking() {
                 value={asset.id}
               />
             ))}
+            {/* JSON-encoded quantities for QUANTITY_TRACKED assets */}
+            <input
+              type="hidden"
+              name="quantities"
+              value={JSON.stringify(quantities)}
+            />
             {hasUnsavedChanges && isAlertOpen ? (
               <input name="redirectTo" value={manageKitsUrl} type="hidden" />
             ) : null}
-            <Button
-              type="submit"
-              name="intent"
-              value="addAssets"
-              disabled={isSearching}
-            >
-              Confirm
-            </Button>
+            {/* Omitted entirely (not just hidden) on the Models tab — see the comment above the footer. */}
+            {activeTab === "assets" ? (
+              <Button
+                type="submit"
+                name="intent"
+                value="addAssets"
+                disabled={isSearching}
+              >
+                Confirm
+              </Button>
+            ) : null}
           </Form>
         </div>
       </footer>
@@ -763,19 +1813,33 @@ export default function AddAssetsToNewBooking() {
   );
 }
 
+/**
+ * Row component for each asset in the manage-assets list.
+ * Shows a quantity input inline for QUANTITY_TRACKED assets when selected.
+ */
 const RowComponent = ({
   item,
+  extraProps,
 }: {
   item: AssetsFromViewItem & {
     location?: Prisma.LocationGetPayload<typeof LOCATION_WITH_HIERARCHY> | null;
+    availableQuantity?: number;
+    modelReservedElsewhere?: boolean;
+  };
+  extraProps?: {
+    quantities?: Record<string, number>;
+    onQuantityChange?: (assetId: string, quantity: number) => void;
   };
 }) => {
   const selectedBulkItems = useAtomValue(selectedBulkItemsAtom);
   const currentOrganization = useCurrentOrganization();
   const checked = selectedBulkItems.some((asset) => asset.id === item.id);
   const { category, tags, location } = item;
-  const isPartOfKit = !!item.kitId;
+  const isPartOfKit = (item.assetKits ?? []).length > 0;
   const isAddedThroughKit = isPartOfKit && checked;
+  const isQtyTracked = isQuantityTracked(item);
+  /** Show the quantity picker only when the asset is selected and is QUANTITY_TRACKED */
+  const showQuantityPicker = checked && isQtyTracked;
 
   return (
     <>
@@ -790,6 +1854,7 @@ const RowComponent = ({
                   mainImage: item.mainImage,
                   thumbnailImage: item.thumbnailImage,
                   mainImageExpiration: item.mainImageExpiration,
+                  assetModel: item.assetModel ?? null,
                 }}
                 alt={`Image of ${item.title}`}
                 className="size-full rounded-[4px] border object-cover"
@@ -803,36 +1868,94 @@ const RowComponent = ({
                 Single metadata line under the title — same composition as
                 every other picker/list surface (see
                 `.claude/rules/code-bearing-entity-list-consistency.md`):
-                status + availability first, code chip second. flex-wrap
-                keeps narrow viewports safe.
+                status/availability first, code chip last. flex-wrap keeps
+                narrow viewports safe. Qty-tracked assets show their own
+                "Qty tracked · N available" + consumption badges instead of
+                the plain status badge.
               */}
               <div className="flex flex-wrap items-center gap-2">
-                <When truthy={item.status === AssetStatus.AVAILABLE}>
-                  <AssetStatusBadge
-                    id={item.id}
-                    status={item.status}
-                    availableToBook={item.availableToBook}
-                  />
-                </When>
-
-                <AvailabilityLabel
-                  isAddedThroughKit={isAddedThroughKit}
-                  showKitStatus
-                  asset={item as unknown as AssetWithBooking}
-                  isCheckedOut={item.status === "CHECKED_OUT"}
-                />
+                {isQuantityTracked(item) ? (
+                  <>
+                    <Badge
+                      color={BADGE_COLORS.blue.bg}
+                      textColor={BADGE_COLORS.blue.text}
+                      withDot={false}
+                    >
+                      Qty tracked · {item.availableQuantity ?? item.quantity}{" "}
+                      available
+                    </Badge>
+                    <ConsumptionTypeBadge
+                      consumptionType={item.consumptionType ?? null}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <AssetStatusBadge
+                      id={item.id}
+                      status={item.status}
+                      availableToBook={item.availableToBook}
+                      asset={item}
+                    />
+                    <AvailabilityLabel
+                      isAddedThroughKit={isAddedThroughKit}
+                      showKitStatus
+                      asset={item as unknown as AssetWithBooking}
+                      isCheckedOut={item.status === "CHECKED_OUT"}
+                    />
+                  </>
+                )}
 
                 {currentOrganization ? (
                   <AssetCodeBadge
                     {...resolveDisplayCode({
                       entity: item,
                       organization: currentOrganization,
+                      entityKind: "asset",
                     })}
                   />
                 ) : null}
               </div>
             </div>
           </div>
+          {/* Quantity picker for QUANTITY_TRACKED assets */}
+          {showQuantityPicker ? (
+            <div
+              className="ml-auto flex shrink-0 items-center gap-2 pr-2"
+              role="presentation"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <label
+                htmlFor={`qty-${item.id}`}
+                className="text-xs text-gray-500"
+              >
+                Qty:
+              </label>
+              <input
+                id={`qty-${item.id}`}
+                type="number"
+                {...numberInputWheelGuard}
+                min={1}
+                max={item.availableQuantity ?? item.quantity ?? undefined}
+                value={extraProps?.quantities?.[item.id] ?? 1}
+                onChange={(e) => {
+                  const maxQty =
+                    item.availableQuantity ?? item.quantity ?? Infinity;
+                  const val = Math.max(
+                    1,
+                    Math.min(Number(e.target.value) || 1, maxQty)
+                  );
+                  extraProps?.onQuantityChange?.(item.id, val);
+                }}
+                className="h-8 w-16 rounded-md border border-gray-300 px-2 text-center text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                aria-label={`Quantity for ${item.title}`}
+              />
+              {(item.availableQuantity ?? item.quantity) != null ? (
+                <span className="text-xs text-gray-400">
+                  / {item.availableQuantity ?? item.quantity}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </Td>
 

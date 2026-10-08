@@ -34,20 +34,20 @@ model Image {
 }
 
 model User {
-  id                     String  @id @default(cuid())
-  email                  String  @unique
-  username               String  @unique @default(cuid())
-  firstName              String?
-  lastName               String?
-  displayName            String?
-  profilePicture         String?
-  usedFreeTrial          Boolean @default(false)
-  onboarded              Boolean @default(false)
-  customerId             String? @unique // Stripe customer id
-  sso                    Boolean @default(false)
-  createdWithInvite      Boolean @default(false) // Set to true if the user was created by being invited to a workspace
-  skipSubscriptionCheck  Boolean @default(false) // Set to true if the user has opted out of subscription checks
-  hasUnpaidInvoice       Boolean @default(false) // Set via Stripe webhooks when invoice payment fails
+  id                    String  @id @default(cuid())
+  email                 String  @unique
+  username              String  @unique @default(cuid())
+  firstName             String?
+  lastName              String?
+  displayName           String?
+  profilePicture        String?
+  usedFreeTrial         Boolean @default(false)
+  onboarded             Boolean @default(false)
+  customerId            String? @unique // Stripe customer id
+  sso                   Boolean @default(false)
+  createdWithInvite     Boolean @default(false) // Set to true if the user was created by being invited to a workspace
+  skipSubscriptionCheck Boolean @default(false) // Set to true if the user has opted out of subscription checks
+  hasUnpaidInvoice     Boolean @default(false) // Set via Stripe webhooks when invoice payment fails
   warnForNoPaymentMethod Boolean @default(false) // Set when subscription is transferred to a user without a payment method
 
   // Last selected organization for cross-device workspace persistence
@@ -68,38 +68,47 @@ model User {
   // recently-active member (join via UserOrganization). Null until first use.
   lastMobileActiveAt DateTime?
 
+  // User datetime-formatting preferences. Nullable: null = not yet detected, so
+  // the resolver falls back to live browser hints (today's behavior) until the
+  // user's next authenticated load lazily backfills concrete values. See
+  // ~/utils/date-format (resolveFormatPrefs / detectFormatPrefsFromHints).
+  dateFormat DateFormatPreference? // null → not yet detected
+  timeFormat TimeFormatPreference? // null → not yet detected
+  weekStart  WeekStartPreference?  // null → not yet detected
+  timeZone   String?               // IANA name; null → not yet detected
+
   // Relationships
-  assets              Asset[]
-  categories          Category[]
-  notes               Note[]
-  bookingNotes        BookingNote[]      @relation("BookingNoteUser")
-  auditNotes          AuditNote[]        @relation("AuditNoteUser")
-  locationNotes       LocationNote[]     @relation("LocationNoteUser")
-  qrCodes             Qr[]
-  scans               Scan[]
-  tags                Tag[]
-  roles               Role[]
-  locations           Location[]
-  images              Image[]
-  organizations       Organization[]
-  customFields        CustomField[]
-  sentInvites         Invite[]           @relation("inviter")
-  receivedInvites     Invite[]           @relation("invitee")
-  teamMembers         TeamMember[]
-  userOrganizations   UserOrganization[]
-  bookings            Booking[]          @relation("creator")
-  custodies           Booking[]          @relation("custodian")
-  createdKits         Kit[]
-  tierId              TierId             @default(free)
-  tier                Tier               @relation(fields: [tierId], references: [id])
-  assetReminders      AssetReminder[]
-  contact             UserContact?
-  businessIntel       UserBusinessIntel?
-  auditsCreated       AuditSession[]
-  auditAssignments    AuditAssignment[]
-  auditAssetsScanned  AuditAsset[]
-  auditScans          AuditScan[]
-  auditImagesUploaded AuditImage[]       @relation("AuditImageUploader")
+  assets             Asset[]
+  categories         Category[]
+  notes              Note[]
+  bookingNotes      BookingNote[]      @relation("BookingNoteUser")
+  auditNotes        AuditNote[]        @relation("AuditNoteUser")
+  locationNotes     LocationNote[]     @relation("LocationNoteUser")
+  qrCodes            Qr[]
+  scans              Scan[]
+  tags               Tag[]
+  roles              Role[]
+  locations          Location[]
+  images             Image[]
+  organizations      Organization[]
+  customFields       CustomField[]
+  sentInvites        Invite[]           @relation("inviter")
+  receivedInvites    Invite[]           @relation("invitee")
+  teamMembers        TeamMember[]
+  userOrganizations  UserOrganization[]
+  bookings           Booking[]          @relation("creator")
+  custodies          Booking[]          @relation("custodian")
+  createdKits        Kit[]
+  tierId             TierId             @default(free)
+  tier               Tier               @relation(fields: [tierId], references: [id])
+  assetReminders     AssetReminder[]
+  contact            UserContact?
+  businessIntel      UserBusinessIntel?
+  auditsCreated      AuditSession[]
+  auditAssignments   AuditAssignment[]
+  auditAssetsScanned AuditAsset[]
+  auditScans         AuditScan[]
+  auditImagesUploaded AuditImage[] @relation("AuditImageUploader")
 
   // @deprecated - Historical data only. New entries go to UserBusinessIntel table
   referralSource String? // "How did you hear about us?" field.
@@ -107,8 +116,11 @@ model User {
   // A user can have multiple asset index settings, 1 for each organization
   assetIndexSettings AssetIndexSettings[]
 
-  partialCheckins PartialBookingCheckin[] @relation("PartialCheckinUser")
+  partialCheckins  PartialBookingCheckin[]  @relation("PartialCheckinUser")
   partialCheckouts PartialBookingCheckout[] @relation("PartialCheckoutUser")
+
+  // Native-app SSO web-delegated login — single-use session-handoff codes
+  mobileAuthCodes MobileAuthCode[]
 
   // Updates feature
   createdUpdates Update[]
@@ -118,9 +130,11 @@ model User {
   customTierLimit CustomTierLimit?
 
   assetFilterPresets AssetFilterPreset[]
+  assetModels        AssetModel[]
+  consumptionLogs    ConsumptionLog[]
 
-  // Native-app SSO web-delegated login — single-use session-handoff codes
-  mobileAuthCodes MobileAuthCode[]
+  // Org-scoped SCIM external IDs (one per org, managed by the org's identity provider)
+  scimExternalIds UserScimExternalId[]
 
   // Role change audit log
   roleChangesReceived  RoleChangeLog[] @relation("roleChangeTarget")
@@ -131,6 +145,11 @@ model User {
 
   @@unique([email, username])
   @@index([firstName, lastName])
+  // Invites and CSV import match an account without regard to letter case,
+  // comparing LOWER("email"), which the unique btree above cannot serve.
+  // Prisma has no syntax for an expression index, so it is created in
+  // migrations/20260921100000_add_user_email_lower_index.
+  // @@index([lower(email)])
   // Indexes for foreign keys
   @@index([tierId])
   @@index([lastSelectedOrganizationId])
@@ -178,6 +197,16 @@ model UserBusinessIntel {
   currentSolution      String? // How they currently track assets
   timeline             String? // When they need Shelf working
 
+  // Signup attribution: what the signup link asked for and where it came from.
+  // Read from `/join?plan=…&trial=…&utm_*=…`, written once when the user
+  // completes onboarding. Steers nothing after that; kept for reporting.
+  signupPlan  String? // Plan the link asked for: "team" | "plus"
+  signupTrial Boolean? // Whether the link asked to start with a trial
+  utmSource   String?
+  utmMedium   String?
+  utmCampaign String?
+  utmContent  String?
+
   // Relationships
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   userId String @unique
@@ -191,6 +220,8 @@ model UserBusinessIntel {
   @@index([companyName]) // For company-based analytics
   @@index([jobTitle]) // For role-based analytics
   @@index([teamSize]) // For team size analytics
+  @@index([utmSource]) // For campaign attribution
+  @@index([utmCampaign]) // For campaign attribution
 }
 
 model Asset {
@@ -205,6 +236,21 @@ model Asset {
   availableToBook     Boolean     @default(true)
   sequentialId        String? // Sequential identifier for the asset (e.g., "SAM-0001")
 
+  // Tracking method & model
+  type            AssetType        @default(INDIVIDUAL)
+  assetModelId    String?
+  assetModel      AssetModel?      @relation(fields: [assetModelId], references: [id])
+
+  // Quantity-tracked fields (null for INDIVIDUAL assets)
+  quantity        Int? // Total quantity at this location
+  minQuantity     Int? // Low-stock alert threshold
+  consumptionType ConsumptionType? // How consumption is tracked
+  unitOfMeasure   String? // e.g., "pcs", "boxes", "liters"
+  // Debounce marker for low-stock alerting: set when available first crosses
+  // to/below minQuantity (alert sent), cleared when it recovers above. Prevents
+  // re-alerting on every subsequent decrement while already low.
+  lowStockNotifiedAt DateTime?
+
   // Datetime
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -216,22 +262,26 @@ model Asset {
   organizationId String
   category       Category?    @relation(fields: [categoryId], references: [id])
   categoryId     String?
-  location       Location?    @relation(fields: [locationId], references: [id])
-  locationId     String?
-  kit            Kit?         @relation(fields: [kitId], references: [id])
-  kitId          String?
+  // No `Asset.location` / `locationId` FK — location lives on the
+  // `AssetLocation` pivot (see `assetLocations` below). QUANTITY_TRACKED
+  // assets can be placed at multiple locations at distinct slices;
+  // INDIVIDUAL assets are capped at one row via the
+  // `enforce_individual_asset_single_location` trigger.
 
-  custody      Custody?
+  custody      Custody[]
   notes        Note[]
   qrCodes      Qr[]
-  barcodes     Barcode[]               @relation("AssetBarcodes")
+  barcodes     Barcode[]              @relation("AssetBarcodes")
   reports      ReportFound[]
   tags         Tag[]
   customFields AssetCustomFieldValue[]
-  bookings     Booking[]
-  reminders    AssetReminder[]
-  auditEntries AuditAsset[]
-  auditScans   AuditScan[]
+  bookingAssets   BookingAsset[]
+  consumptionLogs ConsumptionLog[]
+  reminders       AssetReminder[]
+  auditEntries    AuditAsset[]
+  auditScans      AuditScan[]
+  assetKits      AssetKit[]
+  assetLocations AssetLocation[]
 
   // Per-asset override: when an org has multiple linked Barcodes (only possible
   // with the barcode add-on), this picks the specific Barcode to display in
@@ -256,10 +306,16 @@ model Asset {
   @@index([organizationId, title, status, availableToBook], name: "Asset_organizationId_compound_idx")
   @@index([status, organizationId], name: "Asset_status_organizationId_idx")
   @@index([createdAt, organizationId], name: "Asset_createdAt_organizationId_idx")
+  // Serves the advanced index's default view: WHERE organizationId = ?
+  // ORDER BY createdAt DESC, id ASC LIMIT n. Column order (org first, then
+  // createdAt DESC, then id) lets Postgres seek the org and read the page
+  // straight off the index — no full scan + sort of the workspace. The
+  // reversed-order index above (createdAt, organizationId) can't early-terminate
+  // this query.
+  @@index([organizationId, createdAt(sort: Desc), id], name: "Asset_organizationId_createdAt_id_idx")
   @@index([valuation, organizationId], name: "Asset_valuation_organizationId_idx")
   @@index([categoryId, organizationId], name: "Asset_categoryId_organizationId_idx")
-  @@index([locationId, organizationId], name: "Asset_locationId_organizationId_idx")
-  @@index([kitId, organizationId], name: "Asset_kitId_organizationId_idx")
+  @@index([assetModelId, organizationId], name: "Asset_assetModelId_organizationId_idx")
   @@index([sequentialId], name: "Asset_sequentialId_idx")
   // Index for foreign key
   @@index([userId])
@@ -269,6 +325,29 @@ enum AssetStatus {
   AVAILABLE
   IN_CUSTODY
   CHECKED_OUT
+}
+
+/** Determines how an asset is tracked throughout the system. Immutable after creation. */
+enum AssetType {
+  INDIVIDUAL // Default. One row = one physical item.
+  QUANTITY_TRACKED // One row = N fungible items at a location.
+}
+
+/** Controls what happens after checkout for quantity-tracked assets. */
+enum ConsumptionType {
+  ONE_WAY // Checked out and consumed. No return expected.
+  TWO_WAY // Checked out and returned, with consumption report.
+}
+
+/** Classifies the type of quantity change in a ConsumptionLog entry. */
+enum ConsumptionCategory {
+  CHECKOUT // Items checked out to a custodian or booking
+  RETURN // Items returned from a custodian or booking
+  RESTOCK // New stock added (shipment arrived, manual increase)
+  ADJUSTMENT // Manual correction (inventory count, error fix)
+  LOSS // Items reported lost or missing (will not be returned)
+  CONSUME // Items used as intended (ONE_WAY consumables — e.g. AA batteries, latex gloves)
+  DAMAGE // Items returned but unusable — distinct from LOSS for reporting
 }
 
 model AssetFilterPreset {
@@ -342,7 +421,8 @@ model Category {
   user   User    @relation(fields: [userId], references: [id], onUpdate: Cascade)
   userId String
 
-  customFields CustomField[]
+  customFields       CustomField[]
+  assetModelDefaults AssetModel[] // Asset models that use this category as their default
 
   organization   Organization @relation(fields: [organizationId], references: [id], onUpdate: Cascade, onDelete: Cascade)
   organizationId String
@@ -353,6 +433,111 @@ model Category {
   @@index([userId])
   // Trigram index for substring search from the asset-list search bar
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, name: "Category_name_trgm_idx")
+}
+
+/**
+ * A template/grouping entity for assets.
+ * Groups individual assets of the same type (e.g., "Dell Latitude 5550")
+ * and provides default field values when creating new assets from the model.
+ */
+model AssetModel {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+
+  /// Public URL (bucket `files`) of the model's cover image. Rendered by any
+  /// asset of this model that has no image of its own. Public — and therefore
+  /// never-expiring and cacheable — like Location.imageUrl; see
+  /// resolveAssetImage() for the cascade.
+  image String?
+
+  /// Public URL of the 108px thumbnail generated alongside `image`. Used at
+  /// list sizes so inheriting assets never render the full-size original.
+  thumbnailImage String?
+
+  // Template defaults (applied when creating a new asset from this model)
+  defaultCategoryId String?
+  defaultCategory   Category? @relation(fields: [defaultCategoryId], references: [id])
+  defaultValuation  Float?
+
+  // Relationships
+  assets         Asset[]
+  modelRequests  BookingModelRequest[]
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  organizationId String
+  createdBy      User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  userId         String
+
+  // Datetime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId, name])
+  @@index([userId])
+  // Trigram index for substring search from the asset-list search bar
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, name: "AssetModel_name_trgm_idx")
+}
+
+/// Book-by-Model: intent row attached to a booking for a quantity of
+/// assets of a given AssetModel, without yet picking specific assets.
+/// Concrete `BookingAsset` rows are only created at
+/// scan-to-assign time; when the last unit is assigned, the request
+/// row is deleted. `quantity` is the number of units still needing
+/// assignment (starts at the full requested total, decrements on scan).
+///
+/// Keeping model requests separate from `BookingAsset` means the ~40
+/// code paths that assume `BookingAsset.assetId` points to a real
+/// asset stay untouched — model-only bookings become concrete the
+/// moment they're checked out.
+model BookingModelRequest {
+  id String @id @default(cuid())
+
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  bookingId String
+
+  assetModel   AssetModel @relation(fields: [assetModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assetModelId String
+
+  /// Total units originally reserved. Mutated only by explicit
+  /// operator edits (upsert) — never decremented on materialisation.
+  /// This preserves the audit trail of "how many were planned".
+  quantity Int
+
+  /// Units already assigned to concrete `BookingAsset` rows via
+  /// `materializeModelRequestForAsset`. Scans increment it.
+  ///
+  /// It DOES decrease: `removeAssets` (booking service) decrements it by the
+  /// number of removed `BookingAsset` rows whose `bookingModelRequestId`
+  /// points at this request, floored at 0, and clears `fulfilledAt` when the
+  /// result drops below `quantity`.
+  ///
+  /// Counted from that column, never from a shared `assetModelId`: an asset
+  /// added directly alongside a reservation shares the model without having
+  /// discharged anything, so grouping by model re-opened reservations that
+  /// were still correctly satisfied.
+  fulfilledQuantity Int @default(0)
+
+  /// Timestamp of the moment the reservation became fully fulfilled — set
+  /// when `fulfilledQuantity` catches up to `quantity`, and preserved (not
+  /// re-stamped) if an unchanged quantity is saved again. Cleared back to
+  /// null when outstanding units reappear: the operator edits `quantity`
+  /// upwards, or `removeAssets` drops `fulfilledQuantity` below it.
+  ///
+  /// The invariant that makes this the primary "is this outstanding?" filter:
+  /// non-null IFF `fulfilledQuantity === quantity`, so `fulfilledAt IS NULL`
+  /// means units remain to materialise. `fulfilledQuantity` can never exceed
+  /// `quantity` (the claim in `materializeModelRequestForAsset` is a single
+  /// statement guarded by `WHERE "fulfilledQuantity" < "quantity"`; upsert
+  /// rejects a shrink below it), so any decrement re-opens the row.
+  fulfilledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // One request row per (booking, model) — reserving 5 × Dell Latitude
+  // is a single row with quantity=5, not five rows with quantity=1.
+  @@unique([bookingId, assetModelId])
+  @@index([assetModelId])
 }
 
 enum TagUseFor {
@@ -617,6 +802,13 @@ model Scan {
   // Indexes for foreign keys
   @@index([qrId])
   @@index([userId])
+  // Serves getScanByQrId (last-scan card on asset overview + kit detail):
+  // WHERE rawQrId = ? ORDER BY createdAt DESC LIMIT 1. Scan is a global,
+  // append-only table (public QR hits + companion scans, never pruned), so
+  // without this index every page view pays a full sequential scan of all
+  // tenants' scan history. rawQrId seeks the QR; createdAt lets the top-1
+  // sort early-terminate (Postgres walks the btree backwards for DESC).
+  @@index([rawQrId, createdAt])
 }
 
 model Location {
@@ -646,9 +838,18 @@ model Location {
   organization   Organization @relation(fields: [organizationId], references: [id], onUpdate: Cascade, onDelete: Cascade)
   organizationId String
 
-  assets Asset[]
-  kits   Kit[]
-  notes  LocationNote[] @relation("LocationNotes")
+  // Asset placement is via the `AssetLocation` pivot; `kits` stays a
+  // direct relation since `Kit.locationId` remains a FK (kits have a
+  // single location, like INDIVIDUAL assets).
+  assetLocations AssetLocation[]
+  kits           Kit[]
+  notes          LocationNote[] @relation("LocationNotes")
+
+  // Quantity custody taken from this location, and the stock movements
+  // recorded against it. Both point at the location itself, never at an
+  // `AssetLocation` row, so moving a kit or re-creating a placement keeps them.
+  custodies       Custody[]
+  consumptionLogs ConsumptionLog[]
 
   // Self-relation for nested locations
   parentId String?
@@ -660,11 +861,8 @@ model Location {
   @@index([organizationId])
   @@index([userId])
   @@index([organizationId, parentId])
-  // Trigram indexes for substring (ILIKE '%term%') search from the locations
-  // index search bar, which matches name + description + address.
+  // Trigram index for substring search from the asset-list search bar
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, name: "Location_name_trgm_idx")
-  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, name: "Location_description_trgm_idx")
-  @@index([address(ops: raw("gin_trgm_ops"))], type: Gin, name: "Location_address_trgm_idx")
 }
 
 // Master data for roles
@@ -695,11 +893,12 @@ model TeamMember {
   userId          String?
   kitCustodies    KitCustody[]
 
-  createdAt       DateTime         @default(now())
-  updatedAt       DateTime         @updatedAt
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
   deletedAt       DateTime?
   bookings        Booking[]
   assetReminders  AssetReminder[]
+  consumptionLogs ConsumptionLog[]
   teamMemberNotes TeamMemberNote[]
 
   // Booking notification settings
@@ -720,15 +919,58 @@ model Custody {
   teamMemberId String
 
   asset   Asset  @relation(fields: [assetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  assetId String @unique
+  assetId String
+
+  // When this custody row was created because the asset's kit is in
+  // custody, this points to the KitCustody row that triggered it. Null
+  // for operator-assigned custody. ON DELETE CASCADE so releasing kit
+  // custody automatically removes the asset-side rows that were
+  // inherited from the kit, while leaving operator-assigned rows
+  // (kitCustodyId = null) untouched.
+  kitCustody    KitCustody? @relation(fields: [kitCustodyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  kitCustodyId  String?
+
+  quantity Int @default(1) // How many units in custody (1 for individual assets)
+
+  // The manual placement the units were taken from, for a quantity-tracked
+  // asset's operator custody. NULL means the unplaced units, or a source that
+  // was never recorded: `sourceUnknown` tells the two apart. Always NULL for
+  // kit-inherited rows and for individual assets. Custody never changes a
+  // location's count: this only says which location loses the units when
+  // they are used up. `onDelete: SetNull` so deleting the location keeps the
+  // custody.
+  location   Location? @relation(fields: [locationId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  locationId String?
+
+  // True when the assignment did not say where the units came from and the
+  // pool had more than one place they could have come from. Only ever true
+  // with `locationId` NULL. Such units count against no location and never
+  // against the unplaced units; the pool-wide cap still bounds them.
+  sourceUnknown Boolean @default(false)
 
   // DateTime
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Two partial uniques live in raw SQL (Prisma can't express partial
+  // uniques in the schema); see migrations
+  // 20260603100000_custody_partial_uniques_split_operator_kit,
+  // 20260925100000_custody_source_location and
+  // 20261006100000_custody_source_unknown:
+  //   - Custody_operator_unique -> UNIQUE (assetId, teamMemberId, locationId,
+  //                                sourceUnknown) NULLS NOT DISTINCT
+  //                                WHERE "kitCustodyId" IS NULL
+  //     One operator row per holder per source: a location, the unplaced
+  //     units, or a source never recorded.
+  //   - Custody_kit_unique      -> UNIQUE (assetId, kitCustodyId)
+  //                                WHERE "kitCustodyId" IS NOT NULL
+  // The total cap (sum <= Asset.quantity) is enforced at the application
+  // layer by buildKitCustodyInheritData / checkOutQuantity.
   @@index([assetId, teamMemberId], name: "Custody_assetId_teamMemberId_idx")
   // Index for foreign key
   @@index([teamMemberId])
+  @@index([kitCustodyId])
+  @@index([locationId])
 }
 
 model Organization {
@@ -742,6 +984,8 @@ model Organization {
 
   members TeamMember[]
   assets  Asset[]
+  assetKits AssetKit[]
+  assetLocations AssetLocation[]
 
   image   Image?  @relation("orgImage", fields: [imageId], references: [id])
   imageId String? @unique
@@ -767,9 +1011,9 @@ model Organization {
   usedBarcodeTrial  Boolean   @default(false) // Set once a 7-day free barcode trial is activated (prevents reuse)
 
   // Audit add-on (per-organization, managed via Stripe subscription)
-  auditsEnabled   Boolean   @default(false) // If true, this organization can use audit functionality
-  auditsEnabledAt DateTime? // Track when audit feature was enabled
-  usedAuditTrial  Boolean   @default(false) // Set once a 7-day free audit trial is activated (prevents reuse)
+  auditsEnabled    Boolean   @default(false) // If true, this organization can use audit functionality
+  auditsEnabledAt  DateTime? // Track when audit feature was enabled
+  usedAuditTrial   Boolean   @default(false) // Set once a 7-day free audit trial is activated (prevents reuse)
 
   // This is used to disable the workspace for the user. It is set to true when the user leaves the workspace
   workspaceDisabled Boolean @default(false) // If true, the workspace is disabled and the user cannot access it
@@ -788,17 +1032,22 @@ model Organization {
   images             Image[]              @relation("owner")
   bookings           Booking[]
   kits               Kit[]
+  assetModels        AssetModel[]
   assetIndexSettings AssetIndexSettings[]
   assetReminders     AssetReminder[]
   assetFilterPresets AssetFilterPreset[]
 
-  auditSessions AuditSession[]
-  auditImages   AuditImage[]
+  auditSessions      AuditSession[]
+  auditImages        AuditImage[]
 
-  usersWithLastSelected User[]           @relation("lastSelectedOrg")
-  roleChangeLogs        RoleChangeLog[]
-  teamMemberNotes       TeamMemberNote[]
-  activityEvents        ActivityEvent[]
+  usersWithLastSelected User[] @relation("lastSelectedOrg")
+  
+  scimTokens      ScimToken[]
+  scimExternalIds UserScimExternalId[]
+  roleChangeLogs  RoleChangeLog[]
+  teamMemberNotes     TeamMemberNote[]
+  activityEvents      ActivityEvent[]
+
 
   // Migration flag to track if sequential IDs have been generated for this organization's existing assets
   hasSequentialIdsMigrated Boolean @default(false)
@@ -808,6 +1057,10 @@ model Organization {
 
   // Branding preference for downloadable labels
   showShelfBranding Boolean @default(true)
+
+  // Whether the booking checklist and audit receipt PDFs print the QR image.
+  // Off means the sheet cannot be scanned in place of the label on the item.
+  showQrCodesOnPdfs Boolean @default(true)
 
   // Custom footer text appended to workspace emails
   customEmailFooter String? @db.VarChar(500)
@@ -828,6 +1081,12 @@ model UserOrganization {
   roles     OrganizationRoles[]
   createdAt DateTime            @default(now())
   updatedAt DateTime            @updatedAt
+
+  /// Secret, unguessable token for this member's iCal calendar-feed subscription
+  /// in this workspace. Null until the user generates a feed; regenerating it
+  /// rotates the value (invalidating any previously-shared subscription URL).
+  /// `@unique` doubles as the lookup index for the public feed route.
+  calendarTokenId String? @unique
 
   @@unique([userId, organizationId])
   // Index for foreign key
@@ -851,6 +1110,29 @@ enum QrIdDisplayPreference {
   EAN13
 }
 
+// User date-format preference — controls day/month/year ordering in rendered
+// dates. Stored per-User (nullable); null resolves from live browser hints.
+enum DateFormatPreference {
+  DD_MM_YYYY // e.g. 03/04/2026
+  MM_DD_YYYY // e.g. 04/03/2026
+  YYYY_MM_DD // e.g. 2026-04-03
+  MMM_DD_YYYY // e.g. Jul 20, 2026
+  DD_MMM_YYYY // e.g. 20 Jul 2026
+}
+
+// User time-format preference — 12-hour (AM/PM) vs 24-hour clock.
+enum TimeFormatPreference {
+  H12 // 1:30 PM
+  H24 // 13:30
+}
+
+// User "start of week" preference for calendar/date-picker rendering.
+enum WeekStartPreference {
+  MONDAY
+  SUNDAY
+  SATURDAY
+}
+
 enum OrganizationRoles {
   ADMIN
   BASE
@@ -870,9 +1152,55 @@ model SsoDetails {
   selfServiceGroupId String? // The group id for SELF_SERVICE users
   adminGroupId       String? // The group id for ADMIN users
 
+  // Whether legacy sign-in (password, email code, password reset) is refused
+  // for unconverted accounts on this setup's domain. Owners of a linked
+  // workspace keep legacy sign-in either way. Shelf staff turn it off only
+  // while setting up and testing SSO with a few users.
+  requireSsoLogin Boolean @default(true)
+
   // Datetime
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model ScimToken {
+  id        String @id @default(cuid())
+  tokenHash String @unique // SHA-256 hash of the raw bearer token
+
+  label String // Human-friendly label, e.g. "Entra ID Production"
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organizationId String
+
+  createdById String // User ID of the admin who created this token
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  @@index([organizationId])
+}
+
+/**
+ * Org-scoped SCIM external ID linking a Shelf user to an identity-provider
+ * object within a specific organization.  A single Shelf user can appear in
+ * multiple organizations, each managed by a different identity provider, so the
+ * external ID must be scoped to the (user, organization) pair.
+ */
+model UserScimExternalId {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  scimExternalId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([userId, organizationId])
+  // The SCIM-facing resource id is the per-org external id (the IdP object id),
+  // so it must be unique within an org and safe to resolve `/Users/{id}` against.
+  @@unique([organizationId, scimExternalId])
+  @@index([organizationId])
 }
 
 // Tier Ids are used to identify tiers (products) in Stripe. They must be predictable in our model.
@@ -1189,46 +1517,6 @@ model Invite {
   @@index([teamMemberId])
 }
 
-// Single-use authorization codes for native-app SSO login (web-delegated auth).
-// After a user authenticates via SSO in the system browser, the web mints a row
-// here and hands the app the plaintext `code` via the `shelf://` deeplink. The
-// app redeems it at `POST /api/mobile/exchange`, which validates the code and
-// mints a FRESH, independent Supabase session for the device — the web session's
-// tokens are never transferred, so web and mobile keep independent token
-// families (no refresh-rotation cascade). Single-use, short-lived (~60s).
-//
-// @see apps/webapp/app/modules/auth/mobile-sso.server.ts
-// @see apps/webapp/app/routes/_auth+/oauth.callback.mobile.tsx
-model MobileAuthCode {
-  id String @id @default(cuid())
-
-  // The user this code authorizes a session for.
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  userId String
-
-  // SHA-256 hash of the single-use plaintext code. The plaintext only ever
-  // lives in the deeplink + the exchange request body — never stored.
-  codeHash String @unique
-
-  // PKCE (S256) challenge — base64url(SHA-256(verifier)) — set when the minting
-  // client is PKCE-capable. NULL for legacy (pre-PKCE) app builds, which redeem
-  // without a verifier (backward compatible).
-  codeChallenge String?
-
-  // Single-use guard: set when redeemed. A non-null value rejects reuse.
-  consumedAt DateTime?
-
-  // Short TTL (~60s). Rejected once `now > expiresAt`.
-  expiresAt DateTime
-
-  createdAt DateTime @default(now())
-
-  // Indexes for foreign keys
-  @@index([userId])
-  // For periodic cleanup of expired, unredeemed rows
-  @@index([expiresAt])
-}
-
 model Announcement {
   id String @id @default(cuid())
 
@@ -1254,6 +1542,250 @@ enum BookingStatus {
   CANCELLED
 }
 
+/**
+ * Audit trail for all quantity changes on quantity-tracked assets.
+ * Every event records who performed it, who received/returned items,
+ * which booking it relates to, and the category of change.
+ * Quantity is always positive — direction is determined by category.
+ */
+model ConsumptionLog {
+  id        String              @id @default(cuid())
+  asset     Asset               @relation(fields: [assetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assetId   String
+  category  ConsumptionCategory
+  quantity  Int // Always positive. Direction determined by category (Decision #9).
+  note      String?
+
+  performedBy User   @relation(fields: [userId], references: [id])
+  userId      String
+
+  booking   Booking? @relation(fields: [bookingId], references: [id])
+  bookingId String?
+
+  custodian   TeamMember? @relation(fields: [custodianId], references: [id])
+  custodianId String? // Who received/returned the items (if applicable)
+
+  // Per-row attribution for QUANTITY_TRACKED check-in. With Polish-6 a
+  // single (booking, asset) pair can have multiple BookingAsset rows
+  // (kit-driven + standalone slices); aggregating dispositions by
+  // (bookingId, assetId) alone can't distinguish "the kit slice is
+  // done" from "all slices are done". `bookingAssetId` points the log
+  // at the specific row the units were returned/consumed against.
+  //
+  // Declared as a plain column without a Prisma `@relation` accessor
+  // (same pattern as `BookingAsset.assetKitId`) to avoid deep-generic
+  // explosion on read paths that pull ConsumptionLog through Booking
+  // / Asset graphs. The migration SQL creates a proper FK with
+  // `ON DELETE SET NULL` so removing a BookingAsset row doesn't lose
+  // history — the log stays but loses its per-row attribution.
+  //
+  // Legacy rows (pre-Polish-6, pre-this-migration) keep `NULL` and are
+  // handled by a greedy-fill fallback in readers (kit-driven slices
+  // attribute first, then standalone) so existing bookings still
+  // render sensibly.
+  bookingAssetId String?
+
+  // The location the units left or arrived at, when the movement had one:
+  // the custody source for CHECKOUT / RETURN / CONSUME, and the chosen
+  // location for a RESTOCK / LOSS / ADJUSTMENT made at a location. NULL for
+  // the unplaced units and for rows written before the column existed.
+  location   Location? @relation(fields: [locationId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  locationId String?
+
+  // Datetime
+  createdAt DateTime @default(now())
+
+  @@index([assetId, createdAt])
+  @@index([userId])
+  @@index([bookingId])
+  @@index([custodianId])
+  @@index([bookingAssetId])
+  @@index([locationId])
+}
+
+/**
+ * Explicit pivot table between Booking and Asset.
+ * Replaces the implicit M2M (_AssetToBooking) via a rename migration in Phase 3.
+ */
+model BookingAsset {
+  id        String  @id @default(cuid())
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  bookingId String
+  asset     Asset   @relation(fields: [assetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assetId   String
+  quantity  Int     @default(1) // For quantity-tracked assets: how many booked
+
+  // The model reservation this row discharged, when it came from one. `null`
+  // for assets added directly — picked or scanned onto a booking with no
+  // matching reservation to answer. That is most rows.
+  //
+  // A kit-driven row carries it too: a unit sitting inside a kit answers a
+  // promise for units of its model exactly like a loose one, and the pool math
+  // counts it either way. At most ONE row per (booking, asset) is ever stamped
+  // — one physical unit discharges one reserved unit, however many rows the
+  // asset holds on the booking.
+  //
+  // Without it the link is narrative only: `materializeModelRequestForAsset`
+  // writes a note ("assigned X (Model A) — 2 remaining") and then the
+  // relationship is gone. An assigned asset becomes indistinguishable from one
+  // added by hand, so "which assets discharged the LED reservation?" is not
+  // answerable from data, only by reading the activity feed.
+  //
+  // Deliberately a plain column without a Prisma `@relation` accessor, for
+  // exactly the reason spelled out on `assetKitId` below — adding one more
+  // relation to this model pushed the dynamic extended client's deep generic
+  // past TS's recursion limit (TS2321), first in `organization/service.server`
+  // and then in `asset/service.server`. Services read it directly:
+  //   db.bookingAsset.findMany({ where: { bookingModelRequestId } })
+  //   db.bookingAsset.create({ data: { ..., bookingModelRequestId } })
+  //
+  // `SET NULL` cascade (DB-enforced, not Prisma) means a vanished reservation
+  // costs the row its provenance, never its place in the booking — the asset
+  // stays physically committed. In practice this rarely fires:
+  // `removeBookingModelRequest` refuses to delete a request with
+  // `fulfilledQuantity > 0`, so the realistic path is the booking cascade,
+  // which removes both rows together.
+  bookingModelRequestId String?
+
+  // Discriminator for "this booked slice came from a kit" vs "this booked
+  // slice is standalone from the asset's free pool". Mirror of
+  // `Custody.kitCustodyId` and `AssetLocation.assetKitId`. `null` =
+  // standalone; non-null = kit-driven slice (FK points at `AssetKit.id`).
+  //
+  // Deliberately declared as a plain column without a Prisma `@relation`
+  // accessor — the migration SQL creates a proper FK to `AssetKit("id")`
+  // with `ON DELETE SET NULL ON UPDATE CASCADE`, but exposing the relation
+  // at the Prisma type level pushes the dynamic extended client's deep
+  // generic past TS's recursion limit (TS2321) in several services because
+  // `Booking` (this row's grandparent) is a hub model with many relations.
+  // Services query kit-driven rows directly via
+  //   db.bookingAsset.findMany({ where: { assetKitId } })
+  // and create them with
+  //   db.bookingAsset.create({ data: { ..., assetKitId } })
+  // — no Prisma-level relation traversal is needed.
+  //
+  // `SET NULL` cascade (DB-enforced, not Prisma) means removing an asset
+  // from a kit converts the kit-driven booking slice into a standalone
+  // reservation rather than silently shrinking an active booking. The
+  // service layer emits a system note + audit event so the user sees the
+  // conversion.
+  assetKitId String?
+
+  // Durable provenance: the `Kit` this slice was booked under. Unlike
+  // `assetKitId` — which points at the `AssetKit` MEMBERSHIP row and is
+  // `SET NULL`'d the moment the asset leaves the kit — this survives
+  // membership changes, so a booking still knows the slice arrived as part
+  // of a kit after the kit's contents change.
+  //
+  // Read by duplication, kit-drift, and display grouping (a slice whose asset
+  // has left the kit still renders under that kit on bookings past the planning
+  // stage). All availability/quantity math keeps using `assetKitId`, which
+  // remains the source of truth for LIVE membership. The two are related,
+  // never redundant:
+  //   assetKitId NOT NULL -> sourceKitId NOT NULL, and they agree
+  //   assetKitId NULL + sourceKitId NOT NULL -> detached kit residue
+  //   both NULL                              -> genuine standalone slice
+  //
+  // Same plain-column treatment as `assetKitId` above: the FK to `Kit("id")`
+  // with `ON DELETE SET NULL ON UPDATE CASCADE` is created in the migration
+  // SQL, NOT via a Prisma `@relation`. Declaring the relation would add a
+  // `bookingAssets` back-relation to `Kit` — a hub model — and push the
+  // extended client's generics past TS's recursion limit (TS2321).
+  //
+  // `SET NULL` on kit deletion is deliberate: deleting a kit degrades its
+  // slices to loose assets on existing bookings, which is exactly what
+  // happened before this column existed, so no behaviour regresses.
+  sourceKitId String?
+
+  // Whether THIS slice is currently checked out on THIS booking, and by whom.
+  // `checkedOutAt` NULL = never checked out here.
+  //
+  // This is the authoritative answer to "may this slice be checked in?", and
+  // nothing else can give it:
+  //   - `Asset.status` is global. An asset may be CHECKED_OUT by a DIFFERENT
+  //     active booking while never having been checked out on this one.
+  //   - `PartialBookingCheckout` records progressive scan SESSIONS only. The
+  //     all-at-once checkout writes none at all, so the absence of rows says
+  //     nothing about whether an asset went out — see the note on that model.
+  //
+  // Slice-grained rather than asset-grained because a QUANTITY_TRACKED asset is
+  // split across several bookings and several slices at once, so no single
+  // column on `Asset` could represent it.
+  //
+  // `checkedInAt` means FULLY reconciled, matching `PartialBookingCheckin`'s
+  // `assetIds` semantics: a partially-returned qty-tracked slice stays NULL and
+  // its flow back is tracked by `ConsumptionLog`.
+  //
+  // Same plain-column treatment as `assetKitId` / `sourceKitId` above — the
+  // user columns are deliberately NOT Prisma `@relation`s. Adding another
+  // relation to this model (whose grandparent `Booking` is a hub) pushes the
+  // extended client's generics past TS's recursion limit (TS2321). Services
+  // read the ids directly; no relation traversal is needed.
+  checkedOutAt   DateTime? @db.Timestamptz(3)
+  checkedOutById String?
+  checkedInAt    DateTime? @db.Timestamptz(3)
+  checkedInById  String?
+
+  // How many of this slice's units have been sent out on this booking.
+  //
+  // `checkedOutAt` answers WHETHER any units left; this answers HOW MANY. A
+  // QUANTITY_TRACKED slice can go out a few units at a time, and a timestamp
+  // cannot express "3 of 10 are out" — so any reader deriving an obligation
+  // from the timestamp alone must guess, and both guesses are wrong: the full
+  // quantity demands back units that never moved, zero strands the ones that
+  // did.
+  //
+  // CUMULATIVE units dispatched, never decremented. Units coming back are
+  // counted by `ConsumptionLog`, so what is still out is
+  // `checkedOutQuantity - dispositioned`. That split matches the counters the
+  // booking surfaces already read (`bookedQuantity` / `checkedOutQuantity` /
+  // `dispositionedQuantity`); this column is where the second one lives so it
+  // no longer has to be reconstructed from scan sessions. A slice returned in
+  // full and sent out again simply adds to it.
+  //
+  // Every writer that sends units out maintains it — the all-at-once checkout,
+  // progressive checkout, and the kit-member propagation in `updateKitAssets`.
+  // A writer that sets `checkedOutAt` without adding here leaves a slice whose
+  // departure nothing can size.
+  checkedOutQuantity Int @default(0)
+
+  // The location a QUANTITY_TRACKED slice's units left from, recorded once,
+  // when the slice is first checked out (`checkedOutQuantity` goes from 0).
+  // A slice sent out again keeps it.
+  //
+  // Check-in reads it: units reported consumed, lost or damaged come off this
+  // location's manual placement, so a pool placed at several locations loses
+  // them where they actually came from. NULL = the pool's unplaced units, a
+  // pool with no placements, or a slice checked out before this column
+  // existed; check-in then lets the unplaced units absorb the drop, as before.
+  //
+  // A kit-driven slice records its kit's location (`Kit.locationId`, may be
+  // NULL). That is for display only: kit units never come off a manual
+  // placement.
+  //
+  // Same plain-column treatment as `assetKitId` / `sourceKitId` above: the FK
+  // to `Location("id")` with `ON DELETE SET NULL ON UPDATE CASCADE` lives in
+  // the migration SQL, not in a Prisma `@relation`, because one more relation
+  // on this model (its grandparent `Booking` is a hub) pushes the extended
+  // client's generics past TS's recursion limit (TS2321), and a
+  // `bookingAssets` back-relation on `Location` would add another. Services
+  // read the id and look the location up themselves.
+  sourceLocationId String?
+
+  // The old `@@unique([bookingId, assetId])` is replaced by two partial
+  // unique indexes in the migration SQL (Postgres-only feature Prisma
+  // can't express in the schema):
+  //   BookingAsset_manual_unique: (bookingId, assetId) WHERE assetKitId IS NULL
+  //   BookingAsset_kit_unique:    (bookingId, assetKitId) WHERE assetKitId IS NOT NULL
+  // These let one standalone row coexist with N kit-driven rows for the
+  // same (booking, asset) — required for the multi-kit qty-tracked case.
+
+  @@index([assetId])
+  @@index([assetKitId])
+  @@index([sourceKitId])
+  @@index([sourceLocationId])
+}
+
 model Booking {
   id String @id @default(cuid())
 
@@ -1276,11 +1808,15 @@ model Booking {
   organization   Organization @relation(fields: [organizationId], references: [id], onUpdate: Cascade, onDelete: Cascade)
   organizationId String
 
-  assets Asset[]
-  notes  BookingNote[]
+  bookingAssets   BookingAsset[]
+  consumptionLogs ConsumptionLog[]
+  notes           BookingNote[]
+  // Unfulfilled model-level requests (intent rows). Converted into
+  // concrete `bookingAssets` at scan-to-assign time.
+  modelRequests   BookingModelRequest[]
 
-  tags            Tag[]
-  partialCheckins PartialBookingCheckin[]
+  tags             Tag[]
+  partialCheckins  PartialBookingCheckin[]
   partialCheckouts PartialBookingCheckout[]
 
   // Datetime
@@ -1289,13 +1825,25 @@ model Booking {
   from      DateTime @db.Timestamptz(3)
   to        DateTime @db.Timestamptz(3)
 
-  // When a booking is early check-in or early check-out, we store the original from and to
-  // dates here and updated the from and to dates to current date (if users agrees to change)
+  // The period the booking was PLANNED for, as opposed to `from`/`to` above,
+  // which hold the live period. Written while the booking is still being
+  // planned (create, DRAFT edit, reserve) and frozen once it starts — every
+  // later flow moves `from`/`to` and leaves these alone: extension pushes `to`
+  // out, and early check-out / late or early-with-consent check-in rewrite the
+  // dates to the actual moment. Booking Compliance measures returns against
+  // these, so overwriting one after the booking starts erases the deadline the
+  // custodian agreed to. Null only on rows created before the columns existed.
   originalFrom DateTime? @db.Timestamptz(3)
   originalTo   DateTime? @db.Timestamptz(3)
 
   // When a booking is auto-archived, we store the timestamp here
   autoArchivedAt DateTime? @db.Timestamptz(3)
+
+  // True when the booking was archived directly from RESERVED — i.e. its end
+  // date passed without ever being checked out/in. Such bookings were never
+  // "returned", so return-behaviour reports (e.g. Booking Compliance) must
+  // exclude them. Bookings archived from COMPLETE keep the default `false`.
+  archivedWithoutCheckin Boolean @default(false)
 
   cancellationReason String?
 
@@ -1310,6 +1858,13 @@ model Booking {
   // Speeds up status filtering when joining from Asset → Booking
   // (e.g. fetching ONGOING/OVERDUE bookings for asset custodian display)
   @@index([status])
+  // Serves the bookings index default view (getBookings): WHERE
+  // organizationId = ? ORDER BY "from" ASC LIMIT n. Column order (org first,
+  // then the sort key, then id as the pagination tiebreaker) lets Postgres
+  // seek the org and read the page straight off the index instead of
+  // scanning + sorting every booking in the workspace. Same pattern as
+  // Asset_organizationId_createdAt_id_idx.
+  @@index([organizationId, from, id])
 }
 
 model BookingSettings {
@@ -1322,17 +1877,25 @@ model BookingSettings {
   maxBookingLengthSkipClosedDays Boolean @default(false) // If true, the max booking length will skip closed days
 
   autoArchiveBookings Boolean @default(false) // Whether to automatically archive completed bookings
-  autoArchiveDays     Int     @default(2) // Number of days after completion before auto-archiving
+  autoArchiveDays     Int     @default(2) // Number of days after a booking is done before auto-archiving (shared by both auto-archive toggles)
 
-  requireExplicitCheckinForAdmin       Boolean @default(false) // When true, admins must use explicit check-in (scanner) instead of quick check-in
+  // Whether to automatically archive reserved bookings whose end date has passed
+  // without ever being checked out (for teams that use bookings as a reservation
+  // calendar and don't check out/in). Reuses autoArchiveDays for the delay.
+  autoArchiveExpiredReservations Boolean @default(false)
+
+  requireExplicitCheckinForAdmin      Boolean @default(false) // When true, admins must use explicit check-in (scanner) instead of quick check-in
   requireExplicitCheckinForSelfService Boolean @default(false) // When true, self-service users must use explicit check-in (scanner) instead of quick check-in
+
+  requireExplicitCheckoutForAdmin       Boolean @default(false) // When true, admins must use explicit check-out (scan or select) instead of quick check-out
+  requireExplicitCheckoutForSelfService Boolean @default(false) // When true, self-service users must use explicit check-out (scan or select) instead of quick check-out
 
   // Progressive check-in/out settings
   countKitsAsSingleUnit Boolean @default(false) // When true, the booking check-in progress bar treats each kit as one unit instead of counting the assets inside it
 
   // Notification settings
-  notifyBookingCreator     Boolean      @default(true) // Whether the booking creator receives email notifications
-  notifyAdminsOnNewBooking Boolean      @default(true) // Whether all admins receive a notification when a booking is reserved
+  notifyBookingCreator     Boolean @default(true) // Whether the booking creator receives email notifications
+  notifyAdminsOnNewBooking Boolean @default(true) // Whether all admins receive a notification when a booking is reserved
   alwaysNotifyTeamMembers  TeamMember[] @relation("BookingSettingsAlwaysNotify") // Team members who always receive ALL booking email notifications
 
   // Relationships
@@ -1347,6 +1910,13 @@ model BookingSettings {
   @@index([organizationId])
 }
 
+/// A progressive check-in SESSION, mirroring PartialBookingCheckout.
+///
+/// `assetIds` lists only FULLY reconciled assets: INDIVIDUAL always, and
+/// QUANTITY_TRACKED only once its remaining units hit zero (partial returns
+/// live in `ConsumptionLog`). Completing a booking outright writes no row here,
+/// so the same warning applies — absence is not evidence of anything.
+/// `BookingAsset.checkedInAt` is the per-slice fact.
 model PartialBookingCheckin {
   id String @id @default(cuid())
 
@@ -1374,12 +1944,33 @@ model PartialBookingCheckin {
   @@index([bookingId, checkinTimestamp]) // Composite for efficient booking history queries
 }
 
+/// A progressive checkout SESSION: one scan batch, covering N assets via the
+/// positional `assetIds` / `quantities` / `bookingAssetIds` arrays.
+///
+/// Records sessions and the units they claimed — NOT whether an asset is out.
+/// The all-at-once checkout (`checkoutBooking`, the Check out button) flips
+/// statuses and writes NO row here, so **absence proves nothing** and must never
+/// be read as "was not checked out". Reading it that way is what let a single
+/// later scan mark every button-checked-out asset on a booking as
+/// "never checked out". `BookingAsset.checkedOutAt` answers that question.
 model PartialBookingCheckout {
   id String @id @default(cuid())
 
   // Track which assets were checked out during this session
   assetIds      String[] // Array of asset IDs checked out
-  checkoutCount Int // Number of assets checked out (for quick reference)
+  // Units checked out per entry in `assetIds` (positional alignment).
+  // INDIVIDUAL assets always record `1`. QUANTITY_TRACKED slices record the
+  // unit count submitted for the matching `bookingAssetId`. Empty default
+  // keeps legacy rows (written before Wave B) readable without a backfill.
+  quantities    Int[]    @default([])
+  // BookingAsset (slice) IDs per entry in `assetIds` (positional alignment
+  // with `assetIds`/`quantities`). Disambiguates a QUANTITY_TRACKED asset that
+  // is booked as multiple slices (e.g. standalone + kit member). An empty
+  // string `""` element means "no specific slice known → greedy attribution";
+  // Prisma `String[]` cannot hold `null`, so `""` is the sentinel. Empty
+  // default keeps legacy rows readable without a backfill.
+  bookingAssetIds String[] @default([])
+  checkoutCount   Int // Number of assets checked out (for quick reference)
 
   // Metadata
   checkoutTimestamp DateTime @default(now()) @db.Timestamptz(3)
@@ -1401,6 +1992,45 @@ model PartialBookingCheckout {
   @@index([bookingId, checkoutTimestamp]) // Composite for efficient booking history queries
 }
 
+/// Native-app SSO web-delegated login — single-use session-handoff codes.
+/// @see apps/webapp/app/routes/_auth+/oauth.callback.mobile.tsx
+model MobileAuthCode {
+  id String @id @default(cuid())
+
+  // The user this code authorizes a session for.
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  userId String
+
+  // SHA-256 hash of the single-use plaintext code. The plaintext only ever
+  // lives in the deeplink + the exchange request body — never stored.
+  codeHash String @unique
+
+  // PKCE (S256) challenge — base64url(SHA-256(verifier)). Mandatory in practice:
+  // minting refuses a mobile SSO start without one, and redemption refuses a
+  // code that carries none, so an unbound row can never be spent. Nullable only
+  // because rows predating that rule may still exist; treat NULL as poison.
+  codeChallenge String?
+
+  // The web SSO session the code hands to the app, AES-256-GCM encrypted under
+  // a key derived from the plaintext code, which is never stored: the row alone
+  // cannot be decrypted. Cleared when the code is redeemed. NULL on rows minted
+  // before sessions were stored, which redemption refuses.
+  sessionCiphertext String?
+
+  // Single-use guard: set when redeemed. A non-null value rejects reuse.
+  consumedAt DateTime?
+
+  // Short TTL — see MOBILE_AUTH_CODE_TTL_MS. Rejected once `now > expiresAt`.
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+
+  // Indexes for foreign keys
+  @@index([userId])
+  // For periodic cleanup of expired, unredeemed rows
+  @@index([expiresAt])
+}
+
 model Kit {
   id String @id @default(cuid())
 
@@ -1411,11 +2041,20 @@ model Kit {
   image           String?
   imageExpiration DateTime?
 
-  assets   Asset[]
+  // `assets Asset[]` reverse relation on Asset.kitId.
+  assetKits AssetKit[]
   custody  KitCustody?
   qrCodes  Qr[]
   barcodes Barcode[]
   reports  ReportFound[]
+
+  // NOTE: there is intentionally no `bookingAssets BookingAsset[]`
+  // back-relation here. `BookingAsset.sourceKitId` is a plain FK column
+  // (DB-enforced, see the comment on that field) — exposing it as a Prisma
+  // relation tips TS past its recursion limit (TS2321) because Booking is a
+  // hub model with many relations. Services query it directly via
+  // `db.bookingAsset.findMany({ where: { sourceKitId } })`. The `SET NULL`
+  // cascade still fires at the DB level when a Kit row is deleted.
 
   organization   Organization @relation(fields: [organizationId], references: [id], onUpdate: Cascade, onDelete: Cascade)
   organizationId String
@@ -1456,11 +2095,112 @@ model KitCustody {
   kit   Kit    @relation(fields: [kitId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   kitId String @unique
 
+  // Asset-side Custody rows inherited from this kit. Cascade-deleted
+  // when the KitCustody row is removed (e.g. kit-level custody
+  // released, or kit deleted), so operator-assigned custody on the
+  // same asset stays untouched.
+  inheritedCustody Custody[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   // Index for foreign key
   @@index([custodianId])
+}
+
+/// Pivot linking an `Asset` to the `Kit` it belongs to.
+///
+/// `@@unique([assetId])` enforces "at most one kit per asset" today.
+/// The structure already allows multi-row-per-asset; if multi-kit
+/// allocation lands later, drop the `assetId` unique constraint and
+/// add a type-aware single-row trigger + sum-within-total CONSTRAINT
+/// TRIGGER (parallel to the Custody / BookingAsset pivots).
+model AssetKit {
+  id             String          @id @default(cuid())
+  asset          Asset           @relation(fields: [assetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assetId        String
+  kit            Kit             @relation(fields: [kitId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  kitId          String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  organizationId String
+
+  quantity       Int             @default(1)
+
+  // Back-relation to the AssetLocation rows that are "driven by" this
+  // kit membership — at most one per AssetKit. Created when the kit has
+  // a location and the asset joins; auto-deleted via ON DELETE CASCADE
+  // when the asset leaves the kit. See `AssetLocation.assetKit` and the
+  // kit-cascade comments in `kit/service.server.ts`.
+  assetLocations AssetLocation[]
+
+  // NOTE: there is intentionally no `bookingAssets BookingAsset[]`
+  // back-relation here. `BookingAsset.assetKitId` is a plain FK column
+  // (DB-enforced, see the comment on that field) — exposing it as a
+  // Prisma relation tips TS past its recursion limit (TS2321) because
+  // Booking is a hub model with many relations. Services that need to
+  // find kit-driven booking rows use `db.bookingAsset.findMany({
+  // where: { assetKitId } })`. The `SET NULL` cascade still fires at
+  // the DB level when an AssetKit row is deleted.
+
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  // The "INDIVIDUAL asset belongs to at most one kit" cap is enforced
+  // by the `enforce_individual_asset_single_kit` trigger rather than a
+  // `@@unique([assetId])` constraint — QUANTITY_TRACKED assets are
+  // intentionally free to belong to multiple kits at distinct slices.
+  // The composite below still prevents listing the same asset twice in
+  // the same kit.
+  @@unique([assetId, kitId])
+  @@index([kitId])
+  @@index([organizationId])
+}
+
+model AssetLocation {
+  id             String       @id @default(cuid())
+  asset          Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assetId        String
+  location       Location     @relation(fields: [locationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  locationId     String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  organizationId String
+
+  quantity       Int          @default(1)
+
+  // Manual-vs-kit-driven discriminator. NULL = manual placement (user-
+  // managed via the manage-placements dialog or location picker).
+  // Non-NULL = this row is driven by the referenced AssetKit (kit
+  // membership) — the asset is at this location because the kit is.
+  // Kit-driven rows are read-only in the manual-placement editors;
+  // their quantity and location track the AssetKit and the kit's
+  // `Kit.locationId`. The `onDelete: Cascade` means removing the asset
+  // from the kit auto-deletes the kit-driven row. Mirrors the
+  // `Custody.kitCustodyId` discriminator pattern.
+  assetKit       AssetKit?    @relation(fields: [assetKitId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assetKitId     String?
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  // The "INDIVIDUAL asset at one location" cap is enforced by the
+  // `enforce_individual_asset_single_location` trigger; the
+  // `sum(quantity) <= Asset.quantity` invariant by the deferred
+  // `enforce_asset_location_sum_within_total` constraint trigger.
+  //
+  // Uniqueness — split across two partial unique indexes created in
+  // the migration SQL (Prisma can't express partial uniques in
+  // schema, so they live in raw SQL):
+  //   - "AssetLocation_manual_unique" → UNIQUE (assetId, locationId)
+  //                                     WHERE "assetKitId" IS NULL
+  //   - "AssetLocation_kit_unique"    → UNIQUE (assetKitId)
+  //                                     WHERE "assetKitId" IS NOT NULL
+  // The kit partial encodes "each AssetKit drives at most one
+  // AssetLocation row" — since AssetKit itself is unique per
+  // (assetId, kitId), this transitively caps kit-driven rows.
+  @@index([locationId])
+  @@index([organizationId])
+  @@index([assetId])
+  @@index([assetKitId])
 }
 
 model AssetReminder {
@@ -1688,10 +2428,10 @@ model AuditSession {
   missingAssetCount    Int @default(0)
   unexpectedAssetCount Int @default(0)
 
-  startedAt                DateTime?
-  dueDate                  DateTime?
-  completedAt              DateTime?
-  cancelledAt              DateTime?
+  startedAt   DateTime?
+  dueDate     DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
   activeSchedulerReference String?
 
   createdBy      User         @relation(fields: [createdById], references: [id])
@@ -1752,9 +2492,9 @@ model AuditAsset {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  scans  AuditScan[]
+  scans AuditScan[]
   images AuditImage[]
-  notes  AuditNote[]
+  notes AuditNote[]
 
   @@unique([auditSessionId, assetId])
   @@index([status])
@@ -1777,6 +2517,24 @@ model AuditScan {
   scannedById String?
 
   code String?
+
+  /// What was scanned, recorded BY VALUE at scan time.
+  ///
+  /// `asset` and `auditAsset` are both SetNull/Cascade, so deleting an asset
+  /// leaves this row pointing at nothing: no name, and no way to tell whether
+  /// it had been expected. An audit is a historical record, and a record whose
+  /// entries can silently lose their meaning is not one — so the two
+  /// descriptive facts are snapshotted here rather than only referenced.
+  ///
+  /// Readers prefer the LIVE asset when it still exists (a rename should show
+  /// the current name) and fall back to these.
+  ///
+  /// Null means the snapshot could not be taken: scans whose asset had already
+  /// been deleted before these columns were backfilled. Nothing can recover
+  /// those, and they degrade to the scanned `code`, which also survives. Every
+  /// other row carries a snapshot, so null is never merely "old".
+  assetTitle  String?
+  wasExpected Boolean?
 
   metadata Json?
 
@@ -1820,10 +2578,20 @@ model AuditImage {
   @@index([uploadedById])
 }
 
+/// How a membership's role came to change.
+enum RoleChangeSource {
+  /// An owner or administrator changed it in the team settings.
+  MANUAL
+  /// The member's identity-provider groups changed it at sign-in.
+  SSO
+}
+
 model RoleChangeLog {
   id           String            @id @default(cuid())
   previousRole OrganizationRoles
   newRole      OrganizationRoles
+  /// How the change was made. SSO rows name the member themself as `changedBy`.
+  source       RoleChangeSource  @default(MANUAL)
   createdAt    DateTime          @default(now())
 
   // Who was changed
@@ -1914,11 +2682,14 @@ enum ActivityAction {
   ASSET_NAME_CHANGED
   ASSET_DESCRIPTION_CHANGED
   ASSET_CATEGORY_CHANGED
+  ASSET_MODEL_CHANGED
   ASSET_KIT_CHANGED
   ASSET_LOCATION_CHANGED
   ASSET_TAGS_CHANGED
   ASSET_STATUS_CHANGED
   ASSET_VALUATION_CHANGED
+  ASSET_QUANTITY_CHANGED
+  ASSET_MIN_QUANTITY_CHANGED
   ASSET_CUSTOM_FIELD_CHANGED
   ASSET_PREFERRED_BARCODE_CHANGED
   ASSET_ARCHIVED
@@ -1940,6 +2711,16 @@ enum ActivityAction {
   BOOKING_PARTIAL_CHECKOUT
   BOOKING_CANCELLED
   BOOKING_ARCHIVED
+
+  // Booking — model-level reservations (Book-by-Model). The reserved
+  // `AssetModel` travels in `meta.assetModelId` because ActivityEvent has no
+  // assetModelId cross-ref column. `BOOKING_MODEL_REQUEST_FULFILLED` is
+  // emitted once PER UNIT assigned by a scan (carries the concrete `assetId`),
+  // not once per completed reservation.
+  BOOKING_MODEL_REQUESTED
+  BOOKING_MODEL_REQUEST_CHANGED
+  BOOKING_MODEL_REQUEST_REMOVED
+  BOOKING_MODEL_REQUEST_FULFILLED
 
   // Audit
   AUDIT_CREATED

@@ -27,21 +27,30 @@ export async function action({ request, context }: ActionFunctionArgs) {
     );
 
     const intentToActionMap: Record<typeof intent, PermissionAction> = {
-      "bulk-delete": PermissionAction.update,
+      "bulk-delete": PermissionAction.delete,
     };
 
     const { organizationId } = await requirePermission({
       userId,
       request,
-      entity: PermissionEntity.teamMember,
+      entity: PermissionEntity.nonRegisteredMember,
       action: intentToActionMap[intent],
     });
 
     switch (intent) {
       case "bulk-delete": {
-        const { nrmIds } = parseData(formData, BulkDeleteNRMSchema);
+        const { nrmIds, currentSearchParams } = parseData(
+          formData,
+          BulkDeleteNRMSchema
+        );
 
-        await bulkDeleteNRMs({ nrmIds, organizationId });
+        await bulkDeleteNRMs({
+          nrmIds,
+          organizationId,
+          // Forwarded by BulkUpdateDialogContent. On select-all this keeps the
+          // delete scoped to the filtered rows the user was actually looking at.
+          search: new URLSearchParams(currentSearchParams ?? "").get("s"),
+        });
 
         sendNotification({
           title: "Non-registered members deleted",

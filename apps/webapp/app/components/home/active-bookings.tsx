@@ -55,8 +55,11 @@ export default function ActiveBookings() {
             {activeBookings.map((booking: BookingItem) => {
               const custodian = getBookingCustodianName(booking);
               const assetCount =
-                (booking as BookingItem & { _count?: { assets?: number } })
-                  ._count?.assets ?? 0;
+                (
+                  booking as BookingItem & {
+                    _count?: { bookingAssets?: number };
+                  }
+                )._count?.bookingAssets ?? 0;
               const returningSoon = isReturningSoon(booking.to);
 
               return (
@@ -93,11 +96,7 @@ export default function ActiveBookings() {
                                 : ""
                             }
                           >
-                            Due{" "}
-                            <DateS
-                              date={booking.to}
-                              options={{ month: "short", day: "numeric" }}
-                            />
+                            Due <DateS date={booking.to} />
                           </span>
                         </span>
                       </div>

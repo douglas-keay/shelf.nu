@@ -1,18 +1,20 @@
-import { useState } from "react";
-import { BookingStatus } from "@prisma/client";
+import { useMemo, useState } from "react";
 import { useAtomValue } from "jotai";
 import { ChevronRight, PackageCheck, PackageMinus } from "lucide-react";
 import { useLoaderData } from "react-router";
 import { useHydrated } from "remix-utils/use-hydrated";
 import { selectedBulkItemsAtom } from "~/atoms/list";
-import { useBookingStatusHelpers } from "~/hooks/use-booking-status";
+import { useBookingBulkActions } from "~/hooks/use-booking-bulk-actions";
 import { useControlledDropdownMenu } from "~/hooks/use-controlled-dropdown-menu";
+import {
+  describeCheckoutDisabled,
+  makeCheckoutEligibility,
+} from "~/modules/booking/helpers";
 import type { BookingPageLoaderData } from "~/routes/_layout+/bookings.$bookingId.overview";
 import type { AssetWithStatus } from "~/utils/booking-assets";
 import {
   flattenSelectedBookingItems,
   isAssetCheckableIn,
-  isAssetCheckableOut,
   isAssetPartiallyCheckedIn,
 } from "~/utils/booking-assets";
 import { tw } from "~/utils/tw";
@@ -55,39 +57,49 @@ function ConditionalDropdown() {
     booking,
     partialCheckinDetails = {},
     checkedOutAssetIds = [],
+    remainingToCheckOutByAsset = {},
   } = useLoaderData<BookingPageLoaderData>();
-  const bookingStatus = useBookingStatusHelpers(
-    booking.status as BookingStatus
-  );
   const actionsButtonDisabled = selectedItems.length === 0;
 
-  // Show partial check-in only for ONGOING/OVERDUE bookings.
-  const showPartialCheckin =
-    bookingStatus?.isOngoing || bookingStatus?.isOverdue;
+  // Which of the three this user may take here. Shared with the row checkbox
+  // that feeds this menu, so the two cannot disagree.
+  const { canRemove, showPartialCheckin, showPartialCheckout, showRemove } =
+    useBookingBulkActions();
 
-  // Show partial check-out for RESERVED/ONGOING/OVERDUE bookings. Unlike
-  // check-in, checkout can START from a RESERVED booking.
-  const showPartialCheckout =
-    bookingStatus?.isReserved ||
-    bookingStatus?.isOngoing ||
-    bookingStatus?.isOverdue;
-
-  // Finished = COMPLETE/ARCHIVED. Computed directly from status: the helper's
-  // `isFinished` flag isn't present on its undefined-status return shape, and a
-  // direct compare matches how the rest of the booking UI checks status.
-  const isFinished =
-    booking.status === BookingStatus.COMPLETE ||
-    booking.status === BookingStatus.ARCHIVED;
+  // Denormalised view of `booking.bookingAssets` (the QT pivot). Project the
+  // pivot rows down to the plain asset shape the shared resolver
+  // (`flattenSelectedBookingItems`) was authored against — `booking.assets`
+  // no longer exists post-pivot. Mirrors the projection used by both
+  // bulk-partial dialogs so all three call sites stay in lock-step.
+  const assetsList = useMemo(
+    () =>
+      booking.bookingAssets.map((ba) => {
+        // Post-Phase-4a pivot: kit membership lives on `asset.assetKits[]`,
+        // matched via `ba.assetKitId`. Standalone rows leave kit/kitId null.
+        const matchedAssetKit = ba.assetKitId
+          ? ba.asset.assetKits?.find((ak) => ak.id === ba.assetKitId) ?? null
+          : null;
+        return {
+          ...ba.asset,
+          bookingAssetId: ba.id,
+          // `?? 1` defends test fixtures that omit BookingAsset.quantity
+          // from overwriting a caller-supplied bookedQuantity with
+          // `undefined` when this object is spread downstream.
+          bookedQuantity: ba.quantity ?? 1,
+          kitId: matchedAssetKit?.kitId ?? null,
+          kit: matchedAssetKit?.kit ?? null,
+        };
+      }),
+    [booking.bookingAssets]
+  );
 
   // Resolve the selection to enriched asset rows (kits excluded) with the SAME
   // resolver the dialogs use, so the dropdown's enable/disable state can never
   // disagree with what a dialog would actually act on.
   const selectedAssets = flattenSelectedBookingItems(
     selectedItems,
-    booking.assets
+    assetsList
   ).filter((item) => item.title && !item._count);
-
-  const checkedOutIdsSet = new Set(checkedOutAssetIds);
 
   // How many selected assets each action can act on.
   const checkInEligibleCount = selectedAssets.filter((asset) =>
@@ -96,9 +108,6 @@ function ConditionalDropdown() {
       partialCheckinDetails,
       booking.status
     )
-  ).length;
-  const checkOutEligibleCount = selectedAssets.filter((asset) =>
-    isAssetCheckableOut(asset as AssetWithStatus, checkedOutIdsSet)
   ).length;
 
   // Grey out check-in when nothing in the selection is checked out. Tailor the
@@ -123,21 +132,26 @@ function ConditionalDropdown() {
         }
       : false;
 
-  // Grey out check-out when every selected asset is already checked out.
-  const partialCheckoutDisabled =
-    selectedAssets.length === 0
-      ? { reason: "Select one or more assets to check out." }
-      : checkOutEligibleCount === 0
-      ? {
-          reason:
-            "All selected items are already checked out. Select items that are still booked.",
-        }
-      : false;
+  // Grey out check-out when nothing selected can go out, with a reason true of
+  // the whole selection. Eligibility is the scan drawer's rule — see
+  // `makeCheckoutEligibility` for why the returned set is not optional.
+  const checkoutEligibility = makeCheckoutEligibility({
+    checkedOutAssetIds,
+    partialCheckinDetails,
+    remainingToCheckOutByAsset,
+  });
+  const partialCheckoutDisabled = describeCheckoutDisabled(
+    selectedAssets as AssetWithStatus[],
+    checkoutEligibility
+  );
 
   // Mirror per-row Remove: can't remove items from a finished booking.
-  const removeDisabled = isFinished
-    ? { reason: "Can't remove items from a completed or archived booking." }
-    : false;
+  const removeDisabled = canRemove
+    ? false
+    : {
+        reason:
+          "Can't remove items from a completed, archived or cancelled booking.",
+      };
 
   const {
     ref: dropdownRef,
@@ -155,6 +169,17 @@ function ConditionalDropdown() {
     useState(false);
   const [partialCheckoutDialogOpen, setPartialCheckoutDialogOpen] =
     useState(false);
+
+  /**
+   * Every item is now conditional, so the menu can be empty — a BASE custodian
+   * on their own RESERVED or ONGOING booking holds none of the three. Render
+   * nothing rather than an "Actions" button that opens a blank sheet. After
+   * the hooks above, deliberately: an early return before them would change
+   * hook order between renders.
+   */
+  if (!showPartialCheckout && !showPartialCheckin && !showRemove) {
+    return null;
+  }
 
   return (
     <>
@@ -263,19 +288,21 @@ function ConditionalDropdown() {
                 </Button>
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem
-              className="px-4 py-1 md:p-0"
-              onSelect={(e) => {
-                e.preventDefault();
-              }}
-            >
-              <BulkUpdateDialogTrigger
-                type="trash"
-                label="Remove assets/kits"
-                onClick={closeMenu}
-                disabled={removeDisabled}
-              />
-            </DropdownMenuItem>
+            {showRemove && (
+              <DropdownMenuItem
+                className="px-4 py-1 md:p-0"
+                onSelect={(e) => {
+                  e.preventDefault();
+                }}
+              >
+                <BulkUpdateDialogTrigger
+                  type="trash"
+                  label="Remove assets/kits"
+                  onClick={closeMenu}
+                  disabled={removeDisabled}
+                />
+              </DropdownMenuItem>
+            )}
           </div>
         </DropdownMenuContent>
       </DropdownMenu>

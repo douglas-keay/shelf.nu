@@ -20,6 +20,8 @@ import {
   updateAsset,
   updateAssetMainImage,
 } from "~/modules/asset/service.server";
+import { getPrimaryLocation } from "~/modules/asset/utils";
+import { getAssetModels } from "~/modules/asset-model/service.server";
 
 import { getActiveCustomFields } from "~/modules/custom-field/service.server";
 import { buildTagsSet } from "~/modules/tag/service.server";
@@ -72,11 +74,20 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       include: {
         tags: true,
         customFields: true,
-        kit: {
+        assetKits: {
           select: {
-            id: true,
-            name: true,
+            kit: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
           },
+        },
+        // Pull the primary placement so the edit form can pre-fill the
+        // location picker.
+        assetLocations: {
+          select: { location: { select: { id: true } } },
         },
         barcodes: {
           select: {
@@ -90,16 +101,21 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       request,
     });
 
-    const { categories, totalCategories, tags, locations, totalLocations } =
-      await getAllEntriesForCreateAndEdit({
+    const [
+      { categories, totalCategories, tags, locations, totalLocations },
+      { assetModels, totalAssetModels },
+    ] = await Promise.all([
+      getAllEntriesForCreateAndEdit({
         request,
         organizationId,
         defaults: {
           category: asset.categoryId,
-          location: asset.locationId,
+          location: getPrimaryLocation(asset)?.id ?? null,
         },
         tagUseFor: TagUseFor.ASSET,
-      });
+      }),
+      getAssetModels({ organizationId, page: 1, perPage: 100 }),
+    ]);
 
     const searchParams = getCurrentSearchParams(request);
 
@@ -122,6 +138,8 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       totalTags: tags.length,
       locations,
       totalLocations,
+      assetModels,
+      totalAssetModels,
       currency: currentOrganization?.currency,
       customFields,
       referer: getRefererPath(request),
@@ -189,38 +207,67 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       customFieldDef: customFields,
     });
 
-    await updateAssetMainImage({
+    const uploadedNewImage = await updateAssetMainImage({
       request,
       assetId: id,
       userId: authSession.userId,
       organizationId,
     });
 
+    /**
+     * "Use the model's image instead" / "Remove image" — drops the asset's own
+     * image so `resolveAssetImage` falls through to its model's cover image,
+     * or to the placeholder when it has no model.
+     *
+     * Applied as part of the `updateAsset` payload below rather than as its own
+     * committed write: `updateAsset` can still reject (kit-managed location,
+     * quantity over pool, barcode gating, preferred-barcode membership), and a
+     * standalone clear would already have nulled the image while the action
+     * reports failure. The URL is a signed one-way pointer, so the user could
+     * not restore it — the edit must be all-or-nothing.
+     *
+     * Suppressed when this same submit uploaded a replacement, so "clear +
+     * upload" keeps the upload.
+     */
+    const shouldClearImage =
+      formData.get("clearMainImage") === "true" && !uploadedNewImage;
+
     const {
       title,
       description,
       category,
+      assetModelId,
       newLocationId,
       currentLocationId,
       valuation,
       preferredBarcodeId,
       addAnother,
       redirectTo,
+      quantity,
+      minQuantity,
+      consumptionType,
+      unitOfMeasure,
     } = parsedData;
 
     /** This checks if tags are passed and build the  */
     const tags = buildTagsSet(parsedData.tags);
 
-    /** Extract barcode data from form */
+    /**
+     * Barcodes are only read when the workspace holds the add-on. Without it
+     * the form has no barcode section, so `undefined` leaves the asset's
+     * existing barcodes untouched: `updateAsset` only reconciles a list it is
+     * given, and an empty list would read as "remove every barcode".
+     */
     const barcodes = canUseBarcodes
       ? extractBarcodesFromFormData(formData)
-      : [];
+      : undefined;
 
     await updateAsset({
       id,
       title,
       description,
       categoryId: category ? category : "uncategorized",
+      assetModelId: assetModelId || null,
       tags,
       newLocationId,
       currentLocationId,
@@ -233,6 +280,16 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       valuation,
       organizationId,
       request,
+      quantity,
+      minQuantity,
+      consumptionType,
+      unitOfMeasure,
+      // Nulled inside updateAsset's transaction — see `shouldClearImage`.
+      ...(shouldClearImage && {
+        mainImage: null,
+        mainImageExpiration: null,
+        thumbnailImage: null,
+      }),
     });
 
     sendNotification({
@@ -289,9 +346,15 @@ export default function AssetEditPage() {
           }
           title={asset.title}
           categoryId={asset.categoryId}
-          locationId={asset.locationId}
+          assetModelId={asset.assetModelId}
+          locationId={getPrimaryLocation(asset)?.id ?? null}
           description={asset.description}
           valuation={asset.valuation}
+          type={asset.type}
+          quantity={asset.quantity}
+          minQuantity={asset.minQuantity}
+          consumptionType={asset.consumptionType}
+          unitOfMeasure={asset.unitOfMeasure}
           tags={tags}
           barcodes={asset.barcodes}
           preferredBarcodeId={asset.preferredBarcodeId}

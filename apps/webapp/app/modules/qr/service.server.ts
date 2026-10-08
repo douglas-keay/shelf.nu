@@ -7,9 +7,10 @@ import {
   type User,
   type Kit,
 } from "@prisma/client";
+import type { ITXClientDenyList } from "@prisma/client/runtime/library";
 import type { TypeNumber, ErrorCorrectionLevel } from "qrcode-generator";
 import type { LoaderFunctionArgs } from "react-router";
-import { db } from "~/database/db.server";
+import { db, type ExtendedPrismaClient } from "~/database/db.server";
 import { updateCookieWithPerPage } from "~/utils/cookies.server";
 import type { ErrorLabel } from "~/utils/error";
 import { isLikeShelfError, isNotFoundError, ShelfError } from "~/utils/error";
@@ -107,15 +108,41 @@ export async function getQrOrganizationLookup({ qrId }: { qrId: Qr["id"] }) {
   return qr;
 }
 
-export async function createQr({
-  userId,
-  assetId,
-  kitId,
-  organizationId,
-}: Pick<Qr, "userId" | "organizationId"> & {
-  assetId?: Asset["id"];
-  kitId?: Kit["id"];
-}) {
+/**
+ * The transaction client `createQr` accepts. Spelled as the extended client
+ * minus the methods a transaction cannot offer, because a hand-written
+ * structural type is not assignable from the real `$transaction` callback
+ * argument — the extended delegates carry more than the shape they are used at.
+ */
+export type CreateQrTxClient = Omit<ExtendedPrismaClient, ITXClientDenyList>;
+
+/**
+ * Creates a QR code, optionally attached to an asset or a kit.
+ *
+ * Pass `tx` when the caller has already established that no code exists and is
+ * holding a lock that keeps it true — see `generateQrObj`. Nothing in the
+ * schema enforces one linked code per asset or kit: both columns are nullable
+ * and non-unique, because an unclaimed printed code has neither and there are
+ * many at once. So the serialisation is the caller's job, and a caller that
+ * skips it gets a duplicate rather than an error.
+ *
+ * @param args.assetId - Attach to this asset, if given.
+ * @param args.kitId - Attach to this kit, if given.
+ * @param tx - Run inside an existing transaction.
+ * @returns The created QR row.
+ */
+export async function createQr(
+  {
+    userId,
+    assetId,
+    kitId,
+    organizationId,
+  }: Pick<Qr, "userId" | "organizationId"> & {
+    assetId?: Asset["id"];
+    kitId?: Kit["id"];
+  },
+  tx?: CreateQrTxClient
+) {
   const data = {
     id: id(),
     ...(userId && {
@@ -148,7 +175,7 @@ export async function createQr({
     }),
   };
 
-  return db.qr.create({
+  return (tx ?? db).qr.create({
     data,
   });
 }
@@ -453,17 +480,60 @@ export async function claimQrCode({
       });
     }
 
-    return await db.qr.update({
-      // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: claiming only proceeds for unclaimed codes (verified at line 442: throws if qr.organizationId already set), so the code has no organizationId to scope by — this assigns its first org
-      where: {
-        id,
-      },
-      data: {
-        organizationId,
-        userId,
-      },
-    });
+    try {
+      return await db.qr.update({
+        // eslint-disable-next-line local-rules/require-org-scope-on-id-queries -- idor-safe: claiming only proceeds for unclaimed codes (verified above: throws if qr.organizationId already set), so the code has no organizationId to scope by — this assigns its first org
+        where: {
+          id,
+          // why: the check above is not atomic with this write — two
+          // concurrent claims could both pass it and the last write would
+          // silently re-assign the code's org (cross-tenant: org B's claim
+          // overwriting a code org A already linked to an asset).
+          // Constraining the WHERE to the still-unclaimed state makes the
+          // first claim win; the loser gets a P2025, mapped below to the
+          // same 403 the pre-check produces.
+          organizationId: null,
+          // why: createAsset's loose QR-connect branch can link an orgless
+          // code to an asset between the callers' availability guards and
+          // this write. Also requiring the still-unlinked state here keeps
+          // claim atomic with "not linked to anything" — a loser on any
+          // condition gets the same P2025 → 403 mapping, instead of ending
+          // up with a code owned by org B but attached to org A's asset.
+          assetId: null,
+          kitId: null,
+        },
+        data: {
+          organizationId,
+          userId,
+        },
+      });
+    } catch (updateCause) {
+      if (isNotFoundError(updateCause)) {
+        throw new ShelfError({
+          // why: cause deliberately null — makeShelfError collapses any
+          // P2025 anywhere in the cause chain to a 404, which would turn
+          // this lost-race "already claimed" outcome into a not-found.
+          cause: null,
+          message:
+            "This QR code has already been claimed or linked so you cannot claim it.",
+          title: "QR code already claimed",
+          status: 403,
+          additionalData: { id, organizationId, userId },
+          label,
+          shouldBeCaptured: false,
+        });
+      }
+      throw updateCause;
+    }
   } catch (cause) {
+    // why: our own guard errors above carry user-facing messages ("not
+    // available for claiming", already-claimed 403). ShelfError copies
+    // status/title from a cause but NOT message, so re-wrapping would ship
+    // the generic "Failed to claim qr code" to clients (the mobile error
+    // envelope only carries `message`). Pass our own errors through intact.
+    if (isLikeShelfError(cause)) {
+      throw cause;
+    }
     throw new ShelfError({
       cause,
       message: "Failed to claim qr code",

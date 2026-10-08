@@ -54,8 +54,11 @@ export default function OverdueBookings() {
             {overdueBookings.map((booking: BookingItem) => {
               const custodian = getBookingCustodianName(booking);
               const assetCount =
-                (booking as BookingItem & { _count?: { assets?: number } })
-                  ._count?.assets ?? 0;
+                (
+                  booking as BookingItem & {
+                    _count?: { bookingAssets?: number };
+                  }
+                )._count?.bookingAssets ?? 0;
               return (
                 <ClickableTr key={booking.id} to={`/bookings/${booking.id}`}>
                   <Td className="w-full">
@@ -84,11 +87,7 @@ export default function OverdueBookings() {
                             </>
                           )}
                           <span className="font-medium text-error-600">
-                            Due{" "}
-                            <DateS
-                              date={booking.to}
-                              options={{ month: "short", day: "numeric" }}
-                            />
+                            Due <DateS date={booking.to} />
                           </span>
                         </span>
                       </div>

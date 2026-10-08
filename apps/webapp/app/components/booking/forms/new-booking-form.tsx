@@ -6,15 +6,17 @@ import { updateDynamicTitleAtom } from "~/atoms/dynamic-title-atom";
 import { TagsAutocomplete } from "~/components/tag/tags-autocomplete";
 import { useBookingSettings } from "~/hooks/use-booking-settings";
 import { useDisabled } from "~/hooks/use-disabled";
+import { useFormatPrefs } from "~/hooks/use-format-prefs";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { useRoleAccess } from "~/hooks/use-role-access";
 import { useWorkingHours } from "~/hooks/use-working-hours";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
 import { getBookingDefaultStartEndTimes } from "~/modules/working-hours/utils";
 import type {
   NewBookingActionReturnType,
   NewBookingLoaderReturnType,
 } from "~/routes/_layout+/bookings.new";
-import { useHints } from "~/utils/client-hints";
 
+import { bookingCustodianIsSelf } from "~/utils/bookings";
 import { getValidationErrors } from "~/utils/http";
 import { userCanViewSpecificCustody } from "~/utils/permissions/custody-and-bookings-permissions.validator.client";
 import { tw } from "~/utils/tw";
@@ -31,6 +33,14 @@ type NewBookingFormData = {
   booking: {
     custodianRef?: string; // This is a stringified value for custodianRef. It can be either a team member id or a user id
     assetIds?: string[] | null;
+    /**
+     * Optional originating kit id. Present only when the booking is being
+     * created FROM a kit (kit detail → "Create new booking"). Submitted as a
+     * hidden `kitId` input so the action resolves the kit's memberships into
+     * kit-driven slices, keeping the kit grouped in the new booking instead of
+     * its members landing as loose standalone rows.
+     */
+    kitId?: string;
   };
 
   /**
@@ -42,7 +52,7 @@ type NewBookingFormData = {
 
 export function NewBookingForm({ booking, action }: NewBookingFormData) {
   const fetcher = useFetcher<NewBookingActionReturnType>();
-  const { custodianRef, assetIds } = booking;
+  const { custodianRef, assetIds, kitId } = booking;
 
   const { teamMembers, teamMembersForForm, userId, currentOrganization, tags } =
     useLoaderData<NewBookingLoaderReturnType>();
@@ -53,21 +63,25 @@ export function NewBookingForm({ booking, action }: NewBookingFormData) {
   const [, updateName] = useAtom(updateDynamicTitleAtom);
 
   const disabled = useDisabled(fetcher);
-  const hints = useHints();
+  // TIMEZONE FIX: client-side date validation must use the user's RESOLVED
+  // timezone preference (the same one display uses), not the browser hint, so
+  // it agrees with the server parse.
+  const prefs = useFormatPrefs();
 
   // Fetch working hours for validation
   const workingHoursData = useWorkingHours();
   const { workingHours } = workingHoursData;
   const bookingSettings = useBookingSettings();
 
-  const { roles, isBaseOrSelfService, isAdministratorOrOwner } =
-    useUserRoleHelper();
+  const roles = useOrganizationRoles();
+  const roleAccess = useRoleAccess();
 
   const { startDate: defaultStartDate, endDate: defaultEndDate } =
     getBookingDefaultStartEndTimes(
       workingHours,
       bookingSettings.bufferStartTime,
-      isAdministratorOrOwner
+      roleAccess.policy.bookings.bypassTimeLimits,
+      prefs
     );
 
   const [startDate, setStartDate] = useState(defaultStartDate);
@@ -76,11 +90,11 @@ export function NewBookingForm({ booking, action }: NewBookingFormData) {
   const zo = useZorm(
     "NewQuestionWizardScreen",
     BookingFormSchema({
-      hints,
+      prefs,
       action: "new",
       workingHours: workingHours,
       bookingSettings,
-      isAdminOrOwner: isAdministratorOrOwner,
+      bypassTimeLimits: roleAccess.policy.bookings.bypassTimeLimits,
     })
   );
 
@@ -154,7 +168,7 @@ export function NewBookingForm({ booking, action }: NewBookingFormData) {
               <Card className="field-card m-0">
                 <CustodianField
                   defaultTeamMember={defaultTeamMember}
-                  disabled={disabled || isBaseOrSelfService}
+                  disabled={disabled || bookingCustodianIsSelf(roleAccess)}
                   userCanSeeCustodian={userCanSeeCustodian}
                   isNewBooking={true}
                   error={
@@ -187,7 +201,6 @@ export function NewBookingForm({ booking, action }: NewBookingFormData) {
               <Card className="field-card m-0 overflow-visible">
                 <NotificationRecipientsField
                   disabled={disabled}
-                  isAdminOrOwner={isAdministratorOrOwner}
                   creatorName="You"
                 />
               </Card>
@@ -204,6 +217,9 @@ export function NewBookingForm({ booking, action }: NewBookingFormData) {
               value={item}
             />
           ))}
+          {/* Submitted only when creating a booking FROM a kit, so the action
+              can resolve the kit's memberships into kit-driven slices. */}
+          {kitId ? <input type="hidden" name="kitId" value={kitId} /> : null}
           <div className={tw("actions-wrapper flex flex-col gap-2")}>
             {!assetIds ? (
               <Button

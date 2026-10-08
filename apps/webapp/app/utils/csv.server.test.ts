@@ -15,6 +15,9 @@ import {
   parseCsv,
 } from "~/utils/csv.server";
 import { ShelfError } from "~/utils/error";
+import { extractCSVDataFromBackupImport } from "~/utils/import.server";
+
+import { HARDCODED_DEFAULT_PREFS } from "./date-format";
 
 // why: mock parseFormData to control file upload parsing in tests
 // while keeping MaxFileSizeExceededError available
@@ -36,13 +39,6 @@ vi.mock("lottie-react", () => ({
 
 const parseFormDataMock = vi.mocked(parseFormData);
 
-const baseRequest = new Request("http://localhost", {
-  headers: {
-    "accept-language": "en-US",
-    Cookie: "CH-time-zone=UTC",
-  },
-});
-
 describe("parseCsv", () => {
   it("parses CSV data with detected delimiters and escaped quotes", async () => {
     const csvContent =
@@ -54,6 +50,45 @@ describe("parseCsv", () => {
     expect(result).toEqual([
       ["name", "description"],
       ['MacBook "Pro" 16', "16-inch laptop"],
+    ]);
+  });
+
+  it("strips the UTF-8 BOM so an exported file re-imports cleanly", async () => {
+    // Every CSV Shelf serves opens with a BOM (see `~/utils/csv-utf8`), and
+    // files coming back from Excel carry one too. The mark has to be consumed
+    // here, or the mark stays glued to the first header and every column
+    // mapped by name silently misses — a round trip the import-ready export
+    // invites users to perform.
+    //
+    // Two layers strip it independently: a UTF-8 decode drops a leading mark
+    // by spec, and `bom: true` catches one that reaches the parser anyway.
+    // `bom: true` therefore looks redundant and is not — this asserts the
+    // outcome rather than either mechanism, so removing one net keeps the
+    // suite green and removing both does not.
+    const withBom = `\uFEFFtitle,category\nحاسوب محمول,أجهزة`;
+    const bytes = new TextEncoder().encode(withBom);
+
+    const result = await parseCsv(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+    );
+
+    expect(result).toEqual([
+      ["title", "category"],
+      ["حاسوب محمول", "أجهزة"],
+    ]);
+  });
+
+  it("picks the delimiter from the structure, not from inside quoted cells", async () => {
+    // One verbose cell can hold more of the other candidate delimiter than the
+    // whole file holds of the real one. Notes and JSON relations do exactly
+    // that, so the guess has to look between cells only.
+    const csvContent =
+      'title,description\n"Laptop","checked out; returned; checked out; returned"';
+    const csvData = new TextEncoder().encode(csvContent).buffer;
+
+    expect(await parseCsv(csvData)).toEqual([
+      ["title", "description"],
+      ["Laptop", "checked out; returned; checked out; returned"],
     ]);
   });
 });
@@ -239,7 +274,7 @@ describe("buildCsvBackupDataFromAssets", () => {
         id: "asset-1",
         description: "Line 1\nLine 2",
         category: null,
-        location: null,
+        assetLocations: [],
         custody: null,
         notes: [{ content: null }],
         tags: [{ name: "tag-1" }],
@@ -250,23 +285,181 @@ describe("buildCsvBackupDataFromAssets", () => {
     ];
 
     const result = buildCsvBackupDataFromAssets({
-      assets: assets as any,
+      assets,
       keysToSkip: ["skipMe"],
     });
 
     expect(result).toEqual([
       [
-        "asset-1",
+        '"asset-1"',
         '"Line 1Line 2"',
-        "{}",
-        "{}",
-        "{}",
-        '[{"content":""}]',
-        '[{"name":"tag-1"}]',
-        '{"foo":""}',
-        "",
+        '"{}"',
+        '"[]"',
+        '"{}"',
+        '"[{""content"":""""}]"',
+        '"[{""name"":""tag-1""}]"',
+        '"{""foo"":""""}"',
+        '""',
       ],
     ]);
+  });
+
+  it("quotes a value carrying the delimiter or a quote", () => {
+    const assets = [
+      {
+        id: "asset-1",
+        title: "MacBook Pro; 16-inch",
+        description: 'He said "hello" to me',
+      },
+    ];
+
+    expect(buildCsvBackupDataFromAssets({ assets, keysToSkip: [] })).toEqual([
+      ['"asset-1"', '"MacBook Pro; 16-inch"', '"He said ""hello"" to me"'],
+    ]);
+  });
+
+  describe("assetLocations", () => {
+    /** A placement row as `fetchAssetsForExport` loads it. */
+    const placement = (
+      locationName: string,
+      quantity: number,
+      assetKitId: string | null = null
+    ) => ({
+      id: `al-${locationName}`,
+      assetId: "asset-1",
+      locationId: `loc-${locationName}`,
+      organizationId: "org-1",
+      quantity,
+      assetKitId,
+      location: { id: `loc-${locationName}`, name: locationName },
+    });
+
+    /** The exported `assetLocations` cell, the row's third column. */
+    const cellFor = (type: string, assetLocations: unknown[]) =>
+      buildCsvBackupDataFromAssets({
+        assets: [{ id: "asset-1", type, assetLocations }],
+        keysToSkip: [],
+      })[0]?.[2];
+
+    it("writes a pool's placements as JSON names and quantities", () => {
+      expect(
+        cellFor("QUANTITY_TRACKED", [
+          placement("Simulation Suite A", 99),
+          placement("Simulation Suite B", 44),
+        ])
+      ).toBe(
+        '"[{""location"":""Simulation Suite A"",""quantity"":99},{""location"":""Simulation Suite B"",""quantity"":44}]"'
+      );
+    });
+
+    it("writes an individual asset's placement as one entry", () => {
+      expect(cellFor("INDIVIDUAL", [placement("Studio", 1)])).toBe(
+        '"[{""location"":""Studio"",""quantity"":1}]"'
+      );
+    });
+
+    it("leaves a pool's kit-driven placements out", () => {
+      expect(
+        cellFor("QUANTITY_TRACKED", [
+          placement("Warehouse", 5),
+          placement("Van 2", 3, "ak-1"),
+        ])
+      ).toBe('"[{""location"":""Warehouse"",""quantity"":5}]"');
+    });
+  });
+});
+
+describe("backup export -> backup import round trip", () => {
+  // why: the real parser and the real extractor, so the assertion covers the
+  // whole restore path rather than the writer's own idea of its output.
+  const roundTrip = async (asset: Record<string, unknown>) => {
+    const rows = buildCsvBackupDataFromAssets({
+      assets: [asset],
+      keysToSkip: [],
+    });
+    const headers = Object.keys(asset).map((h) => `"${h}"`);
+    const csv = [headers, ...rows].map((row) => row.join(";")).join("\n");
+
+    const parsed = await parseCsv(new TextEncoder().encode(csv).buffer);
+    return extractCSVDataFromBackupImport(parsed as string[][])[0];
+  };
+
+  it("restores an asset whose relations are serialized as JSON", async () => {
+    expect(
+      await roundTrip({
+        id: "asset-1",
+        title: "AMD Ryzen",
+        category: { name: "CPU" },
+        tags: [{ name: "tag-1" }],
+      })
+    ).toEqual({
+      id: "asset-1",
+      title: "AMD Ryzen",
+      category: { name: "CPU" },
+      tags: [{ name: "tag-1" }],
+    });
+  });
+
+  it("restores a pool's placements by location name", async () => {
+    expect(
+      await roundTrip({
+        id: "asset-1",
+        title: "Pens",
+        type: "QUANTITY_TRACKED",
+        quantity: 143,
+        assetLocations: [
+          {
+            id: "al-1",
+            quantity: 99,
+            assetKitId: null,
+            location: { id: "loc-1", name: "Suite A; north" },
+          },
+          {
+            id: "al-2",
+            quantity: 44,
+            assetKitId: null,
+            location: { id: "loc-2", name: 'Suite "B"' },
+          },
+          {
+            id: "al-3",
+            quantity: 10,
+            assetKitId: "ak-1",
+            location: { id: "loc-3", name: "Kit van" },
+          },
+        ],
+      })
+    ).toEqual({
+      id: "asset-1",
+      title: "Pens",
+      type: "QUANTITY_TRACKED",
+      quantity: "143",
+      assetLocations: [
+        { location: "Suite A; north", quantity: 99 },
+        { location: 'Suite "B"', quantity: 44 },
+      ],
+    });
+  });
+
+  it("restores an unplaced asset without placements", async () => {
+    expect(
+      await roundTrip({ id: "asset-1", title: "Loose", assetLocations: [] })
+    ).toEqual({ id: "asset-1", title: "Loose" });
+  });
+
+  it("restores text carrying the delimiter, a quote, or both", async () => {
+    expect(
+      await roundTrip({
+        id: "asset-1",
+        title: 'Monitor "27-inch"; refurbished',
+        description: "Battery at 30% capacity; sold as-is",
+        category: { name: "Displays, external" },
+      })
+    ).toEqual({
+      id: "asset-1",
+      title: 'Monitor "27-inch"; refurbished',
+      description: "Battery at 30% capacity; sold as-is",
+      category: { name: "Displays, external" },
+    });
   });
 });
 
@@ -281,12 +474,14 @@ describe("buildCsvExportDataFromAssets", () => {
         valuation: 1234.5,
         availableToBook: true,
         createdAt: new Date("2024-01-02T03:04:05Z"),
-        custody: {
-          custodian: {
-            name: "Fallback Name",
-            user: { firstName: "Jane", lastName: "Doe" },
+        custody: [
+          {
+            custodian: {
+              name: "Fallback Name",
+              user: { firstName: "Jane", lastName: "Doe" },
+            },
           },
-        },
+        ],
         customFields: [
           {
             customField: { name: "isInsured" },
@@ -367,7 +562,7 @@ describe("buildCsvExportDataFromAssets", () => {
         barcodesEnabled: false,
         currency: "USD",
       },
-      request: baseRequest,
+      prefs: HARDCODED_DEFAULT_PREFS,
     });
 
     expect(headers).toEqual([
@@ -392,15 +587,104 @@ describe("buildCsvExportDataFromAssets", () => {
       '"photo, dslr"',
       '"$1,234.50"',
       '"Yes"',
-      '"2024-01-02T03:04:05.000Z"',
+      // Human export formats createdAt in the acting user's prefs (was raw ISO).
+      '"01/02/2024, 3:04 AM"',
       '"Jane Doe"',
       '"Yes"',
       '"Checked and ready"',
-      '"2024-02-10"',
+      // Custom-field DATE now renders in the user's date format (display-only export).
+      '"02/10/2024"',
       '"$5,000.00"',
       '"misc value"',
       '""',
     ]);
+  });
+
+  it("renders a custom-field DATE from `raw`, not the UTC-midnight `valueDate` (no tz shift)", () => {
+    // `valueDate` is deliberately a DIFFERENT day than `raw` so this guard is
+    // tz-independent: the correct path formats `raw` (2026-07-06). If the export
+    // ever reads `valueDate` again — a UTC-midnight ISO that localeOnly parses to
+    // a UTC instant and then reads in the SERVER's local zone, shifting a day
+    // west of UTC — the cell renders 2026-07-05 and this fails on every machine.
+    const assets = [
+      {
+        id: "asset-d",
+        title: "Dated",
+        tags: [],
+        custody: [],
+        customFields: [
+          {
+            customField: { name: "purchaseDate" },
+            value: { raw: "2026-07-06", valueDate: "2026-07-05T00:00:00.000Z" },
+          },
+        ],
+      },
+    ];
+
+    const columns = [
+      { name: "name", visible: true, position: 0 },
+      {
+        name: "cf_purchaseDate",
+        visible: true,
+        position: 1,
+        cfType: CustomFieldType.DATE,
+      },
+    ];
+
+    const [, row] = buildCsvExportDataFromAssets({
+      assets: assets as any,
+      columns: columns as any,
+      currentOrganization: {
+        id: "org-1",
+        barcodesEnabled: false,
+        currency: "USD",
+      },
+      prefs: HARDCODED_DEFAULT_PREFS,
+    });
+
+    // MM_DD_YYYY default prefs: July 6 from `raw`, never July 5 from `valueDate`.
+    expect(row[1]).toBe('"07/06/2026"');
+  });
+
+  it("emits per-unit valuation and qty-aware total_value side by side", () => {
+    // QT asset: 100 boxes at €1/each. `valuation` column stays per-unit
+    // (CSV round-trip safe — re-import won't inflate it), while the new
+    // synthetic `total_value` column reports the qty-aware total (€100).
+    const assets = [
+      {
+        id: "asset-pens",
+        title: "Pens",
+        valuation: 1,
+        quantity: 100,
+        type: "QUANTITY_TRACKED",
+        unitOfMeasure: "boxes",
+        tags: [],
+        custody: [],
+        customFields: [],
+      },
+    ];
+
+    const columns = [
+      { name: "name", visible: true, position: 0 },
+      { name: "valuation", visible: true, position: 1 },
+      // Injected by the export caller at MAX_SAFE_INTEGER; here we pin
+      // it to position 2 for a stable assertion.
+      { name: "total_value", visible: true, position: 2 },
+    ];
+
+    const [headers, row] = buildCsvExportDataFromAssets({
+      assets: assets as any,
+      columns: columns as any,
+      currentOrganization: {
+        id: "org-1",
+        barcodesEnabled: false,
+        currency: "USD",
+      },
+      prefs: HARDCODED_DEFAULT_PREFS,
+    });
+
+    expect(headers).toEqual(['"Name"', '"Value"', '"Total value"']);
+    expect(row).toEqual(['"Pens"', '"$1.00"', '"$100.00"']);
   });
 });
 
@@ -422,12 +706,15 @@ describe("buildCsvExportDataFromBookings", () => {
       },
       description: "Studio session",
       tags: [{ name: "commercial" }],
-      assets: [{ title: "Primary Asset" }, { title: "Secondary Asset" }],
+      bookingAssets: [
+        { asset: { title: "Primary Asset" } },
+        { asset: { title: "Secondary Asset" } },
+      ],
     };
 
     const [headers, bookingRow, assetRow] = buildCsvExportDataFromBookings(
       [booking as any],
-      baseRequest
+      HARDCODED_DEFAULT_PREFS
     );
 
     expect(headers).toEqual([
@@ -483,9 +770,16 @@ describe("buildCsvExportDataFromBookings", () => {
       custodianUser: null,
       description: "",
       tags: [],
-      assets: [
-        { id: "asset-returned", title: "Returned Camera" },
-        { id: "asset-out", title: "Still-Out Tripod" },
+      // why: bookings carry their assets via the `BookingAsset` pivot
+      // (one row per slice, with a per-slice `quantity`) post-3a, so the
+      // CSV builder feeds off `booking.bookingAssets[].asset` not the
+      // legacy direct `assets` relation.
+      bookingAssets: [
+        {
+          quantity: 1,
+          asset: { id: "asset-returned", title: "Returned Camera" },
+        },
+        { quantity: 1, asset: { id: "asset-out", title: "Still-Out Tripod" } },
       ],
     };
 
@@ -501,7 +795,7 @@ describe("buildCsvExportDataFromBookings", () => {
 
     const [, mainRow, assetRow] = buildCsvExportDataFromBookings(
       [booking as any],
-      baseRequest,
+      HARDCODED_DEFAULT_PREFS,
       checkinsByBooking
     );
 

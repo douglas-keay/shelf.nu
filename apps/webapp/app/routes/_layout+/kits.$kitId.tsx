@@ -25,30 +25,37 @@ import HorizontalTabs from "~/components/layout/horizontal-tabs";
 import { ScanDetails } from "~/components/location/scan-details";
 import When from "~/components/when/when";
 import { db } from "~/database/db.server";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
 import { usePosition } from "~/hooks/use-position";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
 import { createBarcode } from "~/modules/barcode/service.server";
 import {
   validateBarcodeValue,
   normalizeBarcodeValue,
 } from "~/modules/barcode/validation";
+import { getCustodyCardHolderUserId } from "~/modules/custody/utils";
 import {
   deleteKit,
   deleteKitImage,
+  emitAssetKitDetachmentNotes,
+  fetchAssetKitDetachmentImpact,
   getKit,
   getKitCurrentBooking,
+  mergeStandaloneCollisionsForKitDetachment,
+  preserveKitDrivenPlacements,
   relinkKitQrCode,
+  removeKitSlicesFromPlanningBookings,
 } from "~/modules/kit/service.server";
 import { createNote } from "~/modules/note/service.server";
 
 import { generateQrObj } from "~/modules/qr/utils.server";
-import { getScanByQrId } from "~/modules/scan/service.server";
-import { parseScanData } from "~/modules/scan/utils.server";
+import { getLastScanForViewer } from "~/modules/scan/service.server";
 import type { RouteHandleWithName } from "~/modules/types";
 import { getUserByID } from "~/modules/user/service.server";
 import dropdownCss from "~/styles/actions-dropdown.css?url";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { formatUnitCount } from "~/utils/asset-quantity";
 import { checkExhaustiveSwitch } from "~/utils/check-exhaustive-switch";
+import { redactCustodianForViewer } from "~/utils/custody-visibility.server";
 import { sendNotification } from "~/utils/emitter/send-notification.server";
 import { makeShelfError } from "~/utils/error";
 import { payload, error, getParams, parseData } from "~/utils/http.server";
@@ -90,6 +97,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       userOrganizations,
       currentOrganization,
       canUseBarcodes,
+      access,
     } = await requirePermission({
       userId,
       request,
@@ -102,33 +110,70 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
         id: kitId,
         organizationId,
         extraInclude: {
-          assets: {
+          assetKits: {
             select: {
+              // The membership id is the kit-slice discriminator booked rows
+              // point at (`BookingAsset.assetKitId`). `getKitCurrentBooking`
+              // needs it to tell a booking that took THIS kit from one that
+              // took the same pooled asset through another kit.
               id: true,
-              status: true,
-              custody: { select: { id: true } },
-              bookings: {
-                where: {
-                  status: { in: ["ONGOING", "OVERDUE"] },
-                },
+              asset: {
                 select: {
                   id: true,
-                  name: true,
-                  from: true,
                   status: true,
-                  custodianTeamMember: true,
-                  custodianUser: {
+                  // `type` powers the qty-aware unavailability guard in
+                  // ActionsDropdown — QUANTITY_TRACKED assets don't block
+                  // kit-custody assign (Option B handles partial pools).
+                  type: true,
+                  custody: { select: { id: true } },
+                  bookingAssets: {
+                    where: {
+                      booking: {
+                        status: { in: ["ONGOING", "OVERDUE"] },
+                      },
+                    },
                     select: {
-                      firstName: true,
-                      lastName: true,
-                      displayName: true,
-                      profilePicture: true,
-                      email: true,
+                      // Kit provenance of the booked slice: `assetKitId` is
+                      // the live membership row it was booked under,
+                      // `sourceKitId` the kit itself, which outlives a detach.
+                      // Both NULL = a standalone free-pool slice that belongs
+                      // to no kit.
+                      assetKitId: true,
+                      sourceKitId: true,
+                      // Per-slice departure markers — the record of whether
+                      // these units are out right now. A booking stays ONGOING
+                      // while other assets are away, so its status alone does
+                      // not say this kit is still gone.
+                      checkedOutAt: true,
+                      checkedInAt: true,
+                      booking: {
+                        select: {
+                          id: true,
+                          name: true,
+                          from: true,
+                          status: true,
+                          // Only what the custody card and the redaction read:
+                          // the names shown, and the ids that recognise a
+                          // booking the viewer holds.
+                          custodianTeamMember: {
+                            select: { name: true, userId: true },
+                          },
+                          custodianUser: {
+                            select: {
+                              id: true,
+                              firstName: true,
+                              lastName: true,
+                              displayName: true,
+                              profilePicture: true,
+                            },
+                          },
+                        },
+                      },
                     },
                   },
+                  availableToBook: true,
                 },
               },
-              availableToBook: true,
             },
           },
           qrCodes: true,
@@ -154,17 +199,42 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
 
     /**
      * We get the first QR code(for now we can only have 1)
-     * And using the ID of tha qr code, we find the latest scan
+     * And using the ID of tha qr code, we find the latest scan.
+     *
+     * `getLastScanForViewer` applies the `scan:read` gate SERVER-SIDE and
+     * returns null without it. The parsed scan carries the scanner's name and
+     * email, GPS coordinates and user-agent; the component renders
+     * `<ScanDetails>` behind the same check, but a client-side check only
+     * hides the data — BASE and SELF_SERVICE hold `scan: []` and were still
+     * receiving all of it in the page payload.
+     *
+     * The asset route was moved onto this helper in `109d02857`; the kit route
+     * was not, and kept calling `parseScanData` directly.
      */
-    const lastScan = kit.qrCodes[0]?.id
-      ? parseScanData({
-          scan: (await getScanByQrId({ qrId: kit.qrCodes[0].id })) || null,
-          userId,
-        })
-      : null;
+    const lastScan = await getLastScanForViewer({
+      qrId: kit.qrCodes[0]?.id,
+      userId,
+      organizationId,
+      // The caller's FULL role list, mirroring the asset route. Not the single
+      // resolved `role` from requirePermission: passing one role would hand
+      // `hasPermission` a narrower view of the membership than it has, which
+      // is the `roles[0]` trap that bit the mobile audit guards.
+      roles: userOrganizations.find((o) => o.organization.id === organizationId)
+        ?.roles,
+    });
+    // `GET_KIT_STATIC_INCLUDES` selects `custody.custodian.user` down to
+    // `email`, and this route is gated on `kit: read` — held by BASE and
+    // SELF_SERVICE. A kit has ONE custody row, so the helper's object branch
+    // applies here (assets carry an array). The current booking is derived
+    // from the REDACTED kit: it is returned beside the kit, so reading the raw
+    // one would ship the holders the redaction just emptied.
+    const [redactedKit] = redactCustodianForViewer([kit], {
+      canSeeAllCustody: access.custody.seeAll,
+      userId,
+    });
     const currentBooking = getKitCurrentBooking({
-      id: kit.id,
-      assets: kit.assets,
+      id: redactedKit.id,
+      assetKits: redactedKit.assetKits,
     });
 
     const header: HeaderData = {
@@ -177,7 +247,7 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
     };
 
     return payload({
-      kit,
+      kit: redactedKit,
       currentBooking,
       header,
       modelName,
@@ -283,36 +353,144 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
           { additionalData: { userId, organizationId, kitId } }
         );
 
-        const kit = await db.kit.update({
-          where: { id: kitId, organizationId },
-          data: {
-            assets: { disconnect: { id: assetId } },
-          },
-          select: { name: true, custody: { select: { custodianId: true } } },
-        });
-
         /**
-         * If kit was in custody then we have to make the asset available
+         * Wrap the kit disconnect + custody cleanup + status flip in a
+         * single transaction so that:
+         *   1. only the kit-allocated Custody row is removed (operator-
+         *      assigned custody on the same asset is preserved), and
+         *   2. the asset's status is only flipped back to AVAILABLE when
+         *      no custody rows remain — if operator custody still exists
+         *      on the asset, status stays IN_CUSTODY.
+         *
+         * The AssetKit row is deleted at the end, which cascades
+         * `ON DELETE SET NULL` to any BookingAsset rows holding this
+         * kit-driven slice. Before that fires we resolve the rare case
+         * where a standalone slice already exists for the same
+         * `(bookingId, assetId)` — merging the kit qty into the
+         * standalone row so the SET NULL doesn't trip
+         * `BookingAsset_manual_unique`. Detachment notes get the kit /
+         * asset names from a snapshot taken before the merge.
          */
-        if (kit.custody?.custodianId) {
-          await db.asset.update({
-            where: { id: assetId, organizationId },
-            data: {
-              status: AssetStatus.AVAILABLE,
-              custody: { delete: true },
-            },
-          });
-        }
+        const { kit, detachmentImpact, slice } = await db.$transaction(
+          async (tx) => {
+            const assetKitRows = await tx.assetKit.findMany({
+              where: { kitId, assetId },
+              // type + unitOfMeasure label the qty-tracked unit count in
+              // the membership-remove note ("removed 50 units from …");
+              // quantity is the per-row AssetKit.quantity actually being
+              // detached (NOT Asset.quantity). Captured before the
+              // deleteMany below so the note can render after the tx
+              // commits without re-querying.
+              select: {
+                id: true,
+                quantity: true,
+                asset: {
+                  select: { type: true, unitOfMeasure: true },
+                },
+              },
+            });
+            const assetKitIds = assetKitRows.map((ak: { id: string }) => ak.id);
+            // Runs FIRST: a booking that hasn't started tracks the kit's
+            // contents, so its slice is deleted rather than demoted to
+            // standalone. Neither the impact snapshot nor the collision merge
+            // should see a row that is about to disappear.
+            await removeKitSlicesFromPlanningBookings(tx, assetKitIds, {
+              actorUserId: userId,
+              organizationId,
+            });
+            const impact = await fetchAssetKitDetachmentImpact(tx, assetKitIds);
+            await mergeStandaloneCollisionsForKitDetachment(tx, assetKitIds);
+            // `AssetLocation.assetKit` is `onDelete: Cascade`, so the
+            // `assetKits: { deleteMany }` below would take the kit-driven
+            // placement with it and silently unplace the asset. Every sibling
+            // detach path already converts those rows to manual placements
+            // first; this one was missing the call.
+            await preserveKitDrivenPlacements(tx, assetKitIds);
 
-        const actor = wrapUserLinkForNote({
-          id: userId,
-          firstName: user.firstName,
-          lastName: user.lastName,
+            const updatedKit = await tx.kit.update({
+              where: { id: kitId, organizationId },
+              data: {
+                // Remove the pivot row that links this asset to the kit.
+                assetKits: { deleteMany: { assetId } },
+              },
+              select: {
+                name: true,
+                custody: { select: { id: true, custodianId: true } },
+              },
+            });
+
+            /**
+             * If kit was in custody then we have to clean up the kit-
+             * allocated custody row on the asset. Filter the deleteMany by
+             * `kitCustodyId` so operator-assigned custody on the same asset
+             * (e.g. someone holding 10 of 50 batteries directly) is left
+             * untouched.
+             */
+            if (updatedKit.custody?.id) {
+              await tx.custody.deleteMany({
+                where: { assetId, kitCustodyId: updatedKit.custody.id },
+              });
+
+              // After removing only the kit-allocated rows, check whether
+              // any custody rows remain for this asset. The asset should
+              // only flip back to AVAILABLE if no custody is left.
+              const remainingCustody = await tx.custody.count({
+                where: { assetId },
+              });
+
+              if (remainingCustody === 0) {
+                // `status: { not: CHECKED_OUT }` — removing an asset from a
+                // custodied kit must not put it back on the shelf while it is
+                // still out on a booking. `Asset.status` is a single column, so
+                // the unguarded write erased `CHECKED_OUT` and the asset stopped
+                // counting as off the shelf. Precedence
+                // (`CHECKED_OUT` > `IN_CUSTODY` > `AVAILABLE`) matches
+                // `reconcileAssetStatusForBookingExit`.
+                await tx.asset.updateMany({
+                  where: {
+                    id: assetId,
+                    organizationId,
+                    status: { not: AssetStatus.CHECKED_OUT },
+                  },
+                  data: { status: AssetStatus.AVAILABLE },
+                });
+              }
+            }
+
+            // Snapshot the (single) AssetKit slice being detached for the
+            // post-tx note. `assetKitRows[0]` is the only matching row
+            // (composite unique on AssetKit (assetId, kitId) guarantees ≤ 1).
+            const detachedSlice = assetKitRows[0] ?? null;
+
+            return {
+              kit: updatedKit,
+              detachmentImpact: impact,
+              slice: detachedSlice,
+            };
+          }
+        );
+
+        await emitAssetKitDetachmentNotes({
+          impact: detachmentImpact,
+          actor: { ...user, id: userId },
+          organizationId,
         });
+
+        const actor = wrapUserLinkForNote({ ...user, id: userId });
         const kitLink = wrapLinkForNote(`/kits/${kitId}`, kit.name.trim());
 
+        // Qty-tracked: name the per-row AssetKit.quantity actually
+        // detached ("removed 50 units from Camera Kit"); INDIVIDUAL keeps
+        // the original countless wording. Mirrors the singular path in
+        // `createKitChangeNote` (note/service.server.ts) and the bulk
+        // remove path in `bulkRemoveAssetsFromKits`.
+        const count = slice?.asset
+          ? formatUnitCount(slice.asset, slice.quantity)
+          : null;
         await createNote({
-          content: `${actor} removed the asset from ${kitLink}.`,
+          content: count
+            ? `${actor} removed ${count} from ${kitLink}.`
+            : `${actor} removed the asset from ${kitLink}.`,
           type: "UPDATE",
           userId,
           assetId,
@@ -429,10 +607,12 @@ export default function KitDetails() {
   usePosition();
   const { kit, currentBooking, qrObj, lastScan, userId, currentOrganization } =
     useLoaderData<typeof loader>();
-  const { roles } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
   const { canUseBarcodes } = useBarcodePermissions();
 
-  const kitHasUnavailableAssets = kit.assets.some((a) => !a.availableToBook);
+  const kitHasUnavailableAssets = kit.assetKits.some(
+    (ak) => !ak.asset.availableToBook
+  );
 
   const items = [
     { to: "assets", content: "Assets" },
@@ -504,11 +684,17 @@ export default function KitDetails() {
               booking={currentBooking || undefined}
               hasPermission={userCanViewSpecificCustody({
                 roles,
-                custodianUserId: kit?.custody?.custodian?.user?.id,
+                // The holder the card shows, so a viewer always sees custody
+                // that is their own — including a booking they hold.
+                custodianUserId: getCustodyCardHolderUserId({
+                  custody: kit.custody ? [kit.custody] : null,
+                  booking: currentBooking,
+                  viewerUserId: userId,
+                }),
                 organization: currentOrganization,
                 currentUserId: userId,
               })}
-              custody={kit.custody}
+              custody={kit.custody ? [kit.custody] : null}
             />
           </When>
 

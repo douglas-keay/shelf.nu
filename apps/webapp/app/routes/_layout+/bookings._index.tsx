@@ -1,4 +1,3 @@
-import type { Prisma } from "@prisma/client";
 import { TagUseFor } from "@prisma/client";
 import type {
   MetaFunction,
@@ -6,30 +5,24 @@ import type {
   ShouldRevalidateFunction,
 } from "react-router";
 import { data, redirect, Link, Outlet, useMatches } from "react-router";
-import { AvailabilityBadge } from "~/components/booking/availability-label";
-import { BookingAssetsSidebar } from "~/components/booking/booking-assets-sidebar";
 import BookingFilters from "~/components/booking/booking-filters";
-import { BookingStatusBadge } from "~/components/booking/booking-status-badge";
 import BulkActionsDropdown from "~/components/booking/bulk-actions-dropdown";
 import CreateBookingDialog from "~/components/booking/create-booking-dialog";
 import { ExportBookingsButton } from "~/components/booking/export-bookings-button";
+import ListBookingsContent from "~/components/booking/list-bookings-content";
 import { ErrorContent } from "~/components/errors";
 
 import ContextualModal from "~/components/layout/contextual-modal";
 import Header from "~/components/layout/header";
 import type { HeaderData } from "~/components/layout/header/types";
-import LineBreakText from "~/components/layout/line-break-text";
 import { List } from "~/components/list";
 import { ListContentWrapper } from "~/components/list/content-wrapper";
-import ItemsWithViewMore from "~/components/list/items-with-view-more";
 import { Button } from "~/components/shared/button";
-import { DateS } from "~/components/shared/date";
-import { UserBadge } from "~/components/shared/user-badge";
-import { Td, Th } from "~/components/table";
-import { TeamMemberBadge } from "~/components/user/team-member-badge";
+import { Th } from "~/components/table";
 import { db } from "~/database/db.server";
 import { hasGetAllValue } from "~/hooks/use-model-filters";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { useRoleAccess } from "~/hooks/use-role-access";
+import { decorateBookingsForList } from "~/modules/booking/list-flags.server";
 import {
   getBookings,
   getBookingsFilterData,
@@ -43,6 +36,7 @@ import {
 } from "~/modules/team-member/service.server";
 import type { RouteHandleWithName } from "~/modules/types";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { bookingCustodianIsSelf } from "~/utils/bookings";
 import { setCookie, userPrefs } from "~/utils/cookies.server";
 import { makeShelfError, ShelfError } from "~/utils/error";
 import { computeHasActiveFilters } from "~/utils/filter-params";
@@ -54,7 +48,6 @@ import {
   PermissionEntity,
 } from "~/utils/permissions/permission.data";
 import { requirePermission } from "~/utils/roles.server";
-import { resolveUserDisplayName } from "~/utils/user";
 
 export const bookingsSearchFieldTooltipText = `
 Search bookings based on different fields. Separate your keywords by a comma(,) to search with OR condition. Supported fields are: 
@@ -73,18 +66,13 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
   const { userId } = authSession;
 
   try {
-    const {
-      organizationId,
-      currentOrganization,
-      isSelfServiceOrBase,
-      canSeeAllBookings,
-      canSeeAllCustody,
-    } = await requirePermission({
-      userId,
-      request,
-      entity: PermissionEntity.booking,
-      action: PermissionAction.read,
-    });
+    const { organizationId, currentOrganization, access } =
+      await requirePermission({
+        userId,
+        request,
+        entity: PermissionEntity.booking,
+        action: PermissionAction.read,
+      });
 
     if (isPersonalOrg(currentOrganization)) {
       throw new ShelfError({
@@ -113,7 +101,7 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
       tags: filterTags,
     } = await getBookingsFilterData({
       request,
-      canSeeAllBookings,
+      canSeeAllBookings: access.bookings.seeAll,
       organizationId,
       userId,
     });
@@ -148,7 +136,29 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
         orderBy,
         orderDirection,
         tags: filterTags,
-        extraInclude: { tags: TAG_WITH_COLOR_SELECT },
+        // PERF: the list renders booking-level fields plus an asset COUNT. The
+        // per-booking `bookingAssets` payload existed only for the assets
+        // drawer, which now fetches it from
+        // `/api/bookings/:bookingId/assets-sidebar` when a row is expanded.
+        includeAssets: false,
+        extraInclude: {
+          // Asset count for the row's drawer trigger, now that the pivot rows
+          // themselves are no longer loaded.
+          _count: { select: { bookingAssets: true } },
+          tags: TAG_WITH_COLOR_SELECT,
+          // Include outstanding model-level reservations so the
+          // assets-sidebar drawer can render the "Unassigned model
+          // reservations (N)" section — and so the drawer trigger opens
+          // for pure book-by-model bookings (0 concrete assets, N
+          // reserved models).
+          modelRequests: {
+            include: {
+              assetModel: {
+                select: { id: true, name: true },
+              },
+            },
+          },
+        },
       }),
 
       // team members for filter dropdown
@@ -158,21 +168,22 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
         getAll:
           searchParams.has("getAll") &&
           hasGetAllValue(searchParams, "teamMember"),
-        filterByUserId: !canSeeAllCustody, // If they cant see custody, we dont render the filters anyways, however we still add this for performance reasons so we dont load all team members. This way we only load the current user's team member as that is the only one they can see
+        filterByUserId: !access.custody.seeAll, // If they cant see custody, we dont render the filters anyways, however we still add this for performance reasons so we dont load all team members. This way we only load the current user's team member as that is the only one they can see
         userId,
       }),
 
-      // team members for booking form - BASE/SELF_SERVICE users need their team member guaranteed
-      isSelfServiceOrBase
+      // Team members for the booking form: a member whose booking custodian is
+      // fixed to themself needs their own team member guaranteed.
+      bookingCustodianIsSelf(access)
         ? getTeamMemberForForm({
             organizationId,
             userId,
-            isSelfServiceOrBase,
+            access,
             getAll:
               searchParams.has("getAll") &&
               hasGetAllValue(searchParams, "teamMember"),
           })
-        : Promise.resolve(null), // ADMIN users reuse teamMembersData
+        : Promise.resolve(null), // Everyone else reuses teamMembersData
 
       db.tag.findMany({
         where: {
@@ -189,6 +200,18 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
 
     const totalPages = Math.ceil(bookingCount / perPage);
 
+    /**
+     * The two row pills — amber "Stock conflict" (≥1 over-committed
+     * QUANTITY_TRACKED asset in this booking's window) and "Includes
+     * unavailable assets" — both need a query the booking row cannot answer.
+     * `decorateBookingsForList` runs them concurrently, bounded to the current
+     * page's bookings. See `~/modules/booking/list-flags.server`.
+     */
+    const decoratedBookings = await decorateBookingsForList({
+      bookings,
+      organizationId,
+    });
+
     const header: HeaderData = {
       title: "Bookings",
     };
@@ -201,7 +224,7 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
       payload({
         header,
         currentOrganization,
-        items: bookings,
+        items: decoratedBookings,
         search,
         page,
         totalItems: bookingCount,
@@ -210,11 +233,10 @@ export async function loader({ context, request }: LoaderFunctionArgs) {
         modelName,
         hasActiveFilters,
         ...teamMembersData,
-        // For BASE/SELF_SERVICE users, provide dedicated form team members
-        // For ADMIN users, reuse the filter team members
+        // Members fixed to themselves get dedicated form team members;
+        // everyone else reuses the filter team members.
         teamMembersForForm:
           teamMembersForFormData?.teamMembers ?? teamMembersData.teamMembers,
-        isSelfServiceOrBase,
         ...notifyData,
         tags,
         totalTags: tags.length,
@@ -268,7 +290,7 @@ export default function BookingsIndexPage({
   disableBulkActions?: boolean;
 }) {
   const matches = useMatches();
-  const { isBaseOrSelfService } = useUserRoleHelper();
+  const roleAccess = useRoleAccess();
 
   const currentRoute: RouteHandleWithName = matches[matches.length - 1];
 
@@ -331,7 +353,8 @@ export default function BookingsIndexPage({
 
         <List
           bulkActions={
-            disableBulkActions || isBaseOrSelfService ? undefined : (
+            disableBulkActions ||
+            !roleAccess.policy.bookings.showBulkActions ? undefined : (
               <BulkActionsDropdown />
             )
           }
@@ -368,188 +391,5 @@ export default function BookingsIndexPage({
     <Outlet />
   );
 }
-
-const ListBookingsContent = ({
-  item,
-}: {
-  item: Prisma.BookingGetPayload<{
-    include: {
-      assets: {
-        select: {
-          id: true;
-          title: true;
-          availableToBook: true;
-          custody: true;
-          kitId: true;
-          status: true;
-          mainImage: true;
-          thumbnailImage: true;
-          mainImageExpiration: true;
-          // Code-resolution fields — mirror of getBookings' assets select
-          sequentialId: true;
-          preferredBarcodeId: true;
-          qrCodes: { take: 1; select: { id: true } };
-          barcodes: { select: { id: true; type: true; value: true } };
-          category: {
-            select: {
-              id: true;
-              name: true;
-              color: true;
-            };
-          };
-          kit: {
-            select: {
-              id: true;
-              name: true;
-            };
-          };
-        };
-      };
-      creator: {
-        select: {
-          id: true;
-          firstName: true;
-          lastName: true;
-          displayName: true;
-          profilePicture: true;
-        };
-      };
-      from: true;
-      to: true;
-      custodianUser: true;
-      custodianTeamMember: true;
-      tags: { select: { id: true; name: true; color: true } };
-    };
-  }>;
-}) => {
-  const hasUnavaiableAssets =
-    item.assets.some(
-      (asset) => !asset.availableToBook || asset.custody !== null
-    ) && !["COMPLETE", "CANCELLED", "ARCHIVED"].includes(item.status);
-
-  return (
-    <>
-      {/* Item */}
-      <Td className="w-full min-w-52 whitespace-normal p-0 md:p-0">
-        <div className="flex justify-between gap-3 p-4  md:justify-normal md:px-6">
-          <div className="flex items-center gap-3">
-            <div className="min-w-[130px]">
-              <span className="word-break mb-1 block font-medium">
-                <Button
-                  to={`/bookings/${item.id}`}
-                  variant="link"
-                  className="text-left font-medium text-gray-900 hover:text-gray-700"
-                >
-                  {item.name}
-                </Button>
-              </span>
-              <div className="">
-                <BookingStatusBadge
-                  status={item.status}
-                  custodianUserId={item.custodianUserId || undefined}
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-      </Td>
-
-      {/**
-       * Optional label when the booking includes assets that are either:
-       * 1. Marked as not available for boooking
-       * 2. Have custody
-       * 3. Have other bookings with the same period - this I am not sure how to handle yet
-       * */}
-      <Td>
-        {hasUnavaiableAssets ? (
-          <AvailabilityBadge
-            badgeText={"Includes unavailable assets"}
-            tooltipTitle={"Booking includes unavailable assets"}
-            tooltipContent={
-              "There are some assets within this booking that are unavailable for reservation because they are checked-out, have custody assigned or are marked as not allowed to book"
-            }
-          />
-        ) : null}
-      </Td>
-
-      {/* Assets count */}
-      <Td>
-        <BookingAssetsSidebar booking={item} />
-      </Td>
-
-      <Td className="max-w-62">
-        {item.description ? <LineBreakText text={item.description} /> : null}
-      </Td>
-
-      {/* From */}
-      <Td>
-        {item.from ? (
-          <div className="min-w-[130px]">
-            <span className="word-break mb-1 block font-medium">
-              <DateS date={item.from} />
-            </span>
-            <span className="block text-gray-600">
-              <DateS date={item.from} onlyTime />
-            </span>
-          </div>
-        ) : null}
-      </Td>
-
-      {/* To */}
-      <Td>
-        {item.to ? (
-          <div className="min-w-[130px]">
-            <span className="word-break mb-1 block font-medium">
-              <DateS date={item.to} />
-            </span>
-            <span className="block text-gray-600">
-              <DateS date={item.to} onlyTime />
-            </span>
-          </div>
-        ) : null}
-      </Td>
-
-      <Td className="max-w-[auto]">
-        <ItemsWithViewMore
-          items={item.tags}
-          idKey="id"
-          labelKey="name"
-          emptyMessage={<div className="text-sm text-gray-500">No tags</div>}
-        />
-      </Td>
-
-      {/* Custodian */}
-
-      <Td>
-        <TeamMemberBadge
-          teamMember={{
-            name: item.custodianTeamMember
-              ? item.custodianTeamMember.name
-              : resolveUserDisplayName(item.custodianUser),
-            user: item?.custodianUser
-              ? {
-                  id: item?.custodianUser?.id,
-                  firstName: item?.custodianUser?.firstName,
-                  lastName: item?.custodianUser?.lastName,
-                  email: item?.custodianUser?.email,
-                  profilePicture: item?.custodianUser?.profilePicture,
-                }
-              : null,
-          }}
-        />
-      </Td>
-
-      {/* Created by */}
-      <Td>
-        <UserBadge
-          img={
-            item?.creator?.profilePicture || "/static/images/default_pfp.jpg"
-          }
-          name={resolveUserDisplayName(item?.creator)}
-        />
-      </Td>
-    </>
-  );
-};
 
 export const ErrorBoundary = () => <ErrorContent />;

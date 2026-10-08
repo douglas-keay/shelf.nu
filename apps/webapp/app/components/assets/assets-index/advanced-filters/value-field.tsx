@@ -21,18 +21,28 @@ import {
 } from "~/components/icons/library";
 import { Button } from "~/components/shared/button";
 import {
+  DateRangePicker,
+  type DateRangeValue,
+} from "~/components/shared/date-range-picker";
+import {
+  DateTimePicker,
+  parseWireToParts,
+  partsToWire,
+} from "~/components/shared/date-time-picker";
+import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "~/components/shared/tooltip";
+import { useFormatPrefs } from "~/hooks/use-format-prefs";
 import type { AssetIndexLoaderData } from "~/routes/_layout+/assets._index";
-import { useHints } from "~/utils/client-hints";
 import {
   adjustDateToUserTimezone,
   adjustDateToUTC,
   isDateString,
 } from "~/utils/date-fns";
+import { generateClientId } from "~/utils/id/client-id";
 import { handleActivationKeyPress } from "~/utils/keyboard";
 import { tw } from "~/utils/tw";
 import { resolveTeamMemberName } from "~/utils/user";
@@ -50,23 +60,6 @@ function ErrorDisplay({ error }: { error?: string }) {
   return error ? (
     <div className="mt-1 text-sm text-red-500">{error}</div>
   ) : null;
-}
-
-/**
- * Generates a stable unique ID for a MultiDateInput row so React can use
- * it as a map key. `crypto.randomUUID` is preferred when available (modern
- * browsers and node), with a fallback to avoid SSR crashes.
- */
-let dateEntryCounter = 0;
-function createDateEntryId(): string {
-  if (
-    typeof globalThis.crypto !== "undefined" &&
-    typeof globalThis.crypto.randomUUID === "function"
-  ) {
-    return globalThis.crypto.randomUUID();
-  }
-  dateEntryCounter += 1;
-  return `date-entry-${dateEntryCounter}-${Date.now()}`;
 }
 
 /**
@@ -105,6 +98,52 @@ function filterConflictingSelections(
     // User just added positive (or both are new), remove negative
     return newSelection.filter((id) => id !== negativeId);
   }
+}
+
+/**
+ * Sentinel value indicating "no default to apply" — distinct from the
+ * empty-string filter value so callers can tell apart "we resolved to
+ * a deliberate empty" vs "we resolved to nothing".
+ */
+const NO_DEFAULT = Symbol("no-default-filter-value");
+
+/** Custom-field shape `resolveFilterDefault` needs to inspect — kept
+ * narrow so the helper stays decoupled from the wider filter context. */
+type CustomFieldSummary = { name?: string; options?: string[] };
+
+/**
+ * Pure resolver: given an empty-valued filter, return the default value
+ * to seed it with, or `NO_DEFAULT` when the user must pick manually.
+ *
+ * Mirrors the previous branched `useEffect` body so the only visible
+ * behaviour change is "one setFilter call instead of up to one per
+ * branch" — react-doctor's `no-cascading-set-state` is happy and the
+ * underlying infinite-loop avoidance (`setFilter("")` is a thrash, so
+ * we return `NO_DEFAULT` for that case) is preserved verbatim.
+ */
+function resolveFilterDefault(
+  filter: Filter,
+  customFields: CustomFieldSummary[]
+): Filter["value"] | typeof NO_DEFAULT {
+  if (filter.value !== "") return NO_DEFAULT;
+  if (filter.type === "boolean") return true;
+  if (filter.type === "enum") {
+    if (filter.name === "type") return "INDIVIDUAL";
+    if (filter.name === "status") return Object.values(AssetStatus)[0];
+    if (filter.name.startsWith("cf_")) {
+      const options =
+        customFields.find((f) => f?.name === filter.name.slice(3))?.options ??
+        [];
+      // Only return a real default — empty-string would thrash parent
+      // state via setFilter's unstable identity (infinite loop).
+      return options[0] ?? NO_DEFAULT;
+    }
+    // Non-custom enum fields (category, location, kit, assetModel, …)
+    // default to empty string. Returning NO_DEFAULT avoids the no-op
+    // setFilter("") that would re-trigger the effect.
+    return NO_DEFAULT;
+  }
+  return NO_DEFAULT;
 }
 
 // react-doctor:no-giant-component — deferred for follow-up refactor
@@ -175,19 +214,16 @@ export function ValueField({
   }, [localValue, validateBetweenFilter]);
 
   useEffect(() => {
-    if (filter.type === "boolean" && filter.value === "") {
-      setFilter(true); // Set default value to true when boolean field is selected
+    // Single dispatch — react-doctor's `no-cascading-set-state` rule
+    // flags branched setState calls, even when only one fires per
+    // render. Consolidate via `resolveFilterDefault` which returns the
+    // value to apply (or `null` for "no default to apply"), so this
+    // effect only invokes `setFilter` once at most.
+    const next = resolveFilterDefault(filter, customFields);
+    if (next !== NO_DEFAULT) {
+      setFilter(next);
     }
-
-    if (filter.type === "enum" && filter.value === "") {
-      const options =
-        filter.name === "status"
-          ? Object.values(AssetStatus)
-          : customFields.find((field) => field?.name === filter.name.slice(3))
-              ?.options || [];
-      setFilter(options[0]); // Set default value to first option when enum field is selected
-    }
-  }, [customFields, filter.name, filter.type, filter.value, setFilter]);
+  }, [customFields, filter, setFilter]);
 
   function handleChange(
     event: ChangeEvent<
@@ -928,6 +964,10 @@ function CustodyEnumField({
       name: "teamMember" as const,
       queryKey: "name",
       deletedAt: null,
+      // A read FILTER — the workspace custody override governs. Advanced mode
+      // is ADMIN/OWNER-only today, so this is for consistency rather than a
+      // live fix, but it keeps the rule with the picker rather than the route.
+      custodyPurpose: "custody-filter" as const,
     },
     transformItem: (item: any) => item,
     renderItem: (item: any) => resolveTeamMemberName(item, true),
@@ -1146,6 +1186,121 @@ function CategoryEnumField({
       triggerWrapperClassName="w-full text-gray-700"
       className="z-[999999]"
       contentLabel="Category"
+    />
+  );
+}
+
+/** Component that handles asset model selection for both single and multi-select scenarios */
+function AssetModelEnumField({
+  value,
+  handleChange,
+  multiSelect,
+  name,
+  disabled = false,
+}: Omit<EnumFieldProps, "options">) {
+  const data = useLoaderData<AssetIndexLoaderData>();
+
+  // Parse the existing value to get selected asset model IDs
+  const selectedIds = useMemo(() => {
+    if (!value) return [];
+    if (multiSelect && typeof value === "string") {
+      return value.split(",").map((v) => v.trim());
+    }
+    return [value];
+  }, [value, multiSelect]);
+
+  /** Common props for both DynamicSelect and DynamicDropdown */
+  const commonProps = {
+    model: {
+      name: "assetModel" as const,
+      queryKey: "name",
+    },
+    transformItem: (item: any) => ({
+      ...item,
+      id: item.id === "without-model" ? "without-model" : item.id,
+    }),
+    renderItem: (item: any) => <span>{item.name}</span>,
+    initialDataKey: "assetModels",
+    countKey: "totalAssetModels",
+    label: "Filter by asset model",
+    hideLabel: true,
+    hideCounter: true,
+    placeholder: "Search asset models",
+    withoutValueItem: {
+      id: "without-model",
+      name: "No model",
+    },
+    disabled,
+  };
+
+  // For multi-select (containsAny operator), use DynamicDropdown
+  if (multiSelect) {
+    return (
+      <DynamicDropdown
+        {...commonProps}
+        name={name}
+        trigger={
+          <Button
+            type="button"
+            variant="secondary"
+            className="w-full justify-start font-normal [&_span]:w-full [&_span]:max-w-full [&_span]:truncate"
+          >
+            <div className="flex items-center justify-between">
+              <span
+                className={tw(
+                  "text-left",
+                  selectedIds.length <= 0 && "text-gray-500"
+                )}
+              >
+                {disabled
+                  ? "Select a column first"
+                  : selectedIds.length > 0
+                  ? selectedIds
+                      .map((id) => {
+                        if (id === "without-model") {
+                          return "No model";
+                        }
+                        const models =
+                          "assetModels" in data ? data.assetModels : [];
+                        const model = models?.find(
+                          (m: { id: string; name: string }) => m.id === id
+                        );
+                        return model?.name || "";
+                      })
+                      .join(", ")
+                  : "Select asset model"}
+              </span>
+              <ChevronRight className="mr-1 inline-block rotate-90" />
+            </div>
+          </Button>
+        }
+        triggerWrapperClassName="w-full"
+        className="z-[999999]"
+        selectionMode="none"
+        defaultValues={selectedIds}
+        onSelectionChange={(selectedModelIds) => {
+          handleChange(selectedModelIds.join(","));
+        }}
+      />
+    );
+  }
+
+  // For single select (is/isNot operators), use DynamicSelect
+  return (
+    <DynamicSelect
+      {...commonProps}
+      fieldName={name}
+      placeholder={disabled ? "Select a column first" : "Select asset model"}
+      defaultValue={value as string}
+      onChange={(selectedId) => {
+        if (selectedId !== undefined) {
+          handleChange(selectedId);
+        }
+      }}
+      closeOnSelect={true}
+      triggerWrapperClassName="w-full text-gray-700"
+      className="z-[999999]"
+      contentLabel="Asset model"
     />
   );
 }
@@ -1644,6 +1799,130 @@ function TagsField({
 }
 
 /**
+ * Fixed enum field for the asset tracking type (INDIVIDUAL vs QUANTITY_TRACKED).
+ * Uses a simple Popover-based select with two hardcoded options.
+ */
+function TrackingTypeEnumField({
+  value,
+  handleChange,
+  name,
+  disabled = false,
+}: {
+  value: string;
+  handleChange: (value: string) => void;
+  name?: string;
+  disabled?: boolean;
+}) {
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState<number>(0);
+
+  const options = [
+    { id: "INDIVIDUAL", label: "Individual" },
+    { id: "QUANTITY_TRACKED", label: "Tracked by quantity" },
+  ];
+
+  /** Find the label for the currently selected value */
+  const selectedLabel =
+    options.find((opt) => opt.id === value)?.label || "Select type";
+
+  // Sync the keyboard-highlight index when the popover opens. Done in
+  // the open handler (not a useEffect) so react-doctor's
+  // `no-effect-event-handler` rule sees the cause-and-effect tied to
+  // the actual user event.
+  const openPopoverWithSelection = (open: boolean) => {
+    if (disabled) return;
+    if (open) {
+      const currentIndex = options.findIndex((opt) => opt.id === value);
+      setSelectedIndex(currentIndex >= 0 ? currentIndex : 0);
+    }
+    setIsPopoverOpen(open);
+  };
+
+  const handleSelect = (optionValue: string) => {
+    handleChange(optionValue);
+    setIsPopoverOpen(false);
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        setSelectedIndex((prev) =>
+          prev < options.length - 1 ? prev + 1 : prev
+        );
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        setSelectedIndex((prev) => (prev > 0 ? prev - 1 : prev));
+        break;
+      case "Enter":
+      case " ":
+        event.preventDefault();
+        handleSelect(options[selectedIndex].id);
+        break;
+      case "Escape":
+        event.preventDefault();
+        setIsPopoverOpen(false);
+        break;
+    }
+  };
+
+  return (
+    <>
+      <input type="hidden" value={value} name={name} />
+      <Popover
+        open={isPopoverOpen && !disabled}
+        onOpenChange={openPopoverWithSelection}
+      >
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="secondary"
+            className="w-full justify-start truncate whitespace-nowrap font-normal [&_span]:max-w-full [&_span]:truncate"
+            disabled={disabled}
+          >
+            <ChevronRight className="ml-[2px] inline-block rotate-90" />
+            <span className="ml-2">
+              {disabled ? "Select a column first" : selectedLabel}
+            </span>
+          </Button>
+        </PopoverTrigger>
+        <PopoverPortal>
+          <PopoverContent
+            align="start"
+            className={tw(
+              "z-[999999] mt-2 max-h-[400px] min-w-[100px] overflow-scroll rounded-md border border-gray-200 bg-white"
+            )}
+            onKeyDown={handleKeyDown}
+          >
+            {options.map((option, index) => (
+              <div
+                key={option.id}
+                className={tw(
+                  "flex items-center justify-between px-4 py-2 text-[14px] font-medium text-gray-600 hover:cursor-pointer hover:bg-gray-50",
+                  selectedIndex === index && "bg-gray-50"
+                )}
+                role="button"
+                tabIndex={0}
+                onClick={() => handleSelect(option.id)}
+                onKeyDown={handleActivationKeyPress(() =>
+                  handleSelect(option.id)
+                )}
+              >
+                <span>{option.label}</span>
+                {value === option.id && (
+                  <CheckIcon className="size-4 text-primary" />
+                )}
+              </div>
+            ))}
+          </PopoverContent>
+        </PopoverPortal>
+      </Popover>
+    </>
+  );
+}
+
+/**
  * Component that determines which enum field to render based on field name
  */
 function ValueEnumField({
@@ -1693,6 +1972,21 @@ function ValueEnumField({
     );
   }
 
+  if (fieldName === "assetModel") {
+    return (
+      <>
+        <AssetModelEnumField
+          value={value}
+          handleChange={handleChange}
+          multiSelect={multiSelect}
+          name={name}
+          disabled={disabled}
+        />
+        {error && <div className="mt-1 text-[12px] text-red-500">{error}</div>}
+      </>
+    );
+  }
+
   // Apply the same pattern to all other enum fields
   if (fieldName === "location") {
     return (
@@ -1731,6 +2025,20 @@ function ValueEnumField({
           value={value}
           handleChange={handleChange}
           multiSelect={multiSelect}
+          name={name}
+          disabled={disabled}
+        />
+        {error && <div className="mt-1 text-[12px] text-red-500">{error}</div>}
+      </>
+    );
+  }
+
+  if (fieldName === "type") {
+    return (
+      <>
+        <TrackingTypeEnumField
+          value={value}
+          handleChange={handleChange}
           name={name}
           disabled={disabled}
         />
@@ -1809,7 +2117,9 @@ export function DateField({
   error,
   disabled = false,
 }: DateFieldProps) {
-  const { timeZone } = useHints();
+  // Acting user's resolved PREF timezone (not the browser hint) — keeps the
+  // advanced date filters consistent with the user-level date/time system.
+  const { timeZone } = useFormatPrefs();
   const [localValue, setLocalValue] = useState<[string, string]>(["", ""]);
   const [localError, setLocalError] = useState<string | null>(null);
   // Combine local and zorm errors
@@ -1857,6 +2167,34 @@ export function DateField({
     };
   }
 
+  /**
+   * Change handler for the "between" operator's DateRangePicker. Receives the
+   * calendar `{ from, to }` Dates and mirrors `handleDateChange`'s wire flow:
+   * store the user-tz display wires locally, push the UTC-adjusted pair up to
+   * the parent filter once both ends are set, and validate ordering.
+   *
+   * Task 5 note: `adjustDateToUTC` / `adjustDateToUserTimezone` are retained
+   * (not removed) because they form the inverse pair binding the STORED
+   * `filter.value` (UTC-adjusted) to the DISPLAYED wire (user-tz). For a
+   * date-only wire the round-trip is a near-identity, but the single-date and
+   * `inDates` branches still rely on it, so removing it here would diverge
+   * their stored values. Kept identical across all three branches.
+   */
+  function handleRangeChange(range: DateRangeValue) {
+    const newValue: [string, string] = [
+      partsToWire(range.from, "", "date"),
+      partsToWire(range.to, "", "date"),
+    ];
+    setLocalValue(newValue);
+    if (newValue[0] && newValue[1]) {
+      setFilter([
+        adjustDateToUTC(newValue[0], timeZone),
+        adjustDateToUTC(newValue[1], timeZone),
+      ]);
+    }
+    validateDates(newValue);
+  }
+
   function validateDates([start, end]: [string, string]) {
     if (start && end) {
       const startDate = parseISO(start);
@@ -1897,32 +2235,28 @@ export function DateField({
   }
 
   if (filter.operator === "between") {
+    // The range picker deals purely in calendar days, so convert the user-tz
+    // display wires into naive Dates for its controlled `value`, and back to
+    // wires (then UTC-adjusted) on change via `handleRangeChange`. The
+    // hidden `${name}_start` / `${name}_end` inputs preserve the same wires
+    // the previous two DateTimePickers emitted — server logic is unchanged.
+    const rangeValue: DateRangeValue = {
+      from: parseWireToParts(localValue[0]).date,
+      to: parseWireToParts(localValue[1]).date,
+    };
     return (
-      <div className="space-y-2">
-        <div className="flex max-w-full items-center justify-normal gap-[2px]">
-          <Input
-            {...commonInputProps}
-            label="Start Date"
-            type="date"
-            value={localValue[0]}
-            onChange={handleDateChange(0)}
-            className="w-1/2"
-            name={`${name}_start`}
-          />
-          <Input
-            {...commonInputProps}
-            label="End Date"
-            type="date"
-            value={localValue[1]}
-            onChange={handleDateChange(1)}
-            className="w-1/2"
-            name={`${name}_end`}
-          />
-        </div>
-        {combinedError && localValue[0] !== "" && localValue[1] !== "" && (
-          <div className="!mt-0 text-[12px] text-red-500">{combinedError}</div>
-        )}
-      </div>
+      // Route validation through the shared picker's `error` prop so the
+      // message is aria-describedby-linked to the trigger (and shows the error
+      // border), instead of an orphaned <div> that was also hidden until both
+      // ends were filled.
+      <DateRangePicker
+        value={rangeValue}
+        onChange={handleRangeChange}
+        startName={`${name}_start`}
+        endName={`${name}_end`}
+        error={combinedError}
+        className="text-sm"
+      />
     );
   } else if (filter.operator === "inDates") {
     return (
@@ -1930,21 +2264,26 @@ export function DateField({
         setValue={(value) => setFilter(value)}
         value={typeof filter.value === "string" ? filter.value : ""}
         timeZone={timeZone}
-        commonInputProps={commonInputProps}
         error={combinedError}
         name={name}
       />
     );
   } else {
     return (
-      <Input
-        {...commonInputProps}
-        type="date"
+      <DateTimePicker
+        mode="date"
+        label="Date"
+        hideLabel
         value={localValue[0]}
-        onChange={handleDateChange(0)}
+        onChange={(next) =>
+          handleDateChange(0)({
+            target: { value: next },
+          } as ChangeEvent<HTMLInputElement>)
+        }
         error={combinedError}
-        name={name}
+        name={name ?? ""}
         disabled={disabled}
+        className="[&_input]:text-sm"
       />
     );
   }
@@ -1954,19 +2293,12 @@ function MultiDateInput({
   setValue,
   value,
   timeZone,
-  commonInputProps,
   name,
   error,
 }: {
   setValue: (value: string) => void;
   value: string;
   timeZone: string;
-  commonInputProps: {
-    inputClassName: string;
-    hideLabel: boolean;
-    label: string;
-    onKeyUp: (e: KeyboardEvent<HTMLInputElement>) => void;
-  };
   name?: string;
   error?: string;
 }) {
@@ -1979,9 +2311,9 @@ function MultiDateInput({
   type DateEntry = { id: string; value: string };
 
   const [dates, setDates] = useState<DateEntry[]>(() => {
-    if (!value) return [{ id: createDateEntryId(), value: "" }];
+    if (!value) return [{ id: generateClientId(), value: "" }];
     return value.split(",").map((d) => ({
-      id: createDateEntryId(),
+      id: generateClientId(),
       value: d.trim(),
     }));
   });
@@ -2005,7 +2337,7 @@ function MultiDateInput({
 
   // Add new date field
   const addDateField = () => {
-    setDates([...dates, { id: createDateEntryId(), value: "" }]);
+    setDates([...dates, { id: generateClientId(), value: "" }]);
   };
   // Remove date field at index
   const removeDateField = (indexToRemove: number) => {
@@ -2023,12 +2355,21 @@ function MultiDateInput({
     <div className="space-y-1">
       {dates.map((entry, index) => (
         <div key={entry.id} className="relative flex items-center gap-2">
-          <Input
-            {...commonInputProps}
-            type="date"
+          <DateTimePicker
+            mode="date"
+            label="Date"
+            hideLabel
             value={entry.value}
-            onChange={handleDateChange(index)}
-            className="flex-1"
+            onChange={(next) =>
+              handleDateChange(index)({
+                target: { value: next },
+              } as ChangeEvent<HTMLInputElement>)
+            }
+            // Route the error through the shared picker so it renders its
+            // aria-describedby-linked error text (and error border) instead of
+            // an orphaned <div> not associated with any input.
+            error={error}
+            className="flex-1 [&_input]:text-sm"
             name={`${name}_${index}`}
           />
           {dates.length > 1 && (
@@ -2042,11 +2383,10 @@ function MultiDateInput({
           )}
         </div>
       ))}
-      {error && <div className="!mt-0 text-[12px] text-red-500">{error}</div>}
       <Button
         type="button"
         variant="block-link"
-        className="text-[14px]"
+        className="text-sm"
         size="xs"
         onClick={addDateField}
       >

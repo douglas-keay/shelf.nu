@@ -6,7 +6,10 @@
  * custom date component.
  */
 
-import type { Category } from "@prisma/client";
+import type { AssetType, Category } from "@prisma/client";
+import { formatUnitCount } from "~/utils/asset-quantity";
+import { stripMarkdocDelimiters } from "~/utils/markdoc-sanitize";
+import type { UserNameFields } from "~/utils/user";
 import { resolveUserDisplayName } from "~/utils/user";
 
 /**
@@ -80,6 +83,35 @@ export function wrapAssetsWithDataForNote(
 }
 
 /**
+ * Composes a single-asset note fragment that prefixes a unit count for
+ * QUANTITY_TRACKED assets, e.g. `"50 units of {asset link}"`.
+ *
+ * For INDIVIDUAL assets — or a missing / non-positive quantity — it returns
+ * the bare asset link, so existing note phrasing is byte-for-byte unchanged.
+ * Use this for per-asset notes (kit add/remove, location move, booking add)
+ * where the asset appears as a single link in the sentence; the calling verb
+ * wraps around it (e.g. `added ${fragment} to ${kit}`).
+ *
+ * @param asset - Asset with id, title, type, and unitOfMeasure
+ * @param quantity - The PIVOT-row quantity (AssetKit / AssetLocation /
+ *   BookingAsset / Custody `.quantity`), NOT `Asset.quantity`
+ * @returns `"50 units of {% link ... /%}"` or just `"{% link ... /%}"`
+ */
+export function wrapAssetWithCountForNote(
+  asset: {
+    id: string;
+    title: string;
+    type: AssetType;
+    unitOfMeasure?: string | null;
+  },
+  quantity: number | null | undefined
+): string {
+  const link = wrapAssetsWithDataForNote(asset);
+  const count = formatUnitCount(asset, quantity);
+  return count ? `${count} of ${link}` : link;
+}
+
+/**
  * Wraps kit information in Markdoc kits_list tag syntax for interactive display
  *
  * @param kitIds - Array of kit IDs or single kit ID
@@ -145,12 +177,9 @@ export function wrapKitsWithDataForNote(
  * Example: wrapUserLinkForNote({id: "123", firstName: "John", lastName: "Doe"})
  * -> "{% link to=\"/settings/team/users/123\" text=\"John Doe\" /%}"
  */
-export function wrapUserLinkForNote(user: {
-  id: string;
-  displayName?: string | null;
-  firstName?: string | null;
-  lastName?: string | null;
-}): string {
+export function wrapUserLinkForNote(
+  user: UserNameFields & { id: string }
+): string {
   const name = resolveUserDisplayName(user) || "Unknown User";
   return `{% link to="/settings/team/users/${user.id}" text="${name.replace(
     /"/g,
@@ -170,6 +199,27 @@ export function wrapUserLinkForNote(user: {
  */
 export function wrapLinkForNote(to: string, text: string): string {
   return `{% link to="${to}" text="${text.replace(/"/g, "&quot;")}" /%}`;
+}
+
+/**
+ * Appends an optional free-text remark to a system-generated note line.
+ *
+ * Several quantity custody / adjustment endpoints let the caller attach a
+ * free-form `note`, which is then persisted as part of an `UPDATE` note and
+ * rendered through Markdoc. Every one of them built the same string by hand,
+ * and every one of them forgot to sanitize it — so the composition lives here
+ * once, with the strip built in.
+ *
+ * @param baseLine - The system-generated sentence (already safe)
+ * @param text - Untrusted free-text remark; omitted when empty
+ * @returns `baseLine` with the quoted remark appended, or `baseLine` unchanged
+ */
+export function appendUserTextToNote(
+  baseLine: string,
+  text?: string | null
+): string {
+  const safeText = stripMarkdocDelimiters(text);
+  return safeText ? `${baseLine} *"${safeText}"*` : baseLine;
 }
 
 export function wrapTagForNote(tag: {
@@ -239,12 +289,7 @@ export function extractAssetsListTags(content: string): Array<{
 export function wrapCustodianForNote(custodian: {
   teamMember: {
     name: string;
-    user?: {
-      id: string;
-      displayName?: string | null;
-      firstName?: string | null;
-      lastName?: string | null;
-    } | null;
+    user?: (UserNameFields & { id: string }) | null;
   };
 }): string {
   const { teamMember } = custodian;
@@ -253,8 +298,14 @@ export function wrapCustodianForNote(custodian: {
     // Custodian has a user account, create a link
     return wrapUserLinkForNote(teamMember.user);
   } else {
-    // Team member without user account, use bold text with escaped asterisks
-    return `**${teamMember.name.replace(/\*\*/g, "\\*\\*")}**`;
+    // Team member without a user account renders as literal bold text, so the
+    // name must be stripped of Markdoc delimiters as well as escaped for
+    // emphasis — a non-registered member's name is free-form user input and
+    // this wrapper is shared by every custody note in the app.
+    return `**${stripMarkdocDelimiters(teamMember.name).replace(
+      /\*\*/g,
+      "\\*\\*"
+    )}**`;
   }
 }
 

@@ -1,10 +1,54 @@
 import { atom } from "jotai";
 import type { ListItemData } from "~/components/list/list-item";
 
+/**
+ * Unique key for bulk-selection identity.
+ *
+ * A single asset can have multiple BookingAsset rows on the same booking
+ * (Polish-6 multi-slice — e.g. one slice as a kit member + one standalone
+ * slice of the same qty-tracked asset). Both rows carry the same `id`
+ * (asset id) but different `bookingAssetId`. Comparing by `id` alone
+ * treats them as the same selection, so checking the kit auto-checks any
+ * standalone-of-same-asset row (and vice versa) — and removing one
+ * removes both.
+ *
+ * Prefer `bookingAssetId` when present (per-slice rows on a booking), fall
+ * back to `id` (kits, assets that don't have a pivot row attached — e.g.
+ * the asset index page, ALL_SELECTED_KEY sentinel, etc.).
+ */
+export function bulkSelectionKey(
+  item: { id: string } & {
+    bookingAssetId?: string | null;
+  }
+): string {
+  return item.bookingAssetId ?? item.id;
+}
+
 export const selectedBulkItemsAtom = atom<ListItemData[]>([]);
 
 // This atom is used to keep track of the items that are disabled in the bulk actions
 export const disabledBulkItemsAtom = atom<ListItemData[]>([]);
+
+/**
+ * Whether the current route's selection is FORM STATE rather than a set of rows
+ * to act on.
+ *
+ * On an index, a tick means "do the next bulk action to this row", so it must
+ * not outlive the filter it was made under: an item ticked before a search
+ * stays selected while invisible, and the action then reaches an asset the user
+ * cannot see. On the `manage-*` screens a tick means "this item is attached to
+ * this booking or kit", so it MUST survive filtering — unticking is how you
+ * detach something, and clearing on search would submit every attached item as
+ * removed.
+ *
+ * Default false, so a new list page is protected without having to remember
+ * anything. Screens whose selection is form state never set this directly: they
+ * seed through `seedFormSelectionAtom`, which sets it in the same write, so a
+ * screen cannot load its attached items without also opting out.
+ * `AtomsResetHandler` resets this on every pathname change, so an opt-out
+ * cannot leak into the next route.
+ */
+export const selectionIsFormStateAtom = atom<boolean>(false);
 
 /**
  * Reset the atom when it mounts
@@ -37,12 +81,14 @@ export const setSelectedBulkItemAtom = atom<null, ListItemData[], unknown>(
   null,
   (_, set, update) => {
     set(selectedBulkItemsAtom, (prev) => {
-      // Check if the item exists by ID instead of reference
-      const exists = prev.some((item) => item.id === update.id);
+      // Compare by `bulkSelectionKey` so multi-slice rows (kit-driven +
+      // standalone of the same asset) toggle independently — see helper
+      // for rationale.
+      const updateKey = bulkSelectionKey(update);
+      const exists = prev.some((item) => bulkSelectionKey(item) === updateKey);
 
       if (exists) {
-        // Remove by ID instead of reference
-        return prev.filter((item) => item.id !== update.id);
+        return prev.filter((item) => bulkSelectionKey(item) !== updateKey);
       }
       return [...prev, update];
     });
@@ -58,21 +104,41 @@ export const setSelectedBulkItemsAtom = atom<null, ListItemData[][], void>(
     const disabledItems = get(disabledBulkItemsAtom);
     const prevItems = get(selectedBulkItemsAtom);
 
-    // Filter out disabled items from the update
+    // Filter out disabled items from the update — compare by
+    // `bulkSelectionKey` so multi-slice rows are evaluated per-row.
+    const disabledKeys = new Set(disabledItems.map(bulkSelectionKey));
     const filteredUpdate = update.filter(
-      (item) =>
-        !disabledItems.some((disabledItem) => disabledItem.id === item.id)
+      (item) => !disabledKeys.has(bulkSelectionKey(item))
     );
 
-    // Create a map of previous items
-    const prevItemsMap = new Map(prevItems.map((item) => [item.id, item]));
-
-    // Merge with previous items
+    // Dedup-merge prev + filteredUpdate keyed by `bulkSelectionKey`.
+    const prevItemsMap = new Map(
+      prevItems.map((item) => [bulkSelectionKey(item), item])
+    );
     filteredUpdate.forEach((item) => {
-      prevItemsMap.set(item.id, item);
+      prevItemsMap.set(bulkSelectionKey(item), item);
     });
 
     set(selectedBulkItemsAtom, Array.from(prevItemsMap.values()));
+  }
+);
+
+/**
+ * Seeds the selection of a `manage-*` screen with the items already attached to
+ * its booking, kit or location, and marks that selection as form state.
+ *
+ * Use this — not `setSelectedBulkItemsAtom` — wherever a screen loads what is
+ * attached. Those screens submit every unticked item as removed, so if the
+ * selection were cleared by a search the save would detach everything; the flag
+ * set here is what stops `AtomsResetHandler` from clearing it.
+ *
+ * @param update - The items currently attached, pre-ticked in the picker
+ */
+export const seedFormSelectionAtom = atom<null, ListItemData[][], void>(
+  null,
+  (_, set, update) => {
+    set(setSelectedBulkItemsAtom, update);
+    set(selectionIsFormStateAtom, true);
   }
 );
 
@@ -93,11 +159,12 @@ export const setDisabledBulkItemsAtom = atom<null, ListItemData[][], void>(
 export const removeSelectedBulkItemsAtom = atom<null, ListItemData[][], void>(
   null,
   (_, set, update) => {
+    // Per-row removal: compare by `bulkSelectionKey` so removing a
+    // kit-driven slice doesn't also pull a standalone-of-same-asset row
+    // out of the selection (multi-slice).
+    const updateKeys = new Set(update.map(bulkSelectionKey));
     set(selectedBulkItemsAtom, (prev) =>
-      prev.filter(
-        (prevItem) =>
-          !update.some((updateItem) => updateItem.id === prevItem.id)
-      )
+      prev.filter((prevItem) => !updateKeys.has(bulkSelectionKey(prevItem)))
     );
   }
 );

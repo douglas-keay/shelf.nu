@@ -26,6 +26,7 @@ import {
 } from "~/components/shared/modal";
 import { Spinner } from "~/components/shared/spinner";
 import { useDisabled } from "~/hooks/use-disabled";
+import { getPrimaryLocation } from "~/modules/asset/utils";
 import type {
   AssetFromQr,
   KitFromQr,
@@ -77,7 +78,7 @@ export default function UpdateLocationDrawer({
       count: errors.length,
       message: (count: number) => (
         <>
-          <strong>{`${count} QR code${count > 1 ? "s" : ""}`}</strong> $
+          <strong>{`${count} QR code${count > 1 ? "s" : ""}`}</strong>{" "}
           {count > 1 ? "are" : "is"} invalid.
         </>
       ),
@@ -88,9 +89,6 @@ export default function UpdateLocationDrawer({
   // Create blockers component
   const [hasBlockers, Blockers] = createBlockers({
     blockerConfigs,
-    onResolveAll: () => {
-      removeItemsFromList([...errors.map(([qrId]) => qrId)]);
-    },
   });
 
   // Render item row
@@ -243,7 +241,7 @@ function AddToLocationForm({ disableSubmit }: { disableSubmit: boolean }) {
         ))}
 
         <div className="px-4 md:pl-0">
-          <div className="relative z-50 my-8">
+          <div className="relative z-50 mb-3 mt-2">
             <h5 className="mb-1">Update location:</h5>
             <LocationSelect
               isBulk
@@ -257,7 +255,7 @@ function AddToLocationForm({ disableSubmit }: { disableSubmit: boolean }) {
             ) : null}
           </div>
 
-          <div className="mb-4 flex gap-3">
+          <div className="mb-2 flex gap-3">
             <Button
               type="submit"
               variant="primary"
@@ -275,15 +273,17 @@ function AddToLocationForm({ disableSubmit }: { disableSubmit: boolean }) {
 
 // Implement item renderers
 export function AssetRow({ asset }: { asset: AssetFromQr }) {
+  const primaryLocation = getPrimaryLocation(asset);
+
   // Use predefined presets to create label configurations for asset rows
   const availabilityConfigs = [
-    ...(asset.location
+    ...(primaryLocation
       ? [
           {
             condition: true,
-            badgeText: `Currently in: ${asset.location.name}`,
+            badgeText: `Currently in: ${primaryLocation.name}`,
             tooltipTitle: "Current Location",
-            tooltipContent: `Asset is currently located in ${asset.location.name}`,
+            tooltipContent: `Asset is currently located in ${primaryLocation.name}`,
             priority: 60,
             className: "bg-gray-50 border-gray-200 text-gray-700",
           },
@@ -327,7 +327,7 @@ export function KitRow({ kit }: { kit: KitFromQr }) {
       <p className="word-break whitespace-break-spaces font-medium">
         {kit.name}{" "}
         <span className="text-[12px] font-normal text-gray-700">
-          ({kit._count.assets} assets)
+          ({kit._count.assetKits} assets)
         </span>
       </p>
 

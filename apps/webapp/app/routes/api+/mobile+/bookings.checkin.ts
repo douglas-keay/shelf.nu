@@ -1,17 +1,24 @@
 import { data, type ActionFunctionArgs } from "react-router";
 import { z } from "zod";
+import { db } from "~/database/db.server";
 import {
   requireMobileAuth,
   requireMobilePermission,
   requireOrganizationAccess,
+  assertMobileCanUseBookings,
+  getMobileUserContext,
 } from "~/modules/api/mobile-auth.server";
+import { parseMobileBody } from "~/modules/api/mobile-body.server";
 import { checkinBooking } from "~/modules/booking/service.server";
+import { getBookingSettingsForOrganization } from "~/modules/booking-settings/service.server";
+import { validateBookingOwnership } from "~/utils/booking-authorization.server";
 import { getClientHint, type ClientHint } from "~/utils/client-hints";
-import { makeShelfError } from "~/utils/error";
+import { makeShelfError, ShelfError } from "~/utils/error";
 import {
   PermissionAction,
   PermissionEntity,
 } from "~/utils/permissions/permission.data";
+import { isExplicitScanRequired } from "~/utils/permissions/role-access";
 
 /**
  * POST /api/mobile/bookings/checkin
@@ -33,13 +40,16 @@ export async function action({ request }: ActionFunctionArgs) {
       action: PermissionAction.checkin,
     });
 
-    const body = await request.json();
-    const { bookingId, timeZone } = z
-      .object({
+    await assertMobileCanUseBookings(organizationId);
+
+    const { bookingId, timeZone } = await parseMobileBody(
+      z.object({
         bookingId: z.string().min(1),
         timeZone: z.string().optional(),
-      })
-      .parse(body);
+      }),
+      request,
+      "Booking"
+    );
 
     // Derive hints the standard way: locale from the request's Accept-Language
     // header and timeZone from the CH-time-zone cookie (UTC fallback). Native
@@ -50,11 +60,68 @@ export async function action({ request }: ActionFunctionArgs) {
       ...(timeZone ? { timeZone } : {}),
     };
 
+    // Org-scoped, so a foreign-org id 404s before ownership is evaluated.
+    const existingBooking = await db.booking.findFirst({
+      where: { id: bookingId, organizationId },
+      select: { creatorId: true, custodianUserId: true },
+    });
+
+    if (!existingBooking) {
+      return data(
+        { error: { message: "Booking not found in this workspace." } },
+        { status: 404 }
+      );
+    }
+
+    // Cross-user IDOR guard, mirroring the checkout routes: SELF_SERVICE holds
+    // `booking:checkin`, so the role gate above passes for ANY booking id in
+    // the organization, and `checkinBooking` does not check ownership itself.
+    // No-op when `access.bookings.writeAll`.
+    const { access } = await getMobileUserContext(user.id, organizationId);
+    validateBookingOwnership({
+      booking: existingBooking,
+      userId: user.id,
+      access,
+      action: "check in",
+    });
+
+    // PARITY with the web booking action's `checkIn` guard: when the workspace
+    // requires EXPLICIT check-in for the caller's role, the quick "check in
+    // all" path is forbidden — they must scan / select the assets (the
+    // partial-checkin path). The mobile app must NEVER be more permissive than
+    // the web / a workspace's settings, so we enforce the same policy
+    // server-side here. Judged by the caller's access (its effective role), as
+    // the loader's `canQuickCheckin` is, so the app never offers a button this
+    // refuses.
+    // Decided after the booking and ownership checks, so a missing or foreign
+    // booking answers 404 as before and the settings are only read for a
+    // booking the caller may act on.
+    const bookingSettings =
+      await getBookingSettingsForOrganization(organizationId);
+    const explicitCheckinRequired = isExplicitScanRequired({
+      access,
+      settings: bookingSettings,
+      direction: "checkin",
+    });
+    if (explicitCheckinRequired) {
+      throw new ShelfError({
+        cause: null,
+        title: "Not allowed to quick check-in",
+        message:
+          "This workspace requires explicit check-in. Scan or select the assets to check them in.",
+        label: "Booking",
+        status: 403,
+        shouldBeCaptured: false,
+      });
+    }
+
     const booking = await checkinBooking({
       id: bookingId,
       organizationId,
       hints,
       userId: user.id,
+      // "Check In All": the phone's one tap.
+      provenance: { surface: "phone", method: "quick" },
     });
 
     return data({

@@ -1,5 +1,7 @@
 import { action } from "~/routes/api+/mobile+/custody.assign";
 import { createActionArgs } from "@mocks/remix";
+import { accessFor } from "@helpers/role-access";
+import { ALL_SELECTED_KEY } from "~/utils/list";
 
 // @vitest-environment node
 
@@ -35,7 +37,7 @@ vitest.mock("~/modules/api/mobile-auth.server", () => ({
 
 // why: external service — we mock the custody assignment without hitting the database
 vitest.mock("~/modules/asset/service.server", () => ({
-  bulkAssignCustody: vitest.fn().mockResolvedValue(undefined),
+  bulkCheckOutAssets: vitest.fn().mockResolvedValue(undefined),
 }));
 
 // why: external service — we mock the team member lookup without hitting the database
@@ -69,7 +71,7 @@ import {
   requireMobilePermission,
   getMobileUserContext,
 } from "~/modules/api/mobile-auth.server";
-import { bulkAssignCustody } from "~/modules/asset/service.server";
+import { bulkCheckOutAssets } from "~/modules/asset/service.server";
 import { getTeamMember } from "~/modules/team-member/service.server";
 
 const mockUser = {
@@ -112,7 +114,7 @@ describe("POST /api/mobile/custody/assign", () => {
     (requireMobilePermission as any).mockResolvedValue(undefined);
 
     (getMobileUserContext as any).mockResolvedValue({
-      role: "ADMIN",
+      access: accessFor(["ADMIN"]),
       canUseBarcodes: false,
     });
 
@@ -134,7 +136,7 @@ describe("POST /api/mobile/custody/assign", () => {
     const body = await (result as unknown as Response).json();
     expect(body.success).toBe(true);
 
-    expect(bulkAssignCustody).toHaveBeenCalledWith(
+    expect(bulkCheckOutAssets).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user-1",
         assetIds: ["asset-1"],
@@ -161,5 +163,42 @@ describe("POST /api/mobile/custody/assign", () => {
     expect((result as unknown as Response).status).toBe(403);
     const body = await (result as unknown as Response).json();
     expect(body.error.message).toContain("Permission denied");
+  });
+
+  /**
+   * The SCALAR field is the one that looks safe and is not. The route wraps it
+   * as `assetIds: [assetId]`, and `["all-selected"]` satisfies
+   * `bulkCheckOutAssets`'s `includes(ALL_SELECTED_KEY)` check exactly as a
+   * longer list does. Mobile hardcodes `currentSearchParams: ""`, so it expands
+   * against an EMPTY filter — every available asset in the organization.
+   *
+   * SELF_SERVICE holds `asset:custody`, so a restricted role can reach it.
+   *
+   * The bulk siblings were fixed first; this one was missed because a single-id
+   * field does not read as a bulk operation.
+   */
+  it("rejects the select-all sentinel in the scalar assetId field", async () => {
+    const request = createCustodyAssignRequest({
+      assetId: ALL_SELECTED_KEY,
+      custodianId: "custodian-1",
+    });
+
+    const result = await action(createActionArgs({ request }));
+
+    expect((result as unknown as Response).status).toBe(400);
+    // The assertion that matters: the org-wide write is never reached.
+    expect(bulkCheckOutAssets).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty assetId", async () => {
+    const request = createCustodyAssignRequest({
+      assetId: "",
+      custodianId: "custodian-1",
+    });
+
+    const result = await action(createActionArgs({ request }));
+
+    expect((result as unknown as Response).status).toBe(400);
+    expect(bulkCheckOutAssets).not.toHaveBeenCalled();
   });
 });

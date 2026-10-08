@@ -102,6 +102,7 @@ export default {
           { text: "Error Handling", link: "/handling-errors" },
           { text: "Select All Pattern", link: "/select-all-pattern" },
           { text: "Utility Hooks", link: "/hooks" },
+          { text: "Roles & Permissions", link: "/roles-and-permissions" },
           {
             text: "Scanner Drawer Development",
             link: "/scanner-drawer-development",
@@ -118,12 +119,20 @@ export default {
             text: "Security Review Agent",
             link: "/security-review-agent",
           },
+          {
+            text: "PR Review Loop",
+            link: "/pr-review-loop",
+          },
         ],
       },
       {
         text: "📊 Advanced Features",
         collapsed: true,
         items: [
+          {
+            text: "Asset Import (CSV)",
+            link: "/asset-import",
+          },
           {
             text: "Advanced Asset Index",
             link: "/advanced-index/",
@@ -161,6 +170,14 @@ export default {
           {
             text: "Microsoft Entra",
             link: "/sso/providers/microsoft-entra",
+          },
+          {
+            text: "Shibboleth",
+            link: "/sso/providers/shibboleth",
+          },
+          {
+            text: "Okta",
+            link: "/sso/providers/okta",
           },
         ],
       },

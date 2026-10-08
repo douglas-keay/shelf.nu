@@ -1,18 +1,27 @@
 import { useCallback, useRef, useState } from "react";
 import type { BookingStatus, Tag } from "@prisma/client";
+import { BOOKING_RESERVE_BLOCKED_LABELS } from "@shelf/labels";
 import { useAtom } from "jotai";
+import { DateTime } from "luxon";
 import { useActionData, useLoaderData, useNavigation } from "react-router";
 import { useZorm } from "react-zorm";
 import { updateDynamicTitleAtom } from "~/atoms/dynamic-title-atom";
 import { useBookingSettings } from "~/hooks/use-booking-settings";
 import { useBookingStatusHelpers } from "~/hooks/use-booking-status";
+import { useFormatPrefs } from "~/hooks/use-format-prefs";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { useReservationIsRequest } from "~/hooks/use-reservation-is-request";
+import { useRoleAccess } from "~/hooks/use-role-access";
 import { useWorkingHours } from "~/hooks/use-working-hours";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import type { UnavailableAssetRow } from "~/modules/booking/unavailable-assets";
 import type {
   BookingPageActionData,
   BookingPageLoaderData,
 } from "~/routes/_layout+/bookings.$bookingId.overview";
-import { useHints } from "~/utils/client-hints";
+import { getOutstandingModelRequests } from "~/utils/booking-model-requests";
+import { bookingCustodianIsSelf } from "~/utils/bookings";
+import { DATE_TIME_FORMAT } from "~/utils/constants";
+import { toIsoDateTimeToUserTimezone } from "~/utils/date-fns";
 import { isFormProcessing } from "~/utils/form";
 import { getValidationErrors } from "~/utils/http";
 import { userCanViewSpecificCustody } from "~/utils/permissions/custody-and-bookings-permissions.validator.client";
@@ -21,6 +30,7 @@ import {
   PermissionEntity,
 } from "~/utils/permissions/permission.data";
 import { userHasPermission } from "~/utils/permissions/permission.validator.client";
+import { isExplicitScanRequired } from "~/utils/permissions/role-access";
 import { tw } from "~/utils/tw";
 import { Form } from "../../custom-form";
 import { CustodianField } from "./fields/custodian";
@@ -38,22 +48,81 @@ import CheckoutDropdown from "../checkout-dropdown";
 import type { BookingFormSchemaType } from "./forms-schema";
 import { BookingFormSchema } from "./forms-schema";
 
+/**
+ * How many blocking assets the Reserve tooltip names before it stops.
+ *
+ * A hover card that runs off the screen answers nothing. Naming a few is
+ * enough to find the setting: it lives on the asset, and the operator who
+ * clears one will clear the rest the same way.
+ */
+const MAX_NAMED_UNAVAILABLE_ASSETS = 5;
+
+/**
+ * The body of the Reserve button's tooltip when unavailable assets block it.
+ *
+ * Renders the shared refusal sentence, then the assets it refuses over and the
+ * kit each sits in. Without the names an operator has to open every kit on the
+ * booking to find a flag that is invisible on the row itself, because a
+ * not-bookable asset still reads as AVAILABLE.
+ */
+export function UnavailableAssetsReason({
+  assets,
+}: {
+  assets: UnavailableAssetRow[];
+}) {
+  const named = assets.slice(0, MAX_NAMED_UNAVAILABLE_ASSETS);
+  const remaining = assets.length - named.length;
+
+  return (
+    <>
+      {BOOKING_RESERVE_BLOCKED_LABELS.UNAVAILABLE_ASSETS}
+      {named.length > 0 ? (
+        <ul className="mt-2 list-disc pl-4">
+          {named.map((asset) => (
+            <li key={asset.id}>
+              {asset.title}
+              {asset.kitName ? (
+                <span className="text-gray-500"> in kit {asset.kitName}</span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {remaining > 0 ? (
+        <div className="mt-1 text-gray-500">and {remaining} more</div>
+      ) : null}
+    </>
+  );
+}
+
 type BookingFlags = {
   hasAssets: boolean;
+  /**
+   * The booking holds at least one outstanding `BookingModelRequest` row.
+   * Together with `hasAssets`, this lets the Reserve button accept bookings
+   * that only hold model-level reservations.
+   */
+  hasModelRequests?: boolean;
   hasUnavailableAssets: boolean;
   hasCheckedOutAssets: boolean;
   hasAlreadyBookedAssets: boolean;
   hasAssetsInCustody: boolean;
+  /** A kit on the booking has a custodian, so the booking cannot check out. */
+  hasKitsInCustody?: boolean;
 };
 
 type BookingFormData = {
   booking: {
     id: string;
     name: string;
-    startDate: string;
-    endDate: string;
     custodianRef: string; // This is a stringified value for custodianRef. It can be either a team member id or a user id
     bookingFlags: BookingFlags;
+    /**
+     * The assets `bookingFlags.hasUnavailableAssets` refuses over, so the
+     * disabled Reserve button can say which ones rather than only that some
+     * exist. Empty whenever that flag is false.
+     */
+    unavailableAssets: UnavailableAssetRow[];
     description: string | null;
     status: BookingStatus;
     tags: Pick<Tag, "id" | "name">[];
@@ -72,10 +141,9 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
   const {
     id,
     name,
-    startDate: incomingStartDate,
-    endDate: incomingEndDate,
     custodianRef,
     bookingFlags,
+    unavailableAssets,
     description,
     status,
     tags,
@@ -87,20 +155,62 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
     teamMembersForForm,
     userId,
     currentOrganization,
+    booking: loaderBooking,
     lifecycleProgress,
+    checkoutSourceQuestions,
   } = useLoaderData<BookingPageLoaderData>();
+
+  /**
+   * Reserved model units no asset has been assigned to yet. A RESERVED booking
+   * with any routes "Check Out" through the fulfil-and-checkout scanner, which
+   * lists what is still to pull and confirms the unassigned units before the
+   * booking goes out without them. Derived inline from `booking.modelRequests`
+   * (already loaded via `BOOKING_WITH_ASSETS_INCLUDE`) to avoid a new loader
+   * field.
+   */
+  const outstandingModelRequestCount = getOutstandingModelRequests(
+    loaderBooking.modelRequests
+  ).length;
 
   // Progressive checkout is only offered while there are still items that
   // haven't been checked out yet (the Booked bucket). Once everything has been
   // checked out, hide the "Scan to check out" entry point.
   const hasItemsToCheckOut = (lifecycleProgress?.bookedCount ?? 0) > 0;
+
+  const isProcessing = isFormProcessing(navigation.state);
+  // TIMEZONE FIX: seed the datetime-local inputs with the wall-clock in the
+  // user's RESOLVED timezone preference (the same one date DISPLAY uses), so
+  // the edit form shows the same wall-clock the display shows. Seeding from
+  // the raw stored UTC instant via `dateForDateTimeInputValue` (browser/runtime
+  // zone) produced a different wall-clock whenever the browser zone differed
+  // from the pref zone.
+  const prefs = useFormatPrefs();
+  const incomingStartDate = toIsoDateTimeToUserTimezone(
+    loaderBooking.from,
+    prefs.timeZone
+  ).slice(0, 16);
+  const incomingEndDate = toIsoDateTimeToUserTimezone(
+    loaderBooking.to,
+    prefs.timeZone
+  ).slice(0, 16);
+
   const [startDate, setStartDate] = useState(incomingStartDate);
   const [endDate, setEndDate] = useState(incomingEndDate);
 
-  const [, updateName] = useAtom(updateDynamicTitleAtom);
+  // TIMEZONE FIX: `startDate` / `endDate` are naive wall-clock strings in the
+  // user's RESOLVED pref zone (see the seed above). Parse them back to absolute
+  // instants using that SAME zone (not the browser zone) before handing Date
+  // objects to the check-in/out dialogs — `new Date(str)` would parse the
+  // wall-clock in the browser zone and yield the wrong instant when the two
+  // differ. `DATE_TIME_FORMAT` matches the `.slice(0, 16)` wall-clock shape.
+  const startDateAsDate = DateTime.fromFormat(startDate, DATE_TIME_FORMAT, {
+    zone: prefs.timeZone,
+  }).toJSDate();
+  const endDateAsDate = DateTime.fromFormat(endDate, DATE_TIME_FORMAT, {
+    zone: prefs.timeZone,
+  }).toJSDate();
 
-  const isProcessing = isFormProcessing(navigation.state);
-  const hints = useHints();
+  const [, updateName] = useAtom(updateDynamicTitleAtom);
 
   // Fetch working hours for validation
   const workingHoursData = useWorkingHours();
@@ -119,25 +229,21 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
     );
   const bookingSettings = useBookingSettings();
 
-  const {
-    roles,
-    isBaseOrSelfService,
-    isBase,
-    isAdministratorOrOwner,
-    isAdministrator,
-    isOwner,
-    isSelfService,
-  } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
+  const roleAccess = useRoleAccess();
+  const reservationIsRequest = useReservationIsRequest();
 
   const zo = useZorm(
     "NewQuestionWizardScreen",
     BookingFormSchema({
-      hints,
+      // TIMEZONE FIX: client-side date validation uses the RESOLVED pref zone
+      // (matches display + the server parse), not the browser hint.
+      prefs,
       action: "save", // NOTE: in the front-end the action save basically handles the schema for reserve which is the same, the full schema
       status,
       workingHours: workingHours,
       bookingSettings,
-      isAdminOrOwner: isAdministratorOrOwner,
+      bypassTimeLimits: roleAccess.policy.bookings.bypassTimeLimits,
     })
   );
 
@@ -185,11 +291,26 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
   });
 
   /**
-   * Sync the editable `endDate` state with the `incomingEndDate` prop when it
-   * changes. Using the "store prior prop in ref + update during render" pattern
-   * (the React-recommended replacement for prop-sync effects) satisfies
+   * Sync the editable `startDate` / `endDate` state with the incoming loader
+   * props when they change. React Router reuses this component instance across
+   * a client-side navigation between two bookings (same route, different
+   * param), so `useState` keeps the previously-rendered booking's dates unless
+   * we mirror the new props here. Without the `startDate` sync, the duplicate →
+   * redirect flow showed the SOURCE booking's start date until a full refresh.
+   *
+   * Uses the "store prior prop in ref + update during render" pattern (the
+   * React-recommended replacement for prop-sync effects), which satisfies
    * `no-effect-event-handler` while preserving the original behaviour.
    */
+  const lastIncomingStartDateRef = useRef(incomingStartDate);
+  if (
+    incomingStartDate &&
+    incomingStartDate !== lastIncomingStartDateRef.current
+  ) {
+    lastIncomingStartDateRef.current = incomingStartDate;
+    setStartDate(incomingStartDate);
+  }
+
   const lastIncomingEndDateRef = useRef(incomingEndDate);
   if (incomingEndDate && incomingEndDate !== lastIncomingEndDateRef.current) {
     lastIncomingEndDateRef.current = incomingEndDate;
@@ -197,18 +318,15 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
   }
 
   /**
-   * Check whether the user can see actions
-   * 1. Admin/Owner always can see all
-   * 2. SELF_SERVICE can see actions if they are the custodian of the booking
-   * 3. BASE can see actions if they are the custodian of the booking
-   * This is also used to disabled the name & description fields
-   *
+   * Whether the user can see the booking actions:
+   * - Members who write every booking always see them.
+   * - Everyone else only on a booking they hold.
+   * This also decides whether the name and description fields are disabled.
    */
   const canSeeActions =
-    !isBaseOrSelfService ||
-    (isBaseOrSelfService &&
-      (defaultTeamMember?.userId === userId ||
-        defaultTeamMember?.id === userId));
+    roleAccess.bookings.writeAll ||
+    defaultTeamMember?.userId === userId ||
+    defaultTeamMember?.id === userId;
 
   return (
     <Form
@@ -222,7 +340,7 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
       {canSeeActions ? (
         <AbsolutePositionedHeaderActions>
           <div className="flex flex-1 items-center justify-between gap-2">
-            <When truthy={isBase}>
+            <When truthy={reservationIsRequest}>
               <BookingProcessSidebar />
             </When>
 
@@ -270,17 +388,26 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
                 disabled={
                   disabled ||
                   isLoadingWorkingHours ||
-                  !bookingFlags?.hasAssets ||
+                  (!bookingFlags?.hasAssets &&
+                    !bookingFlags?.hasModelRequests) ||
                   bookingFlags?.hasAlreadyBookedAssets ||
                   bookingFlags?.hasUnavailableAssets
                     ? {
-                        reason: bookingFlags?.hasUnavailableAssets
-                          ? "You have some assets in your booking that are marked as unavailble. Either remove the assets from this booking or make them available again"
-                          : bookingFlags?.hasAlreadyBookedAssets
-                          ? "Your booking has assets that are already booked for the desired period. You need to resolve that before you can reserve"
-                          : isProcessing || isLoadingWorkingHours
-                          ? undefined
-                          : "You need to add assets to your booking before you can reserve it",
+                        // Wording lives in @shelf/labels so the tooltip, the
+                        // mobile route's 400, the in-transaction guard and the
+                        // companion's inline note can never say four different
+                        // things about the same rule (they did, and this copy
+                        // carried an "unavailble" typo).
+                        reason: bookingFlags?.hasUnavailableAssets ? (
+                          <UnavailableAssetsReason
+                            assets={unavailableAssets ?? []}
+                          />
+                        ) : bookingFlags?.hasAlreadyBookedAssets ? (
+                          BOOKING_RESERVE_BLOCKED_LABELS.ALREADY_BOOKED
+                        ) : isProcessing ||
+                          isLoadingWorkingHours ? undefined : (
+                          BOOKING_RESERVE_BLOCKED_LABELS.NOTHING_TO_RESERVE
+                        ),
                       }
                     : false
                 }
@@ -290,7 +417,7 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
                 className="grow whitespace-nowrap"
                 size="sm"
               >
-                {isBase ? "Request reservation" : "Reserve"}
+                {reservationIsRequest ? "Request reservation" : "Reserve"}
               </Button>
             ) : null}
 
@@ -300,7 +427,14 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
               (RESERVED/ONGOING/OVERDUE with still-Booked items) into a single
               dropdown — mirroring the check-in dropdown for a consistent header.
               CheckoutDropdown renders a single button when only one option
-              applies, and nothing when neither does.
+              applies, and only "Scan to check out" when the workspace requires
+              explicit check-out for the viewer's role.
+
+              A RESERVED booking with unassigned model units routes through the
+              fulfil-and-checkout scanner instead, which lists what is still to
+              pull. Once the booking is underway, its remaining items go out
+              through the dropdown's "Scan to check out", like any other
+              booking; unassigned units stay open for "Scan to assign".
             */}
             <When
               truthy={
@@ -310,45 +444,79 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
                 canCheckOutBooking
               }
             >
-              <CheckoutDropdown
-                portalContainer={formElement || undefined}
-                formId="edit-booking-form"
-                booking={{ id, name: name!, from: new Date(startDate!) }}
-                disabled={disabled}
-                canFullCheckOut={!!bookingStatus?.isReserved}
-                canCheckOutRemaining={
-                  !!(
-                    (bookingStatus?.isOngoing || bookingStatus?.isOverdue) &&
-                    hasItemsToCheckOut
-                  )
-                }
-                canScanCheckOut={
-                  !!(
-                    (bookingStatus?.isReserved ||
-                      bookingStatus?.isOngoing ||
-                      bookingStatus?.isOverdue) &&
-                    hasItemsToCheckOut
-                  )
-                }
-                checkOutDisabled={
+              {(() => {
+                const checkoutDisabled =
                   disabled ||
                   isLoadingWorkingHours ||
                   bookingFlags?.hasUnavailableAssets ||
                   bookingFlags?.hasAlreadyBookedAssets ||
                   bookingFlags?.hasCheckedOutAssets ||
-                  bookingFlags?.hasAssetsInCustody
+                  bookingFlags?.hasAssetsInCustody ||
+                  bookingFlags?.hasKitsInCustody
                     ? {
                         reason: bookingFlags?.hasAssetsInCustody
                           ? "Some assets in this booking are currently in custody. You need to resolve that before you can check-out"
+                          : bookingFlags?.hasKitsInCustody
+                          ? "Some kits in this booking are currently in custody. Release their custody before you can check-out"
                           : bookingFlags?.hasAlreadyBookedAssets
                           ? "Your booking has assets that are already booked for the desired period. You need to resolve that before you can check-out"
                           : isProcessing || isLoadingWorkingHours
                           ? undefined
                           : "Some assets in this booking are not Available because they're part of an Ongoing or Overdue booking",
                       }
-                    : false
+                    : false;
+
+                // A reserved booking's first check-out goes through the fulfil
+                // scanner while model units are unassigned, so the operator
+                // sees what is still to pull before it leaves.
+                if (
+                  outstandingModelRequestCount > 0 &&
+                  bookingStatus?.isReserved
+                ) {
+                  return (
+                    <Button
+                      to="fulfil-and-checkout"
+                      disabled={checkoutDisabled}
+                      className="grow"
+                      size="sm"
+                    >
+                      Check Out
+                    </Button>
+                  );
                 }
-              />
+
+                return (
+                  <CheckoutDropdown
+                    portalContainer={formElement || undefined}
+                    formId="edit-booking-form"
+                    sourceQuestions={checkoutSourceQuestions}
+                    booking={{ id, name: name!, from: startDateAsDate }}
+                    disabled={disabled}
+                    canFullCheckOut={!!bookingStatus?.isReserved}
+                    canCheckOutRemaining={
+                      !!(
+                        (bookingStatus?.isOngoing ||
+                          bookingStatus?.isOverdue) &&
+                        hasItemsToCheckOut
+                      )
+                    }
+                    canScanCheckOut={
+                      !!(
+                        (bookingStatus?.isReserved ||
+                          bookingStatus?.isOngoing ||
+                          bookingStatus?.isOverdue) &&
+                        hasItemsToCheckOut
+                      )
+                    }
+                    checkOutDisabled={checkoutDisabled}
+                    requireExplicitCheckout={isExplicitScanRequired({
+                      access: roleAccess,
+                      settings: bookingSettings,
+                      direction: "checkout",
+                    })}
+                  />
+                );
+              })()}
             </When>
 
             <When
@@ -363,17 +531,15 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
                 booking={{
                   id,
                   name: name!,
-                  to: new Date(endDate),
-                  from: new Date(startDate),
+                  to: endDateAsDate,
+                  from: startDateAsDate,
                 }}
                 disabled={disabled || isLoadingWorkingHours}
-                requireExplicitCheckin={
-                  !isOwner &&
-                  ((isAdministrator &&
-                    bookingSettings.requireExplicitCheckinForAdmin) ||
-                    (isSelfService &&
-                      bookingSettings.requireExplicitCheckinForSelfService))
-                }
+                requireExplicitCheckin={isExplicitScanRequired({
+                  access: roleAccess,
+                  settings: bookingSettings,
+                  direction: "checkin",
+                })}
               />
             </When>
           </div>
@@ -439,7 +605,7 @@ export function EditBookingForm({ booking, action }: BookingFormData) {
                   disabled={
                     disabled ||
                     isLoadingWorkingHours ||
-                    isBaseOrSelfService ||
+                    bookingCustodianIsSelf(roleAccess) ||
                     inputFieldIsDisabled
                   }
                   userCanSeeCustodian={userCanSeeCustodian}

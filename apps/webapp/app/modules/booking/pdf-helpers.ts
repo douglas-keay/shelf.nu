@@ -5,16 +5,30 @@ import type {
   Organization,
   Prisma,
   Kit,
-  OrganizationRoles,
 } from "@prisma/client";
 import { db } from "~/database/db.server";
-import { validateBookingOwnership } from "~/utils/booking-authorization.server";
+import { ASSET_MODEL_IMAGE_SELECT } from "~/modules/asset/image-select";
+import type { ResolvedDisplayCode } from "~/modules/barcode/display";
+import {
+  QR_CODES_ORDER_BY,
+  resolveDisplayCode,
+} from "~/modules/barcode/display";
+import type { PdfCodeImage } from "~/modules/barcode/pdf-code-image";
+import { buildPdfCodeImageMap } from "~/modules/barcode/pdf-code-image.server";
+import { assertCanDownloadBookingDocuments } from "~/utils/booking-authorization.server";
+import { getOutstandingModelRequests } from "~/utils/booking-model-requests";
 import { calculateTotalValueOfAssets } from "~/utils/bookings";
 import { getClientHint } from "~/utils/client-hints";
-import { ShelfError } from "~/utils/error";
-import { filterBookingAssets, groupAndSortAssetsByKit } from "./helpers";
+import { rethrowIfClientError, ShelfError } from "~/utils/error";
+import type { RoleAccess } from "~/utils/permissions/role-access";
+import type { PdfSnapshotKit } from "./helpers";
+import {
+  buildPdfAssetRows,
+  buildPdfBookingAssetSlices,
+  filterBookingAssets,
+  groupAndSortAssetsByKit,
+} from "./helpers";
 import { getBooking } from "./service.server";
-import { getQrCodeMaps } from "../qr/service.server";
 import { TAG_WITH_COLOR_SELECT } from "../tag/constants";
 
 export interface SortParams {
@@ -24,6 +38,22 @@ export interface SortParams {
   search?: string | null;
 }
 
+/**
+ * Minimal shape of a `BookingModelRequest` row as consumed by the PDF
+ * preview's "Requested models" section (Phase 3d — Book-by-Model).
+ * Declared structurally so callers that query a booking via
+ * `BOOKING_WITH_ASSETS_INCLUDE` (which includes `modelRequests` with
+ * `assetModel`) can pass their rows through without a widening cast.
+ */
+export type PdfModelRequest = {
+  id: string;
+  assetModelId: string;
+  quantity: number;
+  fulfilledQuantity: number;
+  fulfilledAt: Date | string | null;
+  assetModel: { id: string; name: string };
+};
+
 export interface PdfDbResult {
   booking: Prisma.BookingGetPayload<{
     include: {
@@ -32,31 +62,105 @@ export interface PdfDbResult {
       tags: typeof TAG_WITH_COLOR_SELECT;
     };
   }>;
+  /**
+   * The PDF render list, ONE ROW PER `BookingAsset` slice (not one deduped row
+   * per asset). A QUANTITY_TRACKED asset booked standalone + via multiple kits
+   * appears once per slice, each carrying its own booked `quantity` and its own
+   * `kit`. `bookingAssetId` is the unique React key for the row.
+   */
   assets: (Asset & {
     category: Pick<Category, "name"> | null;
     location: Pick<Location, "name"> | null;
-    kit: Pick<Kit, "name"> | null;
+    kit:
+      | (Pick<Kit, "id" | "name"> & { location: Pick<Location, "name"> | null })
+      | null;
+    /** THIS slice's booked units (`BookingAsset.quantity`). */
+    quantity: number;
+    /** Unique `BookingAsset.id` — the rendered row's React key. */
+    bookingAssetId: string;
+    /**
+     * `true` when this slice renders under a kit it is no longer a member of
+     * (detached residue kept by a non-planning booking). Resolved in
+     * {@link buildPdfAssetRows}; the renderer prints a short note in the Kit
+     * cell, the print-medium equivalent of the web overview's
+     * "Removed from kit" badge.
+     */
+    isRemovedFromKit: boolean;
+    /** Cover image of the asset's model, rendered in the PDF when the asset
+     * has no image of its own. See `~/modules/asset/image-resolution`. */
+    assetModel: { image: string | null; thumbnailImage: string | null } | null;
   })[];
   totalValue: string;
   organization: Pick<
     Organization,
-    "id" | "name" | "imageId" | "currency" | "updatedAt"
+    | "id"
+    | "name"
+    | "imageId"
+    | "currency"
+    | "updatedAt"
+    // Read by `resolveDisplayCode` when building `assetIdToDisplayCodeMap`.
+    | "qrIdDisplayPreference"
+    | "barcodesEnabled"
+    // Whether the sheet prints the code pictures at all.
+    | "showQrCodesOnPdfs"
   >;
-  assetIdToQrCodeMap: Record<string, string>;
+  /**
+   * The picture printed for each row's code, keyed by `Asset.id`, with where
+   * it prints (the Code cell or a full-width line under the row). It is a
+   * picture of the code in `assetIdToDisplayCodeMap`: an SVG of the barcode
+   * when that code is one, otherwise the Shelf QR. An asset with no entry
+   * prints its code as text only. Built by `buildPdfCodeImageMap`.
+   */
+  assetIdToCodeImageMap: Record<string, PdfCodeImage>;
+  /**
+   * The code to PRINT in each row's Code cell, the same one the workspace's
+   * on-screen asset lists show: the QR id, the SAM id, or a barcode value,
+   * with a per-asset override winning over the workspace preference.
+   *
+   * Keyed by `Asset.id`, not by `bookingAssetId`: the render list is
+   * per-slice, so a QUANTITY_TRACKED asset booked standalone + via kits has
+   * several rows that all resolve to this one entry.
+   */
+  assetIdToDisplayCodeMap: Record<string, ResolvedDisplayCode>;
+  /**
+   * Outstanding model-level reservations on the booking (Phase 3d).
+   * Only rows with `quantity > 0` are meaningful for the PDF — the
+   * renderer filters defensively and omits the section entirely when
+   * nothing is outstanding.
+   */
+  modelRequests: PdfModelRequest[];
   from?: string;
   to?: string;
   originalFrom?: string;
   originalTo?: string;
 }
 
+/** Optional switches for {@link fetchAllPdfRelatedData}. */
+export interface PdfDataOptions {
+  /**
+   * Whether to draw a code picture per asset. `true` by default, so a sheet
+   * that prints code pictures needs no opt-in.
+   *
+   * A sheet that prints only the text code passes `false`: the encode is a
+   * per-asset cost and puts a data URL per asset into a response that nothing
+   * reads. The workspace's own `showQrCodesOnPdfs` still wins over a `true`
+   * here: this switch can only turn generation off, never on.
+   */
+  includeCodeImages?: boolean;
+}
+
 export async function fetchAllPdfRelatedData(
   bookingId: string,
   organizationId: string,
   userId: string,
-  role: OrganizationRoles | undefined,
+  /** The caller's access; `undefined` for system callers, which skip the check. */
+  access: RoleAccess | undefined,
   request: Request,
-  sortParams?: SortParams
+  sortParams?: SortParams,
+  options?: PdfDataOptions
 ): Promise<PdfDbResult> {
+  const includeCodeImages = options?.includeCodeImages ?? true;
+
   try {
     const booking = await getBooking({
       id: bookingId,
@@ -65,13 +169,12 @@ export async function fetchAllPdfRelatedData(
       extraInclude: { tags: TAG_WITH_COLOR_SELECT },
     });
 
-    if (role) {
-      validateBookingOwnership({
+    if (access) {
+      assertCanDownloadBookingDocuments({
+        access,
         booking,
         userId,
-        role,
         action: "view",
-        checkCustodianOnly: true,
       });
     }
 
@@ -81,40 +184,85 @@ export async function fetchAllPdfRelatedData(
 
     // getBooking no longer filters by search, so honor the page's active
     // search here (in memory) — the PDF should export exactly what the user is
-    // looking at. Mirrors the overview loader.
-    const visibleAssets = filterBookingAssets(
-      booking?.assets ?? [],
+    // looking at. Mirrors the overview loader. We filter on the normalized
+    // (singular kit/location) projection of the booking's bookingAssets. This
+    // stays a PER-SLICE list (one entry per BookingAsset row: one standalone +
+    // N kit-driven for a QT asset) — the PDF renders one row per slice. Each
+    // slice carries its own booked `quantity` and its unique `bookingAssetId`
+    // (used later as the row key); the asset ids are deduped only for the
+    // efficiency of the `rawAssets` fetch below, not for the render list.
+    const visibleBookingAssets = filterBookingAssets(
+      buildPdfBookingAssetSlices(booking?.bookingAssets ?? []),
       sortParams?.search
     );
+    const visibleAssetIds = [...new Set(visibleBookingAssets.map((a) => a.id))];
 
-    const [assets, organization] = await Promise.all([
+    /**
+     * Kits referenced by a visible slice's durable `BookingAsset.sourceKitId`.
+     * Fetched because the PDF, unlike the booking overview, has no kit query of
+     * its own — a kit only ever reaches it through `asset.assetKits`, which is
+     * exactly what a detached slice no longer has.
+     */
+    const snapshotKitIds = [
+      ...new Set(
+        visibleBookingAssets
+          .map((slice) => slice.sourceKitId)
+          .filter((id): id is string => id !== null)
+      ),
+    ];
+
+    const [rawAssets, organization, snapshotKits] = await Promise.all([
       db.asset.findMany({
         where: {
-          id: { in: visibleAssets.map((a) => a.id) },
+          id: { in: visibleAssetIds },
           // Defense-in-depth: scope to the caller's org even though the
           // asset ids originate from an already org-scoped booking
           organizationId,
         },
         include: {
+          // Model cover image for assets with no image of their own — the
+          // exported PDF renders the same cascade as every web surface.
+          ...ASSET_MODEL_IMAGE_SELECT,
           category: {
             select: {
               name: true,
             },
           },
-          qrCodes: true,
-          location: {
+          // why: out of this rule: `getQrCodeMaps` renders the image from
+          // `Qr.version`/`errorCorrection`, so the tight select cannot be used.
+          // Ordered so the QR picture and the QR id printed under it are the
+          // same first code on every print.
+          qrCodes: { orderBy: QR_CODES_ORDER_BY },
+          // Feeds `resolveDisplayCode` so a barcode-preference workspace gets
+          // its barcode value printed instead of the QR id.
+          barcodes: { select: { id: true, type: true, value: true } },
+          assetLocations: {
             select: {
-              name: true,
+              location: {
+                select: {
+                  name: true,
+                },
+              },
             },
           },
-          kit: {
+          // Each slice's `kit` / `kitId` are resolved PER SLICE below by
+          // matching the slice's `BookingAsset.assetKitId` against these
+          // memberships' `id` (a QT asset can be in several kits, so
+          // `assetKits[0]` is not necessarily the slice's kit). `kit.location`
+          // is included so `groupAndSortAssetsByKit` can sort kit groups by
+          // Location in the exported PDF (otherwise every kit is treated as
+          // null-location and falls back to kit-name order, making the PDF not
+          // match the selected Location sort).
+          assetKits: {
             select: {
-              name: true,
-              // Kit location — required so groupAndSortAssetsByKit can sort kit
-              // groups by Location in the exported PDF (otherwise every kit is
-              // treated as null-location and falls back to kit-name order,
-              // making the PDF not match the selected Location sort).
-              location: { select: { name: true } },
+              id: true,
+              kit: {
+                select: {
+                  id: true,
+                  name: true,
+                  location: { select: { name: true } },
+                },
+              },
             },
           },
         },
@@ -127,8 +275,28 @@ export async function fetchAllPdfRelatedData(
           id: true,
           currency: true,
           updatedAt: true,
+          // Which code the workspace wants printed, and whether its picture is
+          // printed at all.
+          qrIdDisplayPreference: true,
+          barcodesEnabled: true,
+          showQrCodesOnPdfs: true,
         },
       }),
+      // SECURITY (cross-org IDOR): `sourceKitId`'s FK accepts a `Kit` in ANY
+      // organization, so this lookup is org-scoped and an id that doesn't
+      // resolve simply leaves the slice rendering as a standalone row.
+      snapshotKitIds.length > 0
+        ? db.kit.findMany({
+            where: { id: { in: snapshotKitIds }, organizationId },
+            select: {
+              id: true,
+              name: true,
+              // Kit location — `groupAndSortAssetsByKit` sorts kit groups by
+              // it, so a snapshot kit must carry it like a live one.
+              location: { select: { name: true } },
+            },
+          })
+        : Promise.resolve<PdfSnapshotKit[]>([]),
     ]);
 
     if (!organization) {
@@ -140,33 +308,143 @@ export async function fetchAllPdfRelatedData(
       });
     }
 
-    // Group by kit and sort - this ensures kit assets stay together
+    // Build the PER-SLICE render list: join each search-visible BookingAsset
+    // slice to its full (deduped) asset data, resolving that slice's own kit
+    // and carrying its own booked quantity + unique row key. A QT asset booked
+    // standalone + via two kits produces three rows here.
+    const rawAssetsById = new Map(rawAssets.map((asset) => [asset.id, asset]));
+    const snapshotKitsById = new Map(snapshotKits.map((kit) => [kit.id, kit]));
+    const assets = buildPdfAssetRows(
+      visibleBookingAssets,
+      rawAssetsById,
+      snapshotKitsById
+    );
+
+    // Group by kit and sort - this keeps each kit's per-slice rows contiguous.
     const sortedAssets = groupAndSortAssetsByKit(
       assets,
       orderBy,
       orderDirection
     );
 
-    const assetIdToQrCodeMap = await getQrCodeMaps({
-      assets: sortedAssets,
-      userId,
-      organizationId,
-      size: "small",
-    });
+    // Deduplicate by asset id: `sortedAssets` is one row PER SLICE, so a QT
+    // asset booked standalone + via kits appears several times. The code and
+    // its picture are properties of the asset, so each asset is resolved and
+    // drawn once, and every slice row reads the same entry by `asset.id`.
+    const uniqueAssets = Array.from(
+      new Map(sortedAssets.map((asset) => [asset.id, asset])).values()
+    );
+
+    // Resolved once per unique asset. Resolving per rendered row would repeat
+    // identical work for every slice of a QUANTITY_TRACKED asset and would have
+    // to be threaded through `PdfAssetRow`; a map keyed by asset id leaves the
+    // row types untouched.
+    const assetIdToDisplayCodeMap: Record<string, ResolvedDisplayCode> =
+      Object.fromEntries(
+        uniqueAssets.map((asset) => [
+          asset.id,
+          resolveDisplayCode({
+            entity: asset,
+            organization,
+            entityKind: "asset",
+          }),
+        ])
+      );
+
+    // Drawn only when the sheet will print them: a workspace that turned code
+    // pictures off, or a caller whose sheet has no picture at all, renders
+    // nothing from this map, so drawing it would cost an encode per asset and
+    // put a data URL per asset in the response that nothing reads. The renderer
+    // treats a missing entry as "text only", so an empty map needs no handling
+    // of its own.
+    const assetIdToCodeImageMap =
+      organization.showQrCodesOnPdfs && includeCodeImages
+        ? await buildPdfCodeImageMap({
+            assets: uniqueAssets,
+            displayCodes: assetIdToDisplayCodeMap,
+            userId,
+            organizationId,
+          })
+        : {};
+
+    // Phase 3d (Book-by-Model): surface outstanding model-level
+    // reservations so the PDF can render a dedicated "Requested models"
+    // section. `getBooking` merges with `BOOKING_WITH_ASSETS_INCLUDE`
+    // which already pulls `modelRequests` with `assetModel`, so this
+    // pass-through is cheap — no extra database query required.
+    const modelRequests: PdfModelRequest[] = getOutstandingModelRequests(
+      (booking as unknown as { modelRequests?: PdfModelRequest[] })
+        .modelRequests
+    ).map((req) => ({
+      id: req.id,
+      assetModelId: req.assetModelId,
+      quantity: req.quantity,
+      fulfilledQuantity: req.fulfilledQuantity,
+      fulfilledAt: req.fulfilledAt,
+      assetModel: {
+        id: req.assetModel.id,
+        name: req.assetModel.name,
+      },
+    }));
+
+    // Everything dropped here is fetch-only. The code relations have done their
+    // job in the two maps above; `assetKits` and `assetLocations` were reduced
+    // to this row's `kit` and `location` by `buildPdfAssetRows`. Nothing reads
+    // any of them again, here or in the browser, and the render list is one row
+    // per SLICE — so a QUANTITY_TRACKED asset booked standalone and through
+    // three kits would otherwise serialise four copies of each.
+    const printableAssets = sortedAssets.map(
+      ({
+        qrCodes: _qrCodes,
+        barcodes: _barcodes,
+        assetKits: _assetKits,
+        assetLocations: _assetLocations,
+        ...row
+      }) => row
+    );
+
+    // `getBooking` returns the whole booking, and `BOOKING_WITH_ASSETS_INCLUDE`
+    // hangs two things off it that the sheet never reads: `bookingAssets`,
+    // carrying a second, select-shaped copy of every asset — code relations
+    // included — once per slice, and `modelRequests` with full `AssetModel`
+    // rows, which the sheet reads from the projection above instead. The
+    // booking itself is here for its name, description, custodian and tags.
+    const {
+      bookingAssets: _bookingAssets,
+      modelRequests: _bookingModelRequests,
+      ...printableBooking
+    } = booking as typeof booking & { modelRequests?: unknown };
+
     return {
-      booking,
-      assets: sortedAssets,
+      booking: printableBooking,
+      assets: printableAssets,
       // Keep the total aligned with the exported (search-filtered) rows so a
       // searched PDF doesn't show a subset of assets with a full-booking total.
       totalValue: calculateTotalValueOfAssets({
-        assets: sortedAssets,
+        // Sum per-slice over EXACTLY the search-visible slices — the same
+        // `visibleBookingAssets` list `buildPdfAssetRows` renders above — so
+        // the total can never diverge from the exported rows. Scoping by asset
+        // id instead folds in an asset's OTHER, non-visible slices: e.g. a QT
+        // item shown only via a re-expanded kit slice would wrongly add its
+        // hidden standalone slice's value (#2811 review). Each slice
+        // contributes its own booked `quantity` × per-unit `valuation`, so a QT
+        // asset stocked at 100 with 5 booked contributes value-for-5, not 100.
+        assets: visibleBookingAssets.map((slice) => ({
+          valuation: slice.valuation,
+          bookedQuantity: slice.quantity,
+        })),
         currency: organization.currency,
         locale: getClientHint(request).locale,
       }),
       organization,
-      assetIdToQrCodeMap,
+      assetIdToCodeImageMap,
+      assetIdToDisplayCodeMap,
+      modelRequests,
     };
   } catch (cause) {
+    // A refusal (the caller may not see this booking or its documents) keeps
+    // its own 4xx status; only unexpected failures become a 500.
+    rethrowIfClientError(cause);
     throw new ShelfError({
       cause,
       message: "Error fetching booking data for PDF",

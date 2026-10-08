@@ -29,37 +29,25 @@ import { Image } from "expo-image";
 import { api } from "@/lib/api";
 import type { KitDetail } from "@/lib/api/types";
 import { useOrg } from "@/lib/org-context";
-import { pushIntoTab } from "@/lib/navigation";
+import { useAssetScreenNavigation } from "@/lib/asset-host-stack";
 import {
   fontSize,
   spacing,
   borderRadius,
   formatStatus,
-  formatDate,
   formatCurrency,
 } from "@/lib/constants";
+import { useDateFormatter } from "@/lib/use-date-formatter";
+import { isQuantityTracked, formatQuantity } from "@/lib/quantity-format";
 import { useTheme } from "@/lib/theme-context";
 import { createStyles } from "@/lib/create-styles";
 import { InfoRow } from "@/components/shared/info-row";
+import { CodeSection } from "@/components/shared/code-section";
 import { KitActions } from "@/components/kit-detail/kit-actions";
 import { TeamMemberPicker } from "@/components/team-member-picker";
 import { LocationPicker } from "@/components/location-picker";
 import { useKitActions } from "@/hooks/use-kit-actions";
 import { userHasPermission } from "@/lib/permissions";
-
-// Lazy-loaded: ~50KB library only needed when viewing the kit's QR code.
-let QRCode: typeof import("react-native-qrcode-svg").default | null = null;
-try {
-  // why: dynamic require keeps react-native-qrcode-svg out of the initial JS
-  // bundle for screens that don't render a QR code.
-  QRCode =
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    require("react-native-qrcode-svg").default ??
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    require("react-native-qrcode-svg");
-} catch {
-  QRCode = null;
-}
 
 /**
  * Kit detail screen, resolved from the `id` route param scoped to the current
@@ -70,8 +58,12 @@ try {
 export default function KitDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { currentOrg } = useOrg();
+  // Asset rows open in whichever stack mounts this screen (the Assets tab, or
+  // the Audits stack when reached from an audit). See lib/asset-routes.ts.
+  const assetNavigation = useAssetScreenNavigation();
   const { colors, statusBadge } = useTheme();
   const styles = useStyles();
+  const { formatDate } = useDateFormatter();
 
   // Role-aware UI — the server re-enforces these on every API call.
   const roles = currentOrg?.roles;
@@ -302,36 +294,15 @@ export default function KitDetailScreen() {
             />
           </View>
 
-          {/* ── QR Code ────────────────────────────────── */}
-          {kit.qrCodes.length > 0 ? (
-            <View style={styles.sectionContainer}>
-              <Text style={styles.sectionTitle}>QR Code</Text>
-              <View style={styles.qrCard}>
-                {QRCode ? (
-                  <QRCode
-                    value={`${
-                      process.env.EXPO_PUBLIC_QR_BASE_URL ||
-                      "https://app.shelf.nu"
-                    }/qr/${kit.qrCodes[0].id}`}
-                    size={160}
-                    backgroundColor={colors.white}
-                    color={colors.foreground}
-                  />
-                ) : (
-                  <View style={styles.qrPlaceholder}>
-                    <Ionicons
-                      name="qr-code-outline"
-                      size={64}
-                      color={colors.muted}
-                    />
-                  </View>
-                )}
-                <Text style={styles.qrIdText} selectable numberOfLines={1}>
-                  {kit.qrCodes[0].id}
-                </Text>
-              </View>
-            </View>
-          ) : null}
+          {/* ── Codes ──────────────────────────────────── */}
+          {/* Same block the asset screen uses: leads with the workspace's
+              preferred code, resolved server-side. A workspace preferring SAM
+              IDs resolves to the QR here, because kits carry no SAM ID. */}
+          <CodeSection
+            displayCode={kit.displayCode}
+            barcodes={kit.barcodes}
+            qrCodes={kit.qrCodes}
+          />
 
           {/* ── Assets ─────────────────────────────────── */}
           <View style={styles.sectionContainer}>
@@ -347,16 +318,18 @@ export default function KitDetailScreen() {
                     bg: colors.backgroundTertiary,
                     text: colors.muted,
                   };
+                  // Only show the "×N" kit-quantity line when we have a
+                  // formatted value — never a bare "×". Mirrors the assets
+                  // list/detail screens, which render nothing when
+                  // formatQuantity returns null (missing/non-finite qty).
+                  const kitQuantityLabel = isQuantityTracked(asset)
+                    ? formatQuantity(asset.kitQuantity, asset.unitOfMeasure)
+                    : null;
                   return (
                     <TouchableOpacity
                       key={asset.id}
                       style={styles.assetRow}
-                      onPress={() =>
-                        pushIntoTab(
-                          "/(tabs)/assets",
-                          `/(tabs)/assets/${asset.id}`
-                        )
-                      }
+                      onPress={() => assetNavigation.openAsset(asset.id)}
                       activeOpacity={0.7}
                       accessibilityLabel={`View asset ${asset.title}`}
                       accessibilityRole="button"
@@ -387,6 +360,11 @@ export default function KitDetailScreen() {
                         <Text style={styles.assetTitle} numberOfLines={1}>
                           {asset.title}
                         </Text>
+                        {kitQuantityLabel ? (
+                          <Text style={styles.assetMeta} numberOfLines={1}>
+                            {`×${kitQuantityLabel}`}
+                          </Text>
+                        ) : null}
                         <Text style={styles.assetMeta} numberOfLines={1}>
                           {asset.category?.name || "Uncategorized"}
                         </Text>
@@ -530,28 +508,6 @@ const useStyles = createStyles((colors, shadows) => ({
     textTransform: "uppercase",
     letterSpacing: 0.5,
     marginBottom: spacing.sm,
-  },
-  qrCard: {
-    backgroundColor: colors.white,
-    borderRadius: borderRadius.xl,
-    borderWidth: 1,
-    borderColor: colors.border,
-    alignItems: "center",
-    paddingVertical: spacing.xl,
-    paddingHorizontal: spacing.lg,
-    gap: spacing.md,
-    ...shadows.sm,
-  },
-  qrPlaceholder: {
-    width: 160,
-    height: 160,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  qrIdText: {
-    fontSize: fontSize.xs,
-    color: colors.mutedLight,
-    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
   assetList: { gap: spacing.sm },
   assetRow: {

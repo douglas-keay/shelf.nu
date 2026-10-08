@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import { useActionData, useLoaderData } from "react-router";
 import z from "zod";
@@ -16,6 +16,7 @@ import type {
 import type { AssetWithStatus } from "~/utils/booking-assets";
 import {
   flattenSelectedBookingItems,
+  getRemainingCheckedOutAssetIds,
   isAssetCheckableIn,
 } from "~/utils/booking-assets";
 import { tw } from "~/utils/tw";
@@ -45,12 +46,46 @@ export default function BulkPartialCheckinDialog({
 
   const rawSelectedItems = useAtomValue(selectedBulkItemsAtom);
 
+  // Denormalised view of `booking.bookingAssets` (the QT pivot). We flatten
+  // the pivot to a plain asset list shape so the SHARED resolver
+  // (`flattenSelectedBookingItems`) — authored against the old `booking.assets`
+  // array — can enrich entries by id without needing to know about the pivot.
+  // Preserves `bookingAssetId` (used as React key for per-slice hidden inputs),
+  // `bookedQuantity`, and resolves the row's kit attribution via
+  // `BookingAsset.assetKitId` so a qty-tracked asset booked as both standalone
+  // and kit-member surfaces under the right group.
+  const assetsList = useMemo(
+    () =>
+      booking.bookingAssets.map((ba) => {
+        // Resolve the per-row kit attribution by matching this BookingAsset's
+        // `assetKitId` (the per-row pivot discriminator) against the asset's
+        // set of `AssetKit` memberships. A qty-tracked asset can be a member
+        // of multiple kits and appear in this booking as both a standalone
+        // slice (`assetKitId IS NULL`) and a kit-driven slice — only the
+        // membership whose `id` matches contributes its kit identity to this
+        // row. Mirrors the loader's `bookingAssets` flattening at
+        // `bookings.$bookingId.overview.tsx` (~L273) so the shared resolver
+        // sees the same shape from both sides.
+        const sourceKit = ba.assetKitId
+          ? ba.asset.assetKits.find((ak) => ak.id === ba.assetKitId) ?? null
+          : null;
+        return {
+          ...ba.asset,
+          bookingAssetId: ba.id,
+          bookedQuantity: ba.quantity,
+          kitId: sourceKit?.kitId ?? null,
+          kit: sourceKit?.kit ?? null,
+        };
+      }),
+    [booking.bookingAssets]
+  );
+
   // Flatten/enrich the selection via the SHARED resolver (single source of
   // truth with the dropdown and checkout dialog), then keep kits + the assets
   // that are actually checkable-in.
   const flattenedItems = flattenSelectedBookingItems(
     rawSelectedItems,
-    booking.assets
+    assetsList
   );
   const selectedItems = flattenedItems.filter((item) => {
     if (item.type === "kit" || (item.name && item._count)) return true;
@@ -82,9 +117,15 @@ export default function BulkPartialCheckinDialog({
   const checkedInAssetIds = new Set(
     partialCheckinProgress?.checkedInAssetIds || []
   );
-  const remainingCheckedOutAssets = booking.assets.filter(
-    (asset) =>
-      asset.status === "CHECKED_OUT" && !checkedInAssetIds.has(asset.id)
+  // Source remaining-CHECKED_OUT assets from the denormalised `assetsList`
+  // (pivot-aware) — `booking.assets` was the pre-pivot shape and no longer
+  // exists. Check-in eligibility is fully encoded in `partialCheckinDetails`
+  // (see `isAssetCheckableIn`), so the shared helper's plain status probe is
+  // all the "final checkin" case needs. It returns distinct ids because the
+  // selection compared against it is deduped too.
+  const remainingCheckedOutAssetIds = getRemainingCheckedOutAssetIds(
+    assetsList,
+    checkedInAssetIds
   );
   // Deduped asset ids being checked in (kits excluded). The selection can
   // contain the same asset twice (e.g. selected standalone and as a kit
@@ -93,8 +134,8 @@ export default function BulkPartialCheckinDialog({
   const selectedAssetIds = Array.from(eligibleAssetIds);
 
   const isFinalCheckin =
-    selectedAssetIds.length === remainingCheckedOutAssets.length &&
-    remainingCheckedOutAssets.length > 0;
+    selectedAssetIds.length === remainingCheckedOutAssetIds.size &&
+    remainingCheckedOutAssetIds.size > 0;
 
   // Check if it's an early check-in (only relevant for final check-ins)
   const isEarlyCheckin = Boolean(
@@ -147,7 +188,7 @@ export default function BulkPartialCheckinDialog({
       <Dialog
         open={open}
         onClose={handleCloseDialog}
-        className={tw("bulk-tagging-dialog lg:w-[400px]")}
+        className="lg:w-[400px]"
         title={
           <div className="w-full">
             <div className={tw("mb-2")}>
@@ -184,7 +225,8 @@ export default function BulkPartialCheckinDialog({
           {skippedCount > 0 && (
             <p className="mb-3 rounded border border-warning-200 bg-warning-50 p-2 text-xs text-warning-800">
               {skippedCount} selected item{skippedCount === 1 ? "" : "s"}{" "}
-              {skippedCount === 1 ? "is" : "are"} not eligible for check-in and will be skipped.
+              {skippedCount === 1 ? "is" : "are"} not eligible for check-in and
+              will be skipped.
             </p>
           )}
 
@@ -251,6 +293,7 @@ export default function BulkPartialCheckinDialog({
                                 thumbnailImage: asset.thumbnailImage,
                                 mainImage: asset.mainImage,
                                 mainImageExpiration: asset.mainImageExpiration,
+                                assetModel: asset.assetModel ?? null,
                               }}
                               alt={`${asset.title} main image`}
                             />
@@ -282,6 +325,7 @@ export default function BulkPartialCheckinDialog({
                               thumbnailImage: asset.thumbnailImage,
                               mainImage: asset.mainImage,
                               mainImageExpiration: asset.mainImageExpiration,
+                              assetModel: asset.assetModel ?? null,
                             }}
                             alt={`${asset.title} main image`}
                           />
@@ -316,7 +360,13 @@ export default function BulkPartialCheckinDialog({
               Cancel
             </Button>
 
-            {/* Submit button - conditional based on early check-in */}
+            {/* Submit button: a confirming CheckinDialog for an early final
+                check-in, a plain submit otherwise. Both post this same form
+                with intent="partial-checkin", so the overview routes every
+                path through checkinAssets, which records the batch as
+                selected and applies the date choice. The whole-booking
+                checkIn intent is the header's one-click path, which the
+                explicit rule refuses. */}
             {isEarlyCheckin ? (
               <CheckinDialog
                 booking={{
@@ -330,6 +380,7 @@ export default function BulkPartialCheckinDialog({
                 disabled={disabled}
                 portalContainer={formElement || undefined}
                 formId="bulk-partial-checkin-form"
+                intent="partial-checkin"
                 onClose={handleCloseDialog}
                 specificAssetIds={selectedAssetIds}
                 fullWidth

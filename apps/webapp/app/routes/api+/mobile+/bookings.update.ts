@@ -1,0 +1,260 @@
+import { BookingStatus } from "@prisma/client";
+import { data, type ActionFunctionArgs } from "react-router";
+import { z } from "zod";
+import { BookingFormSchema } from "~/components/booking/forms/forms-schema";
+import { db } from "~/database/db.server";
+import {
+  requireMobileAuth,
+  requireMobilePermission,
+  requireOrganizationAccess,
+  getMobileUserContext,
+  assertMobileCanUseBookings,
+} from "~/modules/api/mobile-auth.server";
+import { parseMobileBody } from "~/modules/api/mobile-body.server";
+import { updateBasicBooking } from "~/modules/booking/service.server";
+import { getBookingSettingsForOrganization } from "~/modules/booking-settings/service.server";
+import { getTeamMember } from "~/modules/team-member/service.server";
+import { getWorkingHoursForOrganization } from "~/modules/working-hours/service.server";
+import { bookingCustodianIsSelf } from "~/utils/bookings";
+import { getClientHint, type ClientHint } from "~/utils/client-hints";
+import { isValidTimeZone } from "~/utils/date-format";
+import { prefsForDeclaredZone } from "~/utils/date-format.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { enforceUserRateLimit } from "~/utils/rate-limit.server";
+
+/**
+ * POST /api/mobile/bookings/update
+ *
+ * Edits a booking's basic info from the Companion app — the mobile twin of the
+ * web "save booking" flow. Wraps the shared `updateBasicBooking` service, which
+ * enforces the status-aware field mask: name/description/tags are editable in
+ * DRAFT/RESERVED/ONGOING/OVERDUE; from/to + custodian are only applied while the
+ * booking is DRAFT; the whole update is rejected for COMPLETE/ARCHIVED/CANCELLED.
+ *
+ * Parity with web:
+ * - Validation runs through the shared {@link BookingFormSchema} with
+ *   `action: "save"` + the booking's current status (so active bookings only
+ *   validate name/custodian/tags, DRAFTs validate dates too).
+ * - A caller who does not write every booking may only edit bookings they are
+ *   the custodian of; one whose booking custodian is fixed to themselves may
+ *   only assign themselves as custodian.
+ * - Bookings are a TEAM-plan feature (`assertMobileCanUseBookings`).
+ *
+ * Reschedules of a *non-DRAFT* booking are intentionally out of scope here —
+ * those go through a dedicated reserve/extend path that re-checks conflicts.
+ *
+ * Body (JSON): {
+ *   bookingId, name, startDate, endDate, timeZone, custodianTeamMemberId,
+ *   description?, tags?: string[]
+ * }
+ * Query: ?orgId=...
+ *
+ * @see {@link file://./bookings.create.ts} the create counterpart
+ */
+
+const BodySchema = z.object({
+  bookingId: z.string().min(1),
+  name: z.string().min(2, "Name is required"),
+  description: z.string().optional(),
+  custodianTeamMemberId: z.string().min(1, "Please select a custodian"),
+  startDate: z.string().min(1, "Start date is required"),
+  endDate: z.string().min(1, "End date is required"),
+  // Must be a real IANA zone — see `bookings.create.ts`.
+  timeZone: z
+    .string()
+    .min(1, "Time zone is required")
+    .refine(isValidTimeZone, "Time zone must be a valid IANA zone"),
+  tags: z.array(z.string()).optional().default([]),
+});
+
+export async function action({ request }: ActionFunctionArgs) {
+  let userId: string | undefined;
+
+  try {
+    const { user } = await requireMobileAuth(request);
+    userId = user.id;
+    await enforceUserRateLimit(user.id, "bulk");
+
+    const organizationId = await requireOrganizationAccess(request, user.id);
+
+    await requireMobilePermission({
+      userId: user.id,
+      organizationId,
+      entity: PermissionEntity.booking,
+      action: PermissionAction.update,
+    });
+
+    await assertMobileCanUseBookings(organizationId);
+
+    const body = await parseMobileBody(BodySchema, request);
+
+    // The caller's access, judged by the membership's effective role.
+    const { access } = await getMobileUserContext(user.id, organizationId);
+
+    // Org-scoped lookup — gives us the current status (drives validation +
+    // which fields actually apply) and the custodian for the ownership check.
+    const existing = await db.booking.findFirst({
+      where: { id: body.bookingId, organizationId },
+      select: { id: true, status: true, custodianUserId: true },
+    });
+
+    if (!existing) {
+      return data(
+        { error: { message: "Booking not found in this workspace." } },
+        { status: 404 }
+      );
+    }
+
+    // A caller who does not write every booking may only edit bookings they
+    // are the custodian of.
+    if (!access.bookings.writeAll && existing.custodianUserId !== user.id) {
+      throw new ShelfError({
+        cause: null,
+        message: "You can only edit your own bookings.",
+        label: "Booking",
+        status: 403,
+        shouldBeCaptured: false,
+      });
+    }
+
+    // Validate + org-scope the custodian team member (cross-org IDOR guard).
+    const custodian = await getTeamMember({
+      id: body.custodianTeamMemberId,
+      organizationId,
+      select: { id: true, name: true, userId: true },
+    }).catch((cause) => {
+      throw new ShelfError({
+        cause,
+        title: "Team member not found",
+        message: "The selected custodian could not be found.",
+        additionalData: {
+          userId,
+          custodianTeamMemberId: body.custodianTeamMemberId,
+        },
+        label: "Booking",
+        status: 404,
+      });
+    });
+
+    // A member whose booking custodian is fixed to themself may only assign
+    // a booking to themself.
+    if (bookingCustodianIsSelf(access) && custodian.userId !== user.id) {
+      throw new ShelfError({
+        cause: null,
+        message: "Self user can assign booking to themselves only.",
+        label: "Booking",
+        status: 403,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const hints: ClientHint = {
+      ...getClientHint(request),
+      timeZone: body.timeZone,
+    };
+
+    // Decode the wall-clock in the zone the client DECLARED it in, not the
+    // user's preference zone. See `bookings.create.ts` — and note the edit
+    // screen re-submits the value it rendered device-local, so a preference-zone
+    // decode here would shift the booking again on every save.
+    const prefs = prefsForDeclaredZone(body.timeZone);
+
+    // Business-rule validation via the shared web schema. The "save" action +
+    // current status picks the right rule set (active bookings skip the date
+    // rules; DRAFTs validate future/buffer/working-hours/max-length).
+    const workingHours = await getWorkingHoursForOrganization(organizationId);
+    const bookingSettings =
+      await getBookingSettingsForOrganization(organizationId);
+
+    let parsedBooking;
+    try {
+      parsedBooking = BookingFormSchema({
+        prefs,
+        action: "save",
+        status: existing.status,
+        workingHours,
+        bookingSettings,
+        bypassTimeLimits: access.policy.bookings.bypassTimeLimits,
+      }).parse({
+        id: body.bookingId,
+        name: body.name,
+        description: body.description,
+        custodian: JSON.stringify({
+          id: custodian.id,
+          name: custodian.name,
+          userId: custodian.userId,
+        }),
+        startDate: body.startDate,
+        endDate: body.endDate,
+        tags: body.tags.join(","),
+      });
+    } catch (cause) {
+      if (cause instanceof z.ZodError) {
+        throw new ShelfError({
+          cause,
+          message: cause.errors[0]?.message ?? "Invalid booking details.",
+          label: "Booking",
+          status: 400,
+          shouldBeCaptured: false,
+        });
+      }
+      throw cause;
+    }
+
+    // Dates + custodian only apply to DRAFT bookings (updateBasicBooking
+    // re-gates this internally), so only carry them through for a draft.
+    //
+    // Use the instants the schema already produced rather than re-parsing the
+    // raw body: `coerceLocalDate` accepts second precision via `fromISO`, while
+    // DATE_TIME_FORMAT is minute-only, so re-parsing could reject a payload the
+    // schema had just accepted. Reusing the result also guarantees the stored
+    // instant is the one that was validated, in the same declared zone.
+    const isDraft = existing.status === BookingStatus.DRAFT;
+    const from = isDraft ? parsedBooking.startDate : undefined;
+    const to = isDraft ? parsedBooking.endDate : undefined;
+
+    // A DRAFT validates through the full schema, so both dates are present;
+    // assert it rather than handing `undefined` to the service as "unchanged".
+    if (isDraft && (!from || !to)) {
+      throw new ShelfError({
+        cause: null,
+        message: "Invalid booking start or end date.",
+        label: "Booking",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const booking = await updateBasicBooking({
+      id: body.bookingId,
+      organizationId,
+      name: body.name,
+      description: body.description ?? null,
+      from,
+      to,
+      custodianTeamMemberId: custodian.id,
+      custodianUserId: custodian.userId ?? null,
+      tags: body.tags.map((id) => ({ id })),
+      userId: user.id,
+      hints,
+    });
+
+    return data({
+      booking: {
+        id: booking.id,
+        name: booking.name,
+        status: booking.status,
+      },
+    });
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(
+      { error: { message: reason.message } },
+      { status: reason.status }
+    );
+  }
+}

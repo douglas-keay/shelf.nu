@@ -1,0 +1,161 @@
+/**
+ * Adjust Quantity API Route
+ *
+ * POST-only endpoint for quick quantity adjustments on QUANTITY_TRACKED assets.
+ * Supports three operations:
+ *   - RESTOCK (add) — increase total stock
+ *   - LOSS (subtract) — decrease total stock due to loss/damage
+ *   - ADJUSTMENT (add or subtract) — correct total stock
+ *
+ * After a successful adjustment, checks whether available quantity has dropped
+ * to or below the asset's low-stock threshold and fires an in-app notification.
+ *
+ * @see {@link file://../../modules/consumption-log/service.server.ts} - adjustQuantity
+ * @see {@link file://../../modules/consumption-log/low-stock.server.ts} - checkAndNotifyLowStock
+ * @see {@link file://./assets.bulk-assign-custody.ts} - Similar API route pattern
+ */
+
+import type { Prisma } from "@prisma/client";
+import { data, type ActionFunctionArgs } from "react-router";
+import { z } from "zod";
+import { adjustLocationNoteSuffix } from "~/modules/asset/custody-source.server";
+import { checkAndNotifyLowStock } from "~/modules/consumption-log/low-stock.server";
+import { adjustQuantity } from "~/modules/consumption-log/service.server";
+import { createNote } from "~/modules/note/service.server";
+import { getUserByID } from "~/modules/user/service.server";
+import { sendNotification } from "~/utils/emitter/send-notification.server";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { assertIsPost, payload, error, parseData } from "~/utils/http.server";
+import { Logger } from "~/utils/logger";
+import {
+  appendUserTextToNote,
+  wrapUserLinkForNote,
+} from "~/utils/markdoc-wrappers";
+import {
+  PermissionAction,
+  PermissionEntity,
+} from "~/utils/permissions/permission.data";
+import { requirePermission } from "~/utils/roles.server";
+
+/**
+ * Zod schema for the adjust-quantity request body.
+ *
+ * The `.refine` enforces the documented category/direction pairing so that the
+ * `ConsumptionLog` row category can never contradict the sign of the quantity
+ * change. RESTOCK must always add, LOSS must always subtract, ADJUSTMENT can
+ * go either way.
+ */
+export const AdjustQuantitySchema = z
+  .object({
+    assetId: z.string(),
+    quantity: z.coerce.number().int().positive("Quantity must be at least 1"),
+    category: z.enum(["RESTOCK", "ADJUSTMENT", "LOSS"]),
+    direction: z.enum(["add", "subtract"]),
+    note: z
+      .string()
+      .optional()
+      .transform((val) => (val === "" ? undefined : val)),
+    /**
+     * Where the units arrived or were lost: a location id, or `"unplaced"`
+     * for the unplaced units. Only sent by the dialog for a pool with two or more
+     * sources; absent keeps the adjustment total-only.
+     */
+    locationId: z.string().optional(),
+  })
+  .refine(
+    ({ category, direction }) =>
+      category === "ADJUSTMENT" ||
+      (category === "RESTOCK" && direction === "add") ||
+      (category === "LOSS" && direction === "subtract"),
+    {
+      message:
+        "Invalid category/direction combination — RESTOCK must add, LOSS must subtract.",
+      path: ["direction"],
+    }
+  );
+
+export async function action({ context, request }: ActionFunctionArgs) {
+  const authSession = context.getSession();
+  const userId = authSession.userId;
+
+  try {
+    assertIsPost(request);
+
+    const { organizationId } = await requirePermission({
+      request,
+      userId,
+      entity: PermissionEntity.asset,
+      action: PermissionAction.update,
+    });
+
+    const formData = await request.formData();
+
+    const { assetId, quantity, category, direction, note, locationId } =
+      parseData(formData, AdjustQuantitySchema);
+
+    const { location } = await adjustQuantity({
+      assetId,
+      quantity,
+      category,
+      direction,
+      userId,
+      organizationId,
+      note,
+      locationId,
+    });
+
+    /** Best-effort audit note — don't fail the action if note creation fails */
+    try {
+      const user = await getUserByID(userId, {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          displayName: true,
+        } satisfies Prisma.UserSelect,
+      });
+
+      const actor = wrapUserLinkForNote(user);
+      const sign = direction === "add" ? "+" : "-";
+      const categoryLabel = category.toLowerCase();
+      const atLocation = adjustLocationNoteSuffix(
+        location,
+        locationId !== undefined
+      );
+      const baseLine = `${actor} adjusted quantity by **${sign}${quantity}** (${categoryLabel})${atLocation}.`;
+      const noteContent = appendUserTextToNote(baseLine, note);
+
+      await createNote({
+        content: noteContent,
+        type: "UPDATE",
+        userId,
+        assetId,
+        organizationId,
+      });
+    } catch (noteError) {
+      Logger.error(
+        new ShelfError({
+          cause: noteError,
+          message: "Failed to create audit note for quantity operation",
+          label: "Assets",
+          additionalData: { assetId, userId },
+        })
+      );
+    }
+
+    sendNotification({
+      title: `Quantity adjusted: ${direction === "add" ? "+" : "-"}${quantity}`,
+      message: "The asset quantity has been updated successfully.",
+      icon: { name: "success", variant: "success" },
+      senderId: userId,
+    });
+
+    /** Check low-stock threshold and notify if breached */
+    await checkAndNotifyLowStock({ assetId, userId, organizationId });
+
+    return data(payload({ success: true }));
+  } catch (cause) {
+    const reason = makeShelfError(cause, { userId });
+    return data(error(reason), { status: reason.status });
+  }
+}

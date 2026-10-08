@@ -100,11 +100,28 @@ export const assetLabelPresets = {
     priority: 90,
   }),
 
-  partOfKit: (isPartOfKit: boolean = false): AvailabilityLabelConfig => ({
+  /**
+   * "Part of kit" badge. Copy differs by asset type:
+   *
+   *   - INDIVIDUAL — whole asset is committed to the kit, so it comes
+   *     along when the kit is scanned; acting on it alone means taking
+   *     it out of the kit first.
+   *   - QUANTITY_TRACKED — only a slice (`AssetKit.quantity`) is in
+   *     the kit; the rest of the pool is free and the action is
+   *     still allowed. The booking + custody drawer blocker is scoped
+   *     to INDIVIDUAL only, so this label needs matching copy so the
+   *     tooltip doesn't contradict the allowed qty-tracked action.
+   */
+  partOfKit: (
+    isPartOfKit: boolean = false,
+    isQuantityTracked: boolean = false
+  ): AvailabilityLabelConfig => ({
     condition: isPartOfKit,
     badgeText: "Part of kit",
     tooltipTitle: "Asset is part of a kit",
-    tooltipContent: "Remove the asset from the kit to add it individually.",
+    tooltipContent: isQuantityTracked
+      ? "Part of this asset's quantity is allocated to a kit. The remaining free pool is still available to add individually."
+      : "Scan the kit's QR to take the whole kit, or remove the asset from the kit to use it on its own.",
     priority: 80,
   }),
 

@@ -1,10 +1,45 @@
+/**
+ * Mobile API route: asset list.
+ *
+ * Serves the companion's Assets tab and its My Custody view: a paginated,
+ * searchable, status-filterable asset list in the flat legacy shape the app
+ * reads. Org-scoped behind the mobile bearer auth, with custody holders
+ * filtered per viewer the same way the asset detail route filters them. Lapsed
+ * asset photo URLs are re-signed before the page is sent. See the loader
+ * docblock for the request contract.
+ *
+ * @see {@link file://./assets.$assetId.ts} the detail twin of this route
+ * @see {@link file://./../../../modules/asset/service.server.ts} refreshExpiredAssetImages
+ */
+import { AssetStatus, type Prisma } from "@prisma/client";
 import { data, type LoaderFunctionArgs } from "react-router";
 import { db } from "~/database/db.server";
+import { resolveMobileAssetSearchWhere } from "~/modules/api/mobile-asset-search.server";
 import {
+  getMobileUserContext,
   requireMobileAuth,
   requireOrganizationAccess,
+  shapeMobileAssetResponse,
 } from "~/modules/api/mobile-auth.server";
-import { makeShelfError } from "~/utils/error";
+import {
+  filterMobileCustodyListForViewer,
+  viewerCanSeeLegacyCustody,
+} from "~/modules/api/mobile-custody-visibility.server";
+import { serializeImageExpiration } from "~/modules/asset/image-resolution";
+import { ASSET_MODEL_IMAGE_SELECT } from "~/modules/asset/image-select";
+import { buildAssetStatusWhere } from "~/modules/asset/search.server";
+import {
+  ASSET_IMAGE_RESIGN_LIMITS,
+  refreshExpiredAssetImages,
+} from "~/modules/asset/service.server";
+import {
+  BARCODE_CODES_ORDER_BY,
+  QR_CODES_ORDER_BY,
+  resolveDisplayCode,
+  serializeDisplayCode,
+} from "~/modules/barcode/display";
+import { makeShelfError, ShelfError } from "~/utils/error";
+import { canUseBarcodes } from "~/utils/subscription.server";
 
 /**
  * GET /api/mobile/assets?orgId=xxx&search=xxx&page=1&perPage=20&myCustody=true&status=IN_CUSTODY
@@ -14,15 +49,21 @@ import { makeShelfError } from "~/utils/error";
  *   - myCustody=true  → only assets in the current user's custody
  *   - status=X         → filter by asset status (e.g. AVAILABLE, IN_CUSTODY, CHECKED_OUT)
  *
- * Image URLs are returned as-stored along with `mainImageExpiration`. Mobile
- * clients should call `/api/mobile/asset/refresh-image/:assetId` lazily when
- * they detect an expired URL — keeps this loader read-only and avoids fanning
- * out N writes per paginated read.
+ * Search matches the same fields as the web asset search — resolved via the
+ * shared org-scoped UNION (modules/asset/search-union.server.ts through
+ * modules/api/mobile-asset-search.server.ts), the same index-driven path the
+ * web indexes use, in a single query.
+ *
+ * Image URLs are returned with the model-image cascade already resolved
+ * (`shapeMobileAssetResponse`), after lapsed ones are re-signed.
+ * `mainImageExpiration` is only sent when the asset's OWN signed URL won the
+ * cascade — model cover images are public and never expire.
  */
 export async function loader({ request }: LoaderFunctionArgs) {
   try {
     const { user } = await requireMobileAuth(request);
     const organizationId = await requireOrganizationAccess(request, user.id);
+    const { access } = await getMobileUserContext(user.id, organizationId);
 
     const url = new URL(request.url);
 
@@ -45,69 +86,274 @@ export async function loader({ request }: LoaderFunctionArgs) {
     const myCustody = url.searchParams.get("myCustody") === "true";
     const statusFilter = url.searchParams.get("status");
 
-    const where: Record<string, unknown> = {
+    // An unknown status must fail loudly: silently dropping the filter
+    // would return the entire unfiltered list under what the client
+    // believes is a filtered request, and letting it through to Prisma
+    // used to crash with a 500. 400 matches the validation contract of
+    // the mobile mutation routes.
+    if (
+      statusFilter &&
+      !(Object.values(AssetStatus) as string[]).includes(statusFilter)
+    ) {
+      throw new ShelfError({
+        cause: null,
+        message: `Invalid status filter: ${statusFilter}`,
+        additionalData: { statusFilter },
+        label: "Assets",
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+    const statusWhere = statusFilter
+      ? buildAssetStatusWhere(statusFilter as AssetStatus)
+      : null;
+
+    const baseWhere: Prisma.AssetWhereInput = {
       organizationId,
-      // Match on title OR sequentialId (SAM id, e.g. "SAM-0001"). When the
-      // workspace display preference is SAM, every asset row shows its SAM id,
-      // so a user typing that number must be able to find it here. Mirrors the
-      // web search's sequentialId branch (modules/asset/service.server.ts) but
-      // intentionally NOT the heavy branches (custodian-name traversal,
-      // custom-fields JSON) — those are slow and low-value on mobile.
-      // `sequentialId` is indexed; a normal word term can't false-positive it.
-      ...(search
-        ? {
-            OR: [
-              { title: { contains: search, mode: "insensitive" as const } },
-              {
-                sequentialId: {
-                  contains: search,
-                  mode: "insensitive" as const,
-                },
-              },
-            ],
-          }
-        : {}),
+      // The same list scope as the web asset index: roles limited to bookable
+      // assets browse only those. Their own custody tab still lists every
+      // asset they hold, bookable or not.
+      ...(access.policy.assets.listScope === "bookable" &&
+        !myCustody && { availableToBook: true }),
       ...(myCustody
         ? {
+            // Phase 2/4 widened `Asset.custody` from 1:1 to 1:many for
+            // QUANTITY_TRACKED multi-custodian support, so we must filter
+            // via `some`. Without `some:`, Prisma rejects the where clause
+            // at runtime and the Custody tab returns 500. Mirrors the
+            // dashboard endpoint's myCustody count filter.
             custody: {
-              custodian: {
-                userId: user.id,
+              some: {
+                custodian: {
+                  userId: user.id,
+                },
               },
             },
           }
         : {}),
-      ...(statusFilter ? { status: statusFilter } : {}),
+      // Status delegates to the QT-aware fragment shared with getAssets
+      // and getAssetsWhereInput (see buildAssetStatusWhere). The AVAILABLE
+      // form is an OR group, so it rides in `AND` to compose with the
+      // search fragment's `OR`; the equality form spreads at the top level.
+      ...(statusWhere
+        ? statusWhere.OR
+          ? { AND: [statusWhere] }
+          : statusWhere
+        : {}),
     };
 
-    const [assets, totalCount] = await Promise.all([
-      db.asset.findMany({
-        where,
-        select: {
-          id: true,
-          title: true,
-          status: true,
-          mainImage: true,
-          mainImageExpiration: true,
-          thumbnailImage: true,
-          category: { select: { id: true, name: true } },
-          location: { select: { id: true, name: true } },
-          custody: {
-            select: {
-              custodian: {
-                select: { id: true, name: true },
+    const searchWhere = await resolveMobileAssetSearchWhere({
+      organizationId,
+      search,
+    });
+
+    /** Fetches one page + total count for the given where clause. */
+    const fetchPage = (where: Prisma.AssetWhereInput) =>
+      Promise.all([
+        db.asset.findMany({
+          where,
+          // Mirrors `MOBILE_ASSET_SELECT` (the canonical shape consumed by
+          // `shapeMobileAssetResponse`) PLUS list-only extras the companion
+          // already consumes: `mainImageExpiration` (drives the lazy
+          // refresh-image flow), `thumbnailImage`, and `category.id`. Keeping
+          // these here — rather than narrowing to `MOBILE_ASSET_SELECT` —
+          // preserves the legacy list-response contract for the in-App-Store
+          // companion (since 2026-05-20).
+          select: {
+            id: true,
+            title: true,
+            status: true,
+            mainImage: true,
+            // The scanner invites you to "Enter QR, barcode, or SAM ID", and
+            // this list is where that search lands — so each row has to be able
+            // to show WHICH SAM ID matched. Without it the user gets hits
+            // identified by title only and has to open each one to find out.
+            sequentialId: true,
+            // Code-resolution inputs — resolved into `displayCode` below so a
+            // workspace that labels its assets with Code 128 can match a
+            // physical label against this list.
+            preferredBarcodeId: true,
+            qrCodes: {
+              take: 1,
+              orderBy: QR_CODES_ORDER_BY,
+              select: { id: true },
+            },
+            barcodes: {
+              orderBy: BARCODE_CODES_ORDER_BY,
+              select: { id: true, type: true, value: true },
+            },
+            // Model cover image; `shapeMobileAssetResponse` resolves the cascade
+            // into the flat image fields the companion already reads.
+            ...ASSET_MODEL_IMAGE_SELECT,
+            mainImageExpiration: true,
+            thumbnailImage: true,
+            // why: powers the scan-to-booking "not available to book" blocker.
+            availableToBook: true,
+            // Quantity fields (additive) — mirror `MOBILE_ASSET_SELECT` so the
+            // helper's now-required quantity scalars are satisfied and the
+            // companion list can DISPLAY quantity. Null for INDIVIDUAL assets.
+            type: true,
+            quantity: true,
+            minQuantity: true,
+            unitOfMeasure: true,
+            consumptionType: true,
+            // Canonical MOBILE_ASSET_SELECT parity — this list select had
+            // drifted (the detail endpoint already returns it).
+            assetModelId: true,
+            // Keep `id` (list extra); helper only types `{ name }` but
+            // structurally accepts the wider shape.
+            category: { select: { id: true, name: true } },
+            // Kit linkage via the AssetKit pivot — flattened to top-level
+            // `kit` + `kitId` by `shapeMobileAssetResponse`, which takes the
+            // FIRST row. The order is therefore load-bearing, not decoration:
+            // only INDIVIDUAL assets are capped at one membership (the
+            // `enforce_individual_asset_single_kit` trigger), so a
+            // QUANTITY_TRACKED asset in several kits would name a different
+            // one on each refresh without it. Oldest membership first is the
+            // kit the web asset index calls primary (`assetQueryJoins` orders
+            // its LATERAL pick on the same two columns) — keep them equal, or
+            // the two surfaces name different kits for the same asset. `id`
+            // breaks ties between memberships written in one transaction.
+            assetKits: {
+              orderBy: [{ createdAt: "asc" as const }, { id: "asc" as const }],
+              select: { kit: { select: { id: true, name: true } } },
+            },
+            // Location via the AssetLocation pivot — flattened to top-level
+            // `location` by the helper.
+            assetLocations: {
+              select: { location: { select: { id: true, name: true } } },
+            },
+            // Custody is now 1:many (Phase 2/4); helper flattens `custody[0]`
+            // so the companion's single-or-null `asset.custody?.custodian`
+            // read keeps working. `quantity` feeds the helper's many-aware
+            // `custodyList`.
+            custody: {
+              // Oldest-first so the flattened single custody + custodyList are
+              // deterministic (the relation is otherwise unordered).
+              orderBy: { createdAt: "asc" as const },
+              select: {
+                quantity: true,
+                // why: operator-vs-kit discriminator for `releasableQuantity`.
+                kitCustodyId: true,
+                custodian: {
+                  // why: `userId` lets the app recognize the caller's own row.
+                  select: { id: true, name: true, userId: true },
+                },
               },
             },
           },
+          // Stable `id` tiebreaker for deterministic skip/take paging when
+          // rows tie on createdAt (bulk-imported assets share timestamps
+          // down to the millisecond) — mirrors getAssets.
+          orderBy: [{ createdAt: "desc" as const }, { id: "asc" as const }],
+          skip,
+          take: perPage,
+        }),
+        db.asset.count({ where }),
+      ]);
+
+    // Single query: the UNION already searches all 11 sources in one shot,
+    // so there is no narrow/fallback two-query dance to run any more.
+    const [storedAssets, totalCount] = await fetchPage({
+      ...baseWhere,
+      ...searchWhere,
+    });
+
+    const assets = await refreshExpiredAssetImages(storedAssets, {
+      organizationId,
+      ...ASSET_IMAGE_RESIGN_LIMITS,
+    });
+
+    // One workspace read for the whole page — the preference is per-workspace,
+    // so resolving it per row would fetch the same answer `perPage` times.
+    const organization = await db.organization.findUniqueOrThrow({
+      where: { id: organizationId },
+      select: { qrIdDisplayPreference: true, barcodesEnabled: true },
+    });
+    // Effective entitlement, not the raw column — see `assets.$assetId.ts`.
+    const barcodesAllowed = canUseBarcodes(organization);
+
+    // Flatten kit/location/custody pivots into the legacy flat shape via the
+    // shared helper, then re-attach `mainImageExpiration`, which the list
+    // response carries but the helper's return type does not. The URL it
+    // describes has already been re-signed above if it had lapsed.
+    //
+    // `thumbnailImage` is deliberately NOT stripped and re-attached any more:
+    // the helper resolves the model-image cascade, so the raw column would
+    // overwrite an inherited thumbnail with null.
+    const shapedAssets = assets.map((asset) => {
+      const {
+        mainImageExpiration,
+        qrCodes,
+        barcodes,
+        preferredBarcodeId,
+        ...assetForHelper
+      } = asset;
+      const shaped = shapeMobileAssetResponse(assetForHelper);
+
+      // Which identifier to show for this row. Same resolver and precedence as
+      // every web asset row and the mobile detail screen.
+      const resolvedCode = resolveDisplayCode({
+        entity: {
+          sequentialId: asset.sequentialId,
+          preferredBarcodeId,
+          qrCodes,
+          barcodes,
         },
-        orderBy: { createdAt: "desc" },
-        skip,
-        take: perPage,
-      }),
-      db.asset.count({ where }),
-    ]);
+        organization: {
+          qrIdDisplayPreference: organization.qrIdDisplayPreference,
+          barcodesEnabled: barcodesAllowed,
+        },
+        entityKind: "asset",
+      });
+
+      /**
+       * Same custody gate the mobile asset DETAIL route applies
+       * (`assets.$assetId.ts`) — this list had none, so a restricted viewer
+       * read every holder's name straight out of the list response while the
+       * detail page for the same asset withheld it.
+       */
+      const { custodyList, custodyListOthersCount } =
+        filterMobileCustodyListForViewer({
+          custodyList: shaped.custodyList,
+          custodyRows: asset.custody,
+          viewerUserId: user.id,
+          canSeeAllCustody: access.custody.seeAll,
+        });
+
+      const primaryCustody = asset.custody[0] ?? null;
+      const visibleCustody =
+        primaryCustody &&
+        viewerCanSeeLegacyCustody({
+          custodianUserId: primaryCustody.custodian.userId,
+          viewerUserId: user.id,
+          canSeeAllCustody: access.custody.seeAll,
+        })
+          ? shaped.custody
+          : null;
+
+      return {
+        ...shaped,
+        custody: visibleCustody,
+        custodyList,
+        custodyListOthersCount,
+        // How many kits this asset belongs to. `shaped.kit` names only the
+        // first, so a row holding several memberships needs this to say the
+        // named kit is one of many rather than the only one — the mobile
+        // counterpart of the web asset index's primary + "+N" kit column.
+        kitCount: asset.assetKits.length,
+        mainImageExpiration: serializeImageExpiration(
+          shaped.imageSource,
+          mainImageExpiration
+        ),
+        // The label the operator reads off the physical tag, in the same
+        // shape the detail endpoints send.
+        displayCode: serializeDisplayCode(resolvedCode),
+      };
+    });
 
     return data({
-      assets,
+      assets: shapedAssets,
       page,
       perPage,
       totalCount,

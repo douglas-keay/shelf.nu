@@ -1,6 +1,7 @@
 import type { JSX } from "react";
 import { CalendarIcon, RowsIcon } from "@radix-ui/react-icons";
 import {
+  Boxes,
   CalendarCheck,
   ClipboardList,
   MapPinIcon,
@@ -10,6 +11,8 @@ import {
   PackageMinus,
   PackagePlus,
   QrCode,
+  SlidersHorizontal,
+  Ungroup,
 } from "lucide-react";
 import { Spinner } from "./spinner";
 
@@ -92,6 +95,8 @@ export type IconType =
   | "tag-add"
   | "category"
   | "location"
+  | "asset-model"
+  | "asset-model-remove"
   | "gps"
   | "duplicate"
   | "asset"
@@ -132,11 +137,14 @@ export type IconType =
   | "unavailable"
   | "change"
   | "booking-exist"
+  | "model-bookings"
+  | "model-booking-exist"
   | "download-qr"
   | "qr-code"
   | "mouse-pointer-click"
   | "add-to-kit"
-  | "remove-from-kit";
+  | "remove-from-kit"
+  | "adjust-quantity";
 
 type IconsMap = {
   [key in IconType]: JSX.Element;
@@ -166,6 +174,8 @@ export const iconsMap: IconsMap = {
   "tag-remove": <RemoveTagsIcon />,
   category: <CategoriesIcon />,
   location: <MapPinIcon />,
+  "asset-model": <Boxes />,
+  "asset-model-remove": <Ungroup />,
   gps: <GpsMarkerIcon />,
   duplicate: <DuplicateIcon />,
   asset: <AssetsIcon />,
@@ -203,11 +213,17 @@ export const iconsMap: IconsMap = {
   unavailable: <UnavailableIcon />,
   change: <ChangeIcon />,
   "booking-exist": <CalendarCheck />,
+  // The model view's two booking entries do the same thing as the asset
+  // index's, so they carry the same icons. `Icon` resolves by dialog type, so
+  // a missing key here renders nothing at all beside the menu label.
+  "model-bookings": <BookingsIcon />,
+  "model-booking-exist": <CalendarCheck />,
   "download-qr": <DownloadIcon />,
   "qr-code": <QrCode />,
   "mouse-pointer-click": <MousePointerClick />,
   "add-to-kit": <PackagePlus />,
   "remove-from-kit": <PackageMinus />,
+  "adjust-quantity": <SlidersHorizontal />,
   "start-audit": <ClipboardList />,
   "add-to-audit": <ClipboardList />,
   "delete-audit": <TrashIcon />,

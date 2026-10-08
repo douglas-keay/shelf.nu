@@ -9,7 +9,12 @@
  * @see {@link file://./../../routes/_layout+/assets.import-update.tsx} Route handler
  */
 import type { User } from "@prisma/client";
+import { AssetType } from "@prisma/client";
 import { db } from "~/database/db.server";
+import {
+  parseQtyTrackedUpdateRow,
+  type ParsedQtyTrackedUpdatePatch,
+} from "~/modules/asset/qty-validation.server";
 import {
   updateAsset,
   updateAssetBookingAvailability,
@@ -18,15 +23,20 @@ import type {
   ICustomFieldValueJson,
   UpdateAssetPayload,
 } from "~/modules/asset/types";
+import { decodeCsvListCell } from "~/utils/csv-cells";
 import { buildCustomFieldValue } from "~/utils/custom-fields";
 import { ShelfError, isLikeShelfError } from "~/utils/error";
+import { Logger } from "~/utils/logger";
 import {
   analyzeUpdateHeaders,
   computeAssetDiffs,
+  describeBulkUpdateRowFailure,
+  isBackupExportHeaderRow,
   normalizeExportedCurrencyValue,
   parseYesNo,
 } from "./import-update-diff";
 import {
+  batchResolveAssetModelNames,
   batchResolveCategoryNames,
   batchResolveLocationNames,
   detectNewEntities,
@@ -54,6 +64,65 @@ export { analyzeUpdateHeaders, computeAssetDiffs } from "./import-update-diff";
 export { fetchAssetsForUpdate } from "./import-update-entities.server";
 
 // ---------------------------------------------------------------------------
+// Shared User-Facing Error Copy
+// ---------------------------------------------------------------------------
+
+/**
+ * "No identifier column" error message — shared between `buildUpdatePreview`
+ * and `applyBulkUpdatesFromImport` so the two call sites of
+ * `analyzeUpdateHeaders` (preview time and apply time) never drift out of
+ * sync with each other.
+ *
+ * Previously claimed the ID column is "automatically included in all Asset
+ * Index exports" — that was false: the Import-ready export historically had
+ * no identifier column at all (now fixed separately — it always includes an
+ * `id` column), and the Standard export's "ID" column is only present when
+ * the user has it visible, or picks the "All columns" scope. Point at the
+ * export that's actually guaranteed to include one instead of asserting
+ * something untrue about "all" exports.
+ */
+const NO_IDENTIFIER_COLUMN_MESSAGE =
+  'No identifier column found. Your CSV needs an "Asset ID", "ID", or "id" ' +
+  "column so rows can be matched to existing assets. Export " +
+  '"Import-ready" from the Asset Index (either column scope) — it always ' +
+  "includes an id column, and the same file can be re-imported here to " +
+  "update those assets.";
+
+/**
+ * "Identifier found, nothing updatable" error message. Fires when every
+ * non-identifier header in the CSV is either unrecognized or a known
+ * read-only field (Status, Kit, Custody, …) — the file matches assets but
+ * carries no column this flow can write. Without this check the preview
+ * silently came back empty ("No changes detected"), which reads as "nothing
+ * changed" rather than "this is the wrong file" — see the
+ * `headerAnalysis.updatableColumns.length === 0` guard below.
+ */
+const NO_UPDATABLE_COLUMNS_MESSAGE =
+  "We matched your identifier column, but none of the other columns in " +
+  "this file can be updated here (e.g. Title, Category, Location, Tags, " +
+  "Valuation, or your custom fields). This usually means the file isn't " +
+  'shaped for updates. Export "Import-ready" from the Asset Index and ' +
+  "re-import that file to update these assets.";
+
+/**
+ * "Workspace backup export detected" error message. Fires when the header
+ * row carries raw Prisma field/relation names that only the workspace
+ * backup export (Settings → General → Export backup) emits — see
+ * `isBackupExportHeaderRow` in `./import-update-diff`. That file's
+ * `category`, `tags`, and `assetModel` cells are JSON blobs, not plain
+ * values, so letting it through would propose creating entities literally
+ * named `{}` / `[]` / a raw JSON string. Checked BEFORE the identifier
+ * check below: the backup file's `id` header now resolves as a valid
+ * identifier column (case-insensitive matching, added by this branch), so
+ * without this guard the file would sail past that check too.
+ */
+const BACKUP_EXPORT_MESSAGE =
+  "This looks like a workspace backup export. Use Export → Import-ready " +
+  "from the Asset Index instead — the backup file's category, tags, and " +
+  "asset model cells are stored as raw data and can't be matched to real " +
+  "entities here.";
+
+// ---------------------------------------------------------------------------
 // Build Full Preview
 // ---------------------------------------------------------------------------
 
@@ -65,7 +134,9 @@ export { fetchAssetsForUpdate } from "./import-update-entities.server";
  * @param csvData - Full CSV data array (first row is headers)
  * @param organizationId - Organization scope for the query
  * @returns Complete preview of all changes that would be applied
- * @throws {ShelfError} If no identifier column found or row limit exceeded
+ * @throws {ShelfError} If no identifier column is found, no column is
+ *   updatable (identifier present but nothing to write), or the row limit
+ *   is exceeded
  */
 export async function buildUpdatePreview({
   csvData,
@@ -83,6 +154,7 @@ export async function buildUpdatePreview({
       cause: null,
       message: `CSV contains ${dataRows.length} data rows, but the maximum is ${MAX_BULK_UPDATE_ROWS}. Please split your file into smaller batches.`,
       label: "Assets",
+      status: 400,
       shouldBeCaptured: false,
     });
   }
@@ -95,13 +167,41 @@ export async function buildUpdatePreview({
 
   const headerAnalysis = analyzeUpdateHeaders(headers, orgCustomFields);
 
+  // Reject a workspace backup export before it can be misread as a normal
+  // update CSV — see BACKUP_EXPORT_MESSAGE. Checked before the identifier
+  // check below because the backup file's `id` header now resolves as a
+  // valid (case-insensitive) identifier column.
+  if (isBackupExportHeaderRow(headers)) {
+    throw new ShelfError({
+      cause: null,
+      message: BACKUP_EXPORT_MESSAGE,
+      label: "Assets",
+      status: 400,
+      shouldBeCaptured: false,
+    });
+  }
+
   // Validate: must have at least one identifier column
   if (headerAnalysis.idColumnIndex === -1) {
     throw new ShelfError({
       cause: null,
-      message:
-        "No identifier column found. Your CSV needs an Asset ID or ID column. The ID column is automatically included in all Asset Index exports.",
+      message: NO_IDENTIFIER_COLUMN_MESSAGE,
       label: "Assets",
+      status: 400,
+      shouldBeCaptured: false,
+    });
+  }
+
+  // Validate: at least one column must actually be updatable. Matching rows
+  // by identifier but writing nothing usually means the wrong file was
+  // uploaded (e.g. a report export with no Shelf-recognized field columns) —
+  // fail loudly here instead of returning a preview with an empty change set.
+  if (headerAnalysis.updatableColumns.length === 0) {
+    throw new ShelfError({
+      cause: null,
+      message: NO_UPDATABLE_COLUMNS_MESSAGE,
+      label: "Assets",
+      status: 400,
       shouldBeCaptured: false,
     });
   }
@@ -142,9 +242,16 @@ export async function buildUpdatePreview({
     fallbackAssets,
   });
 
-  // Compute field change stats
+  // Compute field change stats.
+  //
+  // Only changes WITHOUT a `.warning` are counted: the apply layer skips
+  // warning-marked fields (invalid number/date/enum, assetModel on a
+  // quantity-tracked row, location on a multi-placement asset), so counting
+  // them here would promise the user changes that will never be written —
+  // e.g. a zero-edit round trip of a workspace with multi-location assets
+  // rendered "Apply 2 changes to 2 assets" when the answer was zero.
   const totalFieldChanges = diffs.assetsToUpdate.reduce(
-    (sum, a) => sum + a.changes.length,
+    (sum, a) => sum + a.changes.filter((c) => !c.warning).length,
     0
   );
   // Total possible fields = rows with found assets × updatable columns
@@ -187,7 +294,9 @@ export async function buildUpdatePreview({
  * @param userId - User performing the import
  * @param request - Original HTTP request (passed through to updateAsset)
  * @returns Results summary with updated, skipped, and failed assets
- * @throws {ShelfError} If no identifier column found or row limit exceeded
+ * @throws {ShelfError} If no identifier column is found, no column is
+ *   updatable (identifier present but nothing to write), or the row limit
+ *   is exceeded
  */
 export async function applyBulkUpdatesFromImport({
   csvData,
@@ -210,6 +319,7 @@ export async function applyBulkUpdatesFromImport({
       cause: null,
       message: `CSV contains ${dataRows.length} data rows, but the maximum is ${MAX_BULK_UPDATE_ROWS}. Please split your file into smaller batches.`,
       label: "Assets",
+      status: 400,
       shouldBeCaptured: false,
     });
   }
@@ -221,12 +331,37 @@ export async function applyBulkUpdatesFromImport({
 
   const headerAnalysis = analyzeUpdateHeaders(headers, orgCustomFields);
 
+  // Same "workspace backup export" guard as `buildUpdatePreview` — kept in
+  // sync here since this function re-parses the CSV independently
+  // (stateless apply). See BACKUP_EXPORT_MESSAGE.
+  if (isBackupExportHeaderRow(headers)) {
+    throw new ShelfError({
+      cause: null,
+      message: BACKUP_EXPORT_MESSAGE,
+      label: "Assets",
+      status: 400,
+      shouldBeCaptured: false,
+    });
+  }
+
   if (headerAnalysis.idColumnIndex === -1) {
     throw new ShelfError({
       cause: null,
-      message:
-        "No identifier column found. Your CSV needs an Asset ID or ID column.",
+      message: NO_IDENTIFIER_COLUMN_MESSAGE,
       label: "Assets",
+      status: 400,
+      shouldBeCaptured: false,
+    });
+  }
+
+  // Same "wrong file" guard as `buildUpdatePreview` — kept in sync here
+  // since this function re-parses the CSV independently (stateless apply).
+  if (headerAnalysis.updatableColumns.length === 0) {
+    throw new ShelfError({
+      cause: null,
+      message: NO_UPDATABLE_COLUMNS_MESSAGE,
+      label: "Assets",
+      status: 400,
       shouldBeCaptured: false,
     });
   }
@@ -288,11 +423,7 @@ export async function applyBulkUpdatesFromImport({
       if (col.internalKey === "category") allCategoryNames.add(change.newValue);
       if (col.internalKey === "location") allLocationNames.add(change.newValue);
       if (col.internalKey === "tags") {
-        change.newValue
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean)
-          .forEach((t) => allTagNames.add(t));
+        decodeCsvListCell(change.newValue).forEach((t) => allTagNames.add(t));
       }
     }
   }
@@ -328,6 +459,13 @@ export async function applyBulkUpdatesFromImport({
     rowNumber: f.rowNumber,
     error: f.reason,
   }));
+  /**
+   * Per-row warnings surfaced back to the caller. Populated by the
+   * qty-tracked update parser (e.g. assetModel cell dropped on a
+   * QUANTITY_TRACKED row). Warnings do not prevent the row from
+   * applying — they're transparency only.
+   */
+  const warnings: BulkUpdateResult["warnings"] = [];
 
   // Build row-number index by both primary and fallback identifiers
   const seenIdsForRow = new Map<string, number>();
@@ -344,6 +482,124 @@ export async function applyBulkUpdatesFromImport({
       }
     }
   }
+
+  // ── Qty-tracked + AssetModel pre-pass ──────────────────────────────
+  // For every row that maps to an existing asset, parse the
+  // qty-tracked + assetModel cells via the shared validator. The
+  // parser drops cells silently per the Wave-1 decisions (type cell
+  // ignored; qty-tracked-only cells dropped on INDIVIDUAL rows;
+  // assetModel warn + dropped on QUANTITY_TRACKED rows). The result
+  // is indexed by `assetDbId` so the per-row apply loop can look it
+  // up without re-parsing.
+  //
+  // Column indices: we look up the qty-tracked columns by their
+  // expected internal keys via `headerAnalysis.columnIndexMap`. If a
+  // column isn't present in the CSV, its index is undefined and the
+  // parser sees an empty cell — which it correctly treats as "no
+  // change requested".
+  const qtyColIndex = new Map<string, number>();
+  for (const [colIdx, col] of headerAnalysis.columnIndexMap) {
+    if (
+      col.internalKey === "quantity" ||
+      col.internalKey === "minQuantity" ||
+      col.internalKey === "unitOfMeasure" ||
+      col.internalKey === "consumptionType" ||
+      col.internalKey === "assetModel" ||
+      col.internalKey === "type"
+    ) {
+      qtyColIndex.set(col.internalKey, colIdx);
+    }
+  }
+
+  /**
+   * Per-asset qty-tracked + assetModel patch payload. Keyed by the
+   * canonical asset UUID (not the CSV identifier) so the apply loop
+   * can resolve it regardless of which identifier column the row used.
+   */
+  const qtyPatchesByAssetDbId = new Map<string, ParsedQtyTrackedUpdatePatch>();
+  /** Distinct assetModel names to batch-resolve. INDIVIDUAL rows only. */
+  const assetModelNamesToResolve = new Set<string>();
+
+  for (const assetPreview of diffs.assetsToUpdate) {
+    const existingAsset =
+      existingAssets.get(assetPreview.id) ??
+      fallbackAssets?.get(assetPreview.id);
+    if (!existingAsset) continue;
+
+    // Locate the source row index so warnings / errors can reference
+    // the user-visible row number (1-based, header at row 1 → data
+    // rows start at row 2).
+    const rowIdx = seenIdsForRow.get(assetPreview.id);
+    const rowNumber = rowIdx !== undefined ? rowIdx + 2 : 0;
+
+    const row = rowIdx !== undefined ? dataRows[rowIdx] : undefined;
+    const readCell = (key: string): string | undefined => {
+      const idx = qtyColIndex.get(key);
+      if (idx === undefined || !row) return undefined;
+      const cell = row[idx];
+      return typeof cell === "string" ? cell : undefined;
+    };
+
+    // If the existing asset's type couldn't be loaded (test fixtures
+    // / very old DB shapes), default to INDIVIDUAL so the parser
+    // applies the most restrictive ruleset (qty-tracked-only cells
+    // dropped). Real callers — `fetchAssetsForUpdate` — always
+    // provide the field.
+    const existingType = existingAsset.type ?? AssetType.INDIVIDUAL;
+    const parsed = parseQtyTrackedUpdateRow(
+      {
+        type: readCell("type"),
+        quantity: readCell("quantity"),
+        minQuantity: readCell("minQuantity"),
+        unitOfMeasure: readCell("unitOfMeasure"),
+        consumptionType: readCell("consumptionType"),
+        assetModel: readCell("assetModel"),
+      },
+      { type: existingType },
+      rowNumber
+    );
+
+    // Collect warnings (per decision #3: assetModel on qty-tracked).
+    for (const w of parsed.warnings) {
+      warnings.push({
+        id: assetPreview.id,
+        rowNumber: w.rowIndex,
+        message: w.message,
+      });
+    }
+
+    // Collect errors (malformed cells — non-int qty, bad enum, etc.).
+    // These fail the row's qty + assetModel update only; other cells
+    // (name, category, …) still apply.
+    for (const e of parsed.errors) {
+      failed.push({
+        id: assetPreview.id,
+        title: assetPreview.title,
+        rowNumber: e.rowIndex,
+        error: e.message,
+      });
+    }
+    // If the parser errored, skip queuing this asset's patch entirely.
+    if (parsed.errors.length > 0) continue;
+
+    qtyPatchesByAssetDbId.set(assetPreview.assetDbId, parsed.patch);
+
+    if (parsed.patch.assetModelLookupKey) {
+      assetModelNamesToResolve.add(parsed.patch.assetModelLookupKey);
+    }
+  }
+
+  // Batch-resolve every distinct INDIVIDUAL assetModel name (creates
+  // missing models on the fly). The parser already filtered out the
+  // qty-tracked rows, so the names here are guaranteed safe to apply.
+  const assetModelNameToId =
+    assetModelNamesToResolve.size > 0
+      ? await batchResolveAssetModelNames(
+          [...assetModelNamesToResolve],
+          userId,
+          organizationId
+        )
+      : new Map<string, string>();
 
   for (const assetPreview of diffs.assetsToUpdate) {
     const { id: matchId, assetDbId, title: assetTitle, changes } = assetPreview;
@@ -373,8 +629,19 @@ export async function applyBulkUpdatesFromImport({
       const otherChanges: FieldChange[] = [];
 
       for (const change of changes) {
-        // Skip fields with validation warnings (e.g. bad date format)
-        if (change.warning) continue;
+        // Skip fields with validation warnings (e.g. bad date format,
+        // assetModel-on-qty-tracked, invalid enum) AND forward the
+        // warning text into `result.warnings` so the user sees the
+        // field-level reason in the yellow "Warnings" pill — not just
+        // the row-level "N fields had invalid values" summary.
+        if (change.warning) {
+          warnings.push({
+            id: matchId,
+            rowNumber,
+            message: `${change.field}: ${change.warning}`,
+          });
+          continue;
+        }
 
         // Match by field display name
         const col = headerAnalysis.updatableColumns.find(
@@ -393,13 +660,67 @@ export async function applyBulkUpdatesFromImport({
 
       // Build update payload fields from non-location, non-availableToBook changes
       let title: UpdateAssetPayload["title"];
+      let description: UpdateAssetPayload["description"];
       let categoryId: UpdateAssetPayload["categoryId"];
       let tags: UpdateAssetPayload["tags"];
       let valuation: UpdateAssetPayload["valuation"];
+      // Wave-1 update-path extension — qty-tracked + AssetModel fields.
+      // Populated from `qtyPatchesByAssetDbId` (parsed in the pre-pass)
+      // and the assetModel lookup map.
+      let quantityPatch: UpdateAssetPayload["quantity"];
+      let minQuantityPatch: UpdateAssetPayload["minQuantity"];
+      let unitOfMeasurePatch: UpdateAssetPayload["unitOfMeasure"];
+      let consumptionTypePatch: UpdateAssetPayload["consumptionType"];
+      let assetModelIdPatch: UpdateAssetPayload["assetModelId"];
       const customFieldsValues: {
         id: string;
-        value: ICustomFieldValueJson;
+        // `undefined` is the deletion signal updateAsset expects: it routes
+        // falsy-value entries to deleteMany. The clearing branch below emits it
+        // (mirrors the normal form path, where buildCustomFieldValue returns
+        // undefined for empty). See SHELF-WEBAPP-21W.
+        value: ICustomFieldValueJson | undefined;
       }[] = [];
+
+      // Pull this asset's qty-tracked patch (may be undefined if no
+      // qty-tracked columns were present in the CSV at all).
+      const qtyPatch = qtyPatchesByAssetDbId.get(assetDbId);
+      if (qtyPatch) {
+        // Only apply qty fields that actually changed vs the existing
+        // asset — preserves the "skip no-op cells" behaviour the rest
+        // of the apply loop already exhibits.
+        if (
+          qtyPatch.quantity !== undefined &&
+          qtyPatch.quantity !== (existingAsset.quantity ?? undefined)
+        ) {
+          quantityPatch = qtyPatch.quantity;
+        }
+        if (
+          qtyPatch.minQuantity !== undefined &&
+          qtyPatch.minQuantity !== (existingAsset.minQuantity ?? undefined)
+        ) {
+          minQuantityPatch = qtyPatch.minQuantity;
+        }
+        if (
+          qtyPatch.unitOfMeasure !== undefined &&
+          qtyPatch.unitOfMeasure !== (existingAsset.unitOfMeasure ?? undefined)
+        ) {
+          unitOfMeasurePatch = qtyPatch.unitOfMeasure;
+        }
+        if (
+          qtyPatch.consumptionType !== undefined &&
+          qtyPatch.consumptionType !==
+            (existingAsset.consumptionType ?? undefined)
+        ) {
+          consumptionTypePatch = qtyPatch.consumptionType;
+        }
+        // assetModelId — resolve lookup key via batch map; skip no-op.
+        if (qtyPatch.assetModelLookupKey) {
+          const resolved = assetModelNameToId.get(qtyPatch.assetModelLookupKey);
+          if (resolved && resolved !== existingAsset.assetModelId) {
+            assetModelIdPatch = resolved;
+          }
+        }
+      }
 
       for (const change of otherChanges) {
         const col = headerAnalysis.updatableColumns.find(
@@ -410,6 +731,14 @@ export async function applyBulkUpdatesFromImport({
         switch (col.internalKey) {
           case "name":
             title = change.newValue;
+            break;
+
+          case "description":
+            // Plain scalar, no side-effects. Not clearable via an empty
+            // cell (see compareCoreField's "description" case) — this
+            // branch only runs for a change the diff already produced,
+            // i.e. a non-empty cell that differs from the current value.
+            description = change.newValue;
             break;
 
           case "category": {
@@ -430,10 +759,7 @@ export async function applyBulkUpdatesFromImport({
               // Clear all tags
               tags = { set: [] };
             } else {
-              const tagNames = change.newValue
-                .split(",")
-                .map((t) => t.trim())
-                .filter(Boolean);
+              const tagNames = decodeCsvListCell(change.newValue);
               const tagIds = tagNames
                 .map((n) => tagNameMap.get(n.toLowerCase()))
                 .filter((id): id is string => !!id)
@@ -459,18 +785,32 @@ export async function applyBulkUpdatesFromImport({
             break;
           }
 
+          // Qty-tracked + AssetModel "changes" are routed via the
+          // pre-pass-populated `qtyPatch` above — they're already
+          // validated and resolved. Skip here so we don't double-apply
+          // or treat them as unrecognised core fields.
+          case "quantity":
+          case "minQuantity":
+          case "unitOfMeasure":
+          case "consumptionType":
+          case "assetModel":
+          case "type":
+            break;
+
           default: {
             // Custom field
             if (col.kind === "customField" && col.cfDef) {
               const fullCf = cfByName.get(col.cfDef.name.toLowerCase());
               if (fullCf) {
                 if (change.clearing) {
-                  // Clear custom field by passing empty value
-                  // buildCustomFieldValue returns undefined for empty,
-                  // which signals deletion in updateAsset
+                  // Clearing = delete the value row. updateAsset routes a
+                  // FALSY value to deleteMany, so emit `undefined`. A truthy
+                  // `{ raw: "" }` was instead routed to create/update and
+                  // violated the `ensure_value_structure_and_types` CHECK
+                  // (Postgres 23514) — see SHELF-WEBAPP-21W.
                   customFieldsValues.push({
                     id: fullCf.id,
-                    value: { raw: "" },
+                    value: undefined,
                   });
                 } else {
                   // For AMOUNT/NUMBER fields, pre-normalize and validate
@@ -503,16 +843,28 @@ export async function applyBulkUpdatesFromImport({
       // fields that were silently skipped like invalid numbers)
       let changesApplied = 0;
       if (title !== undefined) changesApplied++;
+      if (description !== undefined) changesApplied++;
       if (categoryId !== undefined) changesApplied++;
       if (tags !== undefined) changesApplied++;
       if (valuation !== undefined) changesApplied++;
+      if (quantityPatch !== undefined) changesApplied++;
+      if (minQuantityPatch !== undefined) changesApplied++;
+      if (unitOfMeasurePatch !== undefined) changesApplied++;
+      if (consumptionTypePatch !== undefined) changesApplied++;
+      if (assetModelIdPatch !== undefined) changesApplied++;
       changesApplied += customFieldsValues.length;
 
       const hasMainChanges =
         title !== undefined ||
+        description !== undefined ||
         categoryId !== undefined ||
         tags !== undefined ||
         valuation !== undefined ||
+        quantityPatch !== undefined ||
+        minQuantityPatch !== undefined ||
+        unitOfMeasurePatch !== undefined ||
+        consumptionTypePatch !== undefined ||
+        assetModelIdPatch !== undefined ||
         customFieldsValues.length > 0;
 
       if (hasMainChanges) {
@@ -522,9 +874,18 @@ export async function applyBulkUpdatesFromImport({
           organizationId,
           request,
           title,
+          description,
           categoryId,
           tags,
           valuation,
+          // Wave-1 qty-tracked + AssetModel patches. `updateAsset`
+          // already accepts these (see `UpdateAssetPayload`); the
+          // service-layer guards re-validate type-vs-cell compatibility.
+          quantity: quantityPatch,
+          minQuantity: minQuantityPatch,
+          unitOfMeasure: unitOfMeasurePatch,
+          consumptionType: consumptionTypePatch,
+          assetModelId: assetModelIdPatch,
           customFieldsValues:
             customFieldsValues.length > 0
               ? (customFieldsValues as UpdateAssetPayload["customFieldsValues"])
@@ -648,14 +1009,26 @@ export async function applyBulkUpdatesFromImport({
         }
       }
     } catch (cause) {
-      const msg = isLikeShelfError(cause)
-        ? (cause as ShelfError).message
-        : "Unknown error";
+      // `updateAsset` wraps unexpected database errors in a *generic* ShelfError
+      // ("We could not create or update this Asset…") whose own message hides the
+      // real reason, and that wrapper is not captured to Sentry. For a bulk import
+      // that means a row can fail with zero diagnosable signal. So we (a) capture
+      // the failure (with its full cause chain) to Sentry, scoped to this feature,
+      // and (b) surface the underlying reason in the per-row report message.
+      Logger.error(
+        new ShelfError({
+          cause,
+          message: "Bulk asset update: row failed to apply",
+          additionalData: { matchId, rowNumber, organizationId, userId },
+          label: "Assets",
+          shouldBeCaptured: true,
+        })
+      );
       failed.push({
         id: matchId,
         title: assetTitle,
         rowNumber,
-        error: msg,
+        error: describeBulkUpdateRowFailure(cause),
       });
     }
   }
@@ -673,6 +1046,7 @@ export async function applyBulkUpdatesFromImport({
     updated,
     skipped,
     failed,
+    warnings,
     summary: {
       total,
       updated: updated.length,

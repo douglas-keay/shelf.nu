@@ -5,8 +5,9 @@ import { useLoaderData } from "react-router";
 import { useHydrated } from "remix-utils/use-hydrated";
 import { StartAuditFromContextDialog } from "~/components/audit/start-audit-from-context-dialog";
 import { useControlledDropdownMenu } from "~/hooks/use-controlled-dropdown-menu";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
+import { useRoleAccess } from "~/hooks/use-role-access";
 import { useUserData } from "~/hooks/use-user-data";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
 import type { loader } from "~/routes/_layout+/kits.$kitId";
 import {
   PermissionAction,
@@ -61,11 +62,20 @@ function ConditionalActionsDropdown({ fullWidth }: { fullWidth?: boolean }) {
     select: { custodian: { select: { userId: true } } };
   }>;
 
-  const someAssetIsNotAvailable = kit.assets.some(
-    (asset) => asset.status !== "AVAILABLE"
+  // QUANTITY_TRACKED assets don't block kit actions: their row-level status
+  // can be IN_CUSTODY because *some* units are operator-allocated, but
+  // Option B math (Phase 3d-Polish-2 `buildKitCustodyInheritData`) handles
+  // that on assign by writing only the remaining-pool quantity. Same
+  // precedent as the manage-assets picker filter (asset/service.server.ts).
+  // Fully-allocated qty-tracked assets are silently skipped by Option B,
+  // they still don't block.
+  const someAssetIsNotAvailable = kit.assetKits.some(
+    (ak) =>
+      ak.asset.type !== "QUANTITY_TRACKED" && ak.asset.status !== "AVAILABLE"
   );
 
-  const { roles, isSelfService } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
+  const assignsSelfOnly = useRoleAccess().custody.assign === "self";
   const user = useUserData();
 
   const {
@@ -80,7 +90,7 @@ function ConditionalActionsDropdown({ fullWidth }: { fullWidth?: boolean }) {
   const [isStartAuditOpen, setIsStartAuditOpen] = useState(false);
 
   const disableReleaseForSelfService =
-    isSelfService && kitCustody?.custodian?.userId !== user?.id;
+    assignsSelfOnly && kitCustody?.custodian?.userId !== user?.id;
 
   return (
     <>
@@ -177,7 +187,7 @@ function ConditionalActionsDropdown({ fullWidth }: { fullWidth?: boolean }) {
                   >
                     <span className="flex items-center gap-2">
                       <Icon icon="assign-custody" />{" "}
-                      {isSelfService ? "Take" : "Assign"} custody
+                      {assignsSelfOnly ? "Take" : "Assign"} custody
                     </span>
                   </Button>
                 )}
@@ -276,7 +286,7 @@ function ConditionalActionsDropdown({ fullWidth }: { fullWidth?: boolean }) {
               </DropdownMenuItem>
             </When>
 
-            <When truthy={!isSelfService}>
+            <When truthy={!assignsSelfOnly}>
               {kitIsCheckedOut || someAssetIsNotAvailable ? (
                 <div className=" border-t p-2 text-left text-xs">
                   Some actions are disabled due to asset(s) not being Available.
@@ -299,7 +309,7 @@ function ConditionalActionsDropdown({ fullWidth }: { fullWidth?: boolean }) {
         contextType="kit"
         contextId={kit.id}
         contextName={kit.name}
-        assetCount={kit.assets.length}
+        assetCount={kit.assetKits.length}
         open={isStartAuditOpen}
         onClose={() => setIsStartAuditOpen(false)}
         showTrigger={false}

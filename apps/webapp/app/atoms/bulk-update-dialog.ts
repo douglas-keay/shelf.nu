@@ -8,6 +8,8 @@ import type { BulkDialogType } from "~/components/bulk-update-dialog/bulk-update
 const DEFAULT_STATE: Record<BulkDialogType, boolean> = {
   location: false,
   category: false,
+  "asset-model": false,
+  "asset-model-remove": false,
   "assign-custody": false,
   "release-custody": false,
   "tag-add": false,
@@ -21,6 +23,8 @@ const DEFAULT_STATE: Record<BulkDialogType, boolean> = {
   unavailable: false,
   bookings: false,
   "booking-exist": false,
+  "model-bookings": false,
+  "model-booking-exist": false,
   "download-qr": false,
   "partial-checkin": false,
   "add-to-kit": false,

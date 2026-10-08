@@ -1,4 +1,5 @@
 import type { ComponentProps } from "react";
+import { act } from "react";
 import {
   fireEvent,
   render,
@@ -7,7 +8,6 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { act } from "react-dom/test-utils";
 import { TextSelection } from "prosemirror-state";
 import { describe, expect, it, beforeAll, vi } from "vitest";
 import type { Mark, Node as PMNode } from "prosemirror-model";
@@ -350,6 +350,108 @@ describe("EditorV2", () => {
     await waitFor(() => {
       expect(view.state.doc.textContent).toContain("Existing paragraph more");
     });
+  });
+
+  it("closes the slash command menu when the editor loses focus", async () => {
+    const user = userEvent.setup();
+    const handleBlur = vi.fn();
+    const { view, container } = await setupEditor({
+      defaultValue: "Existing paragraph",
+      onBlur: handleBlur,
+    });
+
+    const editable = container.querySelector(
+      '[contenteditable="true"]'
+    ) as HTMLElement;
+
+    act(() => {
+      const endSelection = TextSelection.atEnd(view.state.doc);
+      view.dispatch(view.state.tr.setSelection(endSelection));
+      view.focus();
+    });
+
+    await act(async () => {
+      await user.type(editable, "{enter}");
+    });
+    await act(async () => {
+      await user.type(editable, "/quot");
+    });
+
+    expect(
+      await screen.findByRole("listbox", { name: "Slash command menu" })
+    ).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.blur(view.dom);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("listbox", { name: "Slash command menu" })
+      ).not.toBeInTheDocument();
+    });
+
+    expect(handleBlur).toHaveBeenCalledTimes(1);
+
+    // Coming back and typing opens it again: closing the menu drops the pending
+    // query, it does not disable the trigger.
+    await act(async () => {
+      view.focus();
+      await user.type(editable, "e");
+    });
+
+    expect(
+      await screen.findByRole("listbox", { name: "Slash command menu" })
+    ).toBeInTheDocument();
+  });
+
+  it("applies a slash command when its menu item is clicked", async () => {
+    const user = userEvent.setup();
+    const { view, container } = await setupEditor({
+      defaultValue: "Existing paragraph",
+    });
+
+    const editable = container.querySelector(
+      '[contenteditable="true"]'
+    ) as HTMLElement;
+
+    act(() => {
+      const endSelection = TextSelection.atEnd(view.state.doc);
+      view.dispatch(view.state.tr.setSelection(endSelection));
+      view.focus();
+    });
+
+    await act(async () => {
+      await user.type(editable, "{enter}");
+    });
+    await act(async () => {
+      await user.type(editable, "/quote");
+    });
+
+    const slashMenu = await screen.findByRole("listbox", {
+      name: "Slash command menu",
+    });
+    // Scoped to the menu: the toolbar's block-type select also has options.
+    const option = within(slashMenu).getByRole("option", { name: /quote/i });
+    await act(async () => {
+      await user.click(option);
+    });
+
+    await waitFor(() => {
+      let foundBlockquote = false;
+      view.state.doc.descendants((node: PMNode) => {
+        if (node.type.name === "blockquote") {
+          foundBlockquote = true;
+          return false;
+        }
+        return undefined;
+      });
+      expect(foundBlockquote).toBe(true);
+    });
+
+    expect(
+      screen.queryByRole("listbox", { name: "Slash command menu" })
+    ).not.toBeInTheDocument();
   });
 
   it("renders bubble menu buttons as icon-only controls", async () => {

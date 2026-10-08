@@ -25,7 +25,7 @@ import {
   TooltipTrigger,
 } from "~/components/shared/tooltip";
 import { useDisabled } from "~/hooks/use-disabled";
-import { useUserRoleHelper } from "~/hooks/user-user-role-helper";
+import { useOrganizationRoles } from "~/hooks/use-organization-roles";
 import { getBookingHeaderData } from "~/modules/booking/service.server";
 import { setSelectedOrganizationIdCookie } from "~/modules/organization/context.server";
 import type { RouteHandleWithName } from "~/modules/types";
@@ -121,7 +121,7 @@ export default function AssetDetailsPage() {
   const name = useAtomValue(dynamicTitleAtom);
   const hasName = name !== "";
   const { booking } = useLoaderData<typeof loader>();
-  const { roles } = useUserRoleHelper();
+  const roles = useOrganizationRoles();
 
   const items = [
     { to: "overview", content: "Overview" },
@@ -139,6 +139,7 @@ export default function AssetDetailsPage() {
   const shouldHideHeader = [
     "booking.overview.scan-assets",
     "booking.overview.checkin-assets",
+    "booking.overview.fulfil-and-checkout",
     "booking.overview.checkout-assets",
   ].includes(currentRoute?.handle?.name);
 

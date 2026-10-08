@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { AssetStatus, KitStatus } from "@prisma/client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AssetStatus, AssetType, KitStatus } from "@prisma/client";
 import { useAtomValue, useSetAtom } from "jotai";
 import { AlertCircleIcon } from "lucide-react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
@@ -16,7 +16,7 @@ import {
   selectedBulkItemsCountAtom,
   setDisabledBulkItemsAtom,
   setSelectedBulkItemAtom,
-  setSelectedBulkItemsAtom,
+  seedFormSelectionAtom,
 } from "~/atoms/list";
 import { AssetImage } from "~/components/assets/asset-image/component";
 import { AssetStatusBadge } from "~/components/assets/asset-status-badge";
@@ -28,6 +28,8 @@ import { Form } from "~/components/custom-form";
 import DynamicDropdown from "~/components/dynamic-dropdown/dynamic-dropdown";
 import { ChevronRight } from "~/components/icons/library";
 import ImageWithPreview from "~/components/image-with-preview/image-with-preview";
+import type { KitRemovalBookingImpact } from "~/components/kits/booking-removal-notice";
+import { BookingRemovalNotice } from "~/components/kits/booking-removal-notice";
 import { List } from "~/components/list";
 import { Filters } from "~/components/list/filters";
 import { SortBy } from "~/components/list/filters/sort-by";
@@ -54,12 +56,20 @@ import When from "~/components/when/when";
 import { db } from "~/database/db.server";
 import { getPaginatedAndFilterableAssets } from "~/modules/asset/service.server";
 import type { AssetsFromViewItem } from "~/modules/asset/types";
-import { updateKitAssets } from "~/modules/kit/service.server";
+import { getPrimaryLocation, isQuantityTracked } from "~/modules/asset/utils";
+import type { PickerAssetMeta } from "~/modules/kit/picker-meta.server";
+import { getKitPickerMeta } from "~/modules/kit/picker-meta.server";
+import {
+  getBookingImpactForAssetKits,
+  updateKitAssets,
+} from "~/modules/kit/service.server";
 import { appendToMetaTitle } from "~/utils/append-to-meta-title";
+import { AssetQuantitiesSchema } from "~/utils/asset-quantities-schema";
 import { makeShelfError, ShelfError } from "~/utils/error";
 import { isFormProcessing } from "~/utils/form";
 import { payload, error, getParams, parseData } from "~/utils/http.server";
 import { isSelectingAllItems } from "~/utils/list";
+import { numberInputWheelGuard } from "~/utils/number-input-wheel-guard";
 import {
   PermissionAction,
   PermissionEntity,
@@ -77,11 +87,34 @@ const ASSET_KIT_FILTERS = [
   { label: "In other kits", value: "IN_OTHER_KITS" },
 ];
 
+/**
+ * Zod schema for the route's params (`/kits/:kitId/...`).
+ *
+ * Pulled out so the loader and action share the same parse and the
+ * additionalData on `getParams` stays consistent.
+ */
+const KitParamsSchema = z.object({ kitId: z.string() });
+
+/**
+ * Zod schema for the action's form body.
+ *
+ *  - `assetIds`: list of every asset id the picker considers selected
+ *    AFTER the user's edits. Includes both newly-added ids and ids that
+ *    are already in the kit — `updateKitAssets` diffs against the kit's
+ *    current state to derive adds / removes / qty-changes.
+ *  - `assetQuantities`: per-row qty for QUANTITY_TRACKED rows; see
+ *    `AssetQuantitiesSchema`.
+ */
+const ManageAssetsActionSchema = z.object({
+  assetIds: z.array(z.string()).optional().default([]),
+  assetQuantities: AssetQuantitiesSchema,
+});
+
 export async function loader({ context, request, params }: LoaderFunctionArgs) {
   const authSession = context.getSession();
   const { userId } = authSession;
 
-  const { kitId } = getParams(params, z.object({ kitId: z.string() }), {
+  const { kitId } = getParams(params, KitParamsSchema, {
     additionalData: { userId },
   });
 
@@ -118,7 +151,19 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
             name: true,
             status: true,
             location: { select: { id: true, name: true } },
-            assets: { select: { id: true } },
+            // Pull the current pivot rows for THIS kit, including
+            // quantity, so the picker can pre-fill the qty input for
+            // qty-tracked rows the user is already managing.
+            //
+            // `id` is the `AssetKit` id — the key the reserved-booking impact
+            // helper below is written against (`BookingAsset.assetKitId`).
+            assetKits: {
+              select: {
+                id: true,
+                asset: { select: { id: true } },
+                quantity: true,
+              },
+            },
           },
         })
         .catch((cause) => {
@@ -134,13 +179,55 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       getPaginatedAndFilterableAssets({
         request,
         organizationId,
+        // Ignores the custodian-filter seed — scope it rather than fetch a
+        // roster nobody renders.
+        canSeeAllCustody: false,
       }),
     ]);
+
+    // Hydrate per-asset picker metadata for the QUANTITY_TRACKED rows on
+    // this page. See `getKitPickerMeta` for the strict-available formula
+    // and its subtleties.
+    //
+    // In parallel: which bookings a deselection of one of the kit's current
+    // members would affect — RESERVED ones lose the slice, ONGOING/OVERDUE
+    // ones keep it flagged as removed from the kit. Deselecting is destructive
+    // here (the confirm dialog says "Add Assets to kit?"), so the dialog says
+    // so before it happens. Bounded by the kit's size — not the asset index
+    // page — and resolved in the loader so opening the dialog costs no
+    // round-trip.
+    const [pickerMetaByAssetId, bookingImpactByAssetKitId] = await Promise.all([
+      getKitPickerMeta({
+        kitId,
+        organizationId,
+        assetIds: assets.map((a) => a.id),
+      }),
+      getBookingImpactForAssetKits({
+        assetKitIds: kit.assetKits.map((ak) => ak.id),
+        organizationId,
+      }),
+    ]);
+
+    /** `assetId -> impact of removing it from THIS kit`. Impact-free members
+     * are dropped so the dialog's memo only walks rows that matter. */
+    const bookingImpactByAssetId = Object.fromEntries(
+      kit.assetKits
+        .map((ak) => [ak.asset.id, bookingImpactByAssetKitId[ak.id]] as const)
+        .filter(
+          (entry): entry is readonly [string, KitRemovalBookingImpact] =>
+            entry[1] !== undefined
+        )
+    );
 
     const modelName = {
       singular: "asset",
       plural: "assets",
     };
+
+    const itemsWithPickerMeta = assets.map((a) => ({
+      ...a,
+      pickerMeta: pickerMetaByAssetId.get(a.id) ?? null,
+    }));
 
     return payload({
       header: {
@@ -155,7 +242,8 @@ export async function loader({ context, request, params }: LoaderFunctionArgs) {
       showSidebar: true,
       noScroll: true,
       kit,
-      items: assets,
+      bookingImpactByAssetId,
+      items: itemsWithPickerMeta,
       totalItems: totalAssets,
       categories,
       tags,
@@ -179,7 +267,7 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
   const authSession = context.getSession();
   const { userId } = authSession;
 
-  const { kitId } = getParams(params, z.object({ kitId: z.string() }), {
+  const { kitId } = getParams(params, KitParamsSchema, {
     additionalData: { userId },
   });
 
@@ -191,17 +279,16 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
       action: PermissionAction.update,
     });
 
-    const { assetIds } = parseData(
+    const { assetIds, assetQuantities } = parseData(
       await request.formData(),
-      z.object({
-        assetIds: z.array(z.string()).optional().default([]),
-      }),
+      ManageAssetsActionSchema,
       { additionalData: { userId, organizationId, kitId } }
     );
 
     await updateKitAssets({
       kitId,
       assetIds,
+      assetQuantities,
       userId,
       organizationId,
       request,
@@ -214,9 +301,39 @@ export async function action({ context, request, params }: ActionFunctionArgs) {
   }
 }
 
+/**
+ * `aria-describedby` target for the booking-impact notice. The confirm dialog
+ * has no `AlertDialogDescription`, so without this the notice would appear
+ * silently for screen-reader users.
+ */
+const REMOVAL_NOTICE_ID = "manage-kit-assets-removal-notice";
+
 export default function ManageAssetsInKit() {
-  const { kit, items, totalItems } = useLoaderData<LoaderData>();
-  const kitAssetIds = kit.assets.map((asset) => asset.id);
+  const { kit, items, totalItems, bookingImpactByAssetId } =
+    useLoaderData<LoaderData>();
+  // why: `.map` returns a new array each render. The disabled-items effect
+  // below depends on `kitAssetIds`, so an unmemoised list would re-run it on
+  // every render, and its `setDisabledBulkItems` write would loop.
+  const kitAssetsList = useMemo(
+    () => kit.assetKits.map((ak) => ak.asset),
+    [kit.assetKits]
+  );
+  const kitAssetIds = useMemo(
+    () => kitAssetsList.map((asset) => asset.id),
+    [kitAssetsList]
+  );
+  /**
+   * Snapshot of each qty-tracked asset's current AssetKit.quantity in
+   * this kit — used to (a) pre-fill the picker qty input on initial
+   * render and (b) detect post-edit deltas for the in-custody info-box.
+   */
+  const initialKitQuantities = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const ak of kit.assetKits) {
+      map[ak.asset.id] = ak.quantity;
+    }
+    return map;
+  }, [kit.assetKits]);
 
   const navigation = useNavigation();
   const isSearching = isFormProcessing(navigation.state);
@@ -226,23 +343,127 @@ export default function ManageAssetsInKit() {
 
   const selectedBulkItems = useAtomValue(selectedBulkItemsAtom);
   const updateItem = useSetAtom(setSelectedBulkItemAtom);
-  const setSelectedBulkItems = useSetAtom(setSelectedBulkItemsAtom);
+  const seedFormSelection = useSetAtom(seedFormSelectionAtom);
   const selectedBulkItemsCount = useAtomValue(selectedBulkItemsCountAtom);
   const hasSelectedAllItems = isSelectingAllItems(selectedBulkItems);
   const setDisabledBulkItems = useSetAtom(setDisabledBulkItemsAtom);
 
   /**
-   * Set selected items for kit based on the route data
+   * Per-asset quantity for QUANTITY_TRACKED rows. Submitted as a hidden
+   * JSON field so the action can apply the diff against
+   * `initialKitQuantities`. Initialised from the kit's current pivot
+   * rows so users see "currently allocated 60" rather than starting
+   * from a blank input.
    */
-  useEffect(() => {
-    setSelectedBulkItems(kit.assets);
-  }, [kit.assets, setSelectedBulkItems]);
+  const [quantities, setQuantities] = useState<Record<string, number>>(() => ({
+    ...initialKitQuantities,
+  }));
+
+  const handleQuantityChange = useCallback(
+    (assetId: string, quantity: number) => {
+      setQuantities((prev) => ({ ...prev, [assetId]: quantity }));
+    },
+    []
+  );
+
+  /** Drop the qty entry when the row is deselected. */
+  const removeQuantity = useCallback((assetId: string) => {
+    setQuantities((prev) => {
+      if (!(assetId in prev)) return prev;
+      const next = { ...prev };
+      delete next[assetId];
+      return next;
+    });
+  }, []);
+
+  /** Compute the set of qty-tracked assets where the user changed qty
+   *  for an asset that's still in the kit. Used to surface the
+   *  in-custody info-box warning describing the operator-side delta.
+   */
+  const qtyEditedInExistingKitRows = useMemo(() => {
+    const out: { assetId: string; delta: number }[] = [];
+    for (const [assetId, oldQty] of Object.entries(initialKitQuantities)) {
+      const stillSelected = selectedBulkItems.some((a) => a.id === assetId);
+      if (!stillSelected) continue;
+      const newQty = quantities[assetId] ?? oldQty;
+      if (newQty !== oldQty) out.push({ assetId, delta: newQty - oldQty });
+    }
+    return out;
+  }, [initialKitQuantities, quantities, selectedBulkItems]);
 
   /**
-   * Set disabled items for kit
+   * The booking impact of the kit members the user has deselected, split by
+   * outcome.
+   *
+   * Deselecting a row here removes the asset from the kit. On a booking still
+   * being planned that DELETES its kit-driven slice (see
+   * `removeKitSlicesFromPlanningBookings`) — unremarkable for a DRAFT, but a
+   * RESERVED booking has committed dates and a custodian. On an
+   * ONGOING/OVERDUE booking the slice is KEPT and flagged as removed from the
+   * kit, because those units are physically out. The confirm dialog names both
+   * groups. Derived exactly like `qtyEditedInExistingKitRows` above — from the
+   * same selection atom.
+   *
+   * Each group counts its OWN assets: a deselected asset can be reserved
+   * somewhere, checked out somewhere else, or only one of the two.
+   */
+  const deselectedBookingImpact = useMemo(() => {
+    const deselectedAssetIds = Object.keys(bookingImpactByAssetId).filter(
+      (assetId) => !selectedBulkItems.some((a) => a.id === assetId)
+    );
+    const impacts = deselectedAssetIds.map(
+      (assetId) => bookingImpactByAssetId[assetId]
+    );
+    return {
+      reserved: {
+        assetCount: impacts.filter((impact) => impact.reserved.length > 0)
+          .length,
+        bookings: impacts.flatMap((impact) => impact.reserved),
+      },
+      checkedOut: {
+        assetCount: impacts.filter((impact) => impact.checkedOut.length > 0)
+          .length,
+        bookings: impacts.flatMap((impact) => impact.checkedOut),
+      },
+    };
+  }, [bookingImpactByAssetId, selectedBulkItems]);
+
+  const kitIsInCustody =
+    kit.status === KitStatus.IN_CUSTODY || kit.status === KitStatus.CHECKED_OUT;
+  const showInCustodyQtyWarning =
+    kitIsInCustody && qtyEditedInExistingKitRows.length > 0;
+
+  /**
+   * Set selected items for kit based on the route data.
+   *
+   * Initialise the shared Jotai atom synchronously during the first
+   * render (guarded by a ref) rather than running the setter inside a
+   * mount effect — react-doctor's `no-derived-state-effect` flags the
+   * useEffect form, and the render-time init avoids the empty-first-
+   * frame flicker. Same pattern as the booking manage-assets picker
+   * at `bookings.$bookingId.overview.manage-assets.tsx:1156-1160`.
+   * `AtomsResetHandler` runs its pathname-change reset during render
+   * too, so it executes before this init and doesn't clobber the
+   * selection.
+   */
+  const didInitializeSelectedItemsRef = useRef(false);
+  if (!didInitializeSelectedItemsRef.current) {
+    didInitializeSelectedItemsRef.current = true;
+    seedFormSelection(kitAssetsList);
+  }
+
+  /**
+   * Set disabled items for kit.
+   * QUANTITY_TRACKED assets never block selection — their row-level status
+   * flips to IN_CUSTODY / CHECKED_OUT as soon as *any* units are
+   * operator-allocated or actively booked, but the kit-assign flow uses
+   * Option B math (`buildKitCustodyInheritData`) to allocate only the
+   * remaining pool. Same precedent as the manage-assets picker filter in
+   * `asset/service.server.ts` and the kit ActionsDropdown guard.
    */
   useEffect(() => {
     const disabledBulkItems = items.reduce<ListItemData[]>((acc, asset) => {
+      if (isQuantityTracked(asset)) return acc;
       const isCheckedOut = asset.status === AssetStatus.CHECKED_OUT;
       const isInCustody = asset.status === AssetStatus.IN_CUSTODY;
 
@@ -336,15 +557,40 @@ export default function ManageAssetsInKit() {
           navigate={(_assetId, item) => {
             const isParkOfCurrentKit = kitAssetIds.includes(item.id);
 
-            if (
-              item.status === AssetStatus.CHECKED_OUT &&
-              !isParkOfCurrentKit
-            ) {
-              return;
+            // QUANTITY_TRACKED rows are always clickable — partial
+            // allocation doesn't block kit-add (Option B handles it).
+            if (!isQuantityTracked(item)) {
+              if (
+                item.status === AssetStatus.CHECKED_OUT &&
+                !isParkOfCurrentKit
+              ) {
+                return;
+              }
+
+              if (
+                item.status === AssetStatus.IN_CUSTODY &&
+                !isParkOfCurrentKit
+              ) {
+                return;
+              }
             }
 
-            if (item.status === AssetStatus.IN_CUSTODY && !isParkOfCurrentKit) {
-              return;
+            // Track per-row qty for qty-tracked rows so the picker
+            // input is pre-populated when the row is toggled on and
+            // cleaned up when toggled off. INDIVIDUAL rows skip both
+            // (the service treats missing entries as "use 1").
+            const isCurrentlySelected = selectedBulkItems.some(
+              (a) => a.id === item.id
+            );
+            if (isCurrentlySelected) {
+              removeQuantity(item.id);
+            } else if (item.type === AssetType.QUANTITY_TRACKED) {
+              const meta = item.pickerMeta;
+              const fallbackMax =
+                meta?.maxAllowedForThisKit ?? item.quantity ?? 1;
+              const initial =
+                initialKitQuantities[item.id] ?? Math.max(1, fallbackMax);
+              handleQuantityChange(item.id, initial);
             }
 
             updateItem(item);
@@ -366,7 +612,12 @@ export default function ManageAssetsInKit() {
             </>
           }
           disableSelectAllItems={true}
-          extraItemComponentProps={{ kitAssetIds }}
+          extraItemComponentProps={{
+            kitAssetIds,
+            quantities,
+            onQuantityChange: handleQuantityChange,
+            initialKitQuantities,
+          }}
         />
       </div>
       {/* Footer of the modal - fixed at the bottom */}
@@ -388,6 +639,14 @@ export default function ManageAssetsInKit() {
                 value={asset.id}
               />
             ))}
+            {/* JSON-encoded `Record<assetId, quantity>` — picker writes
+                one entry per selected QUANTITY_TRACKED asset. INDIVIDUAL
+                rows are absent and the service falls back to qty=1. */}
+            <input
+              type="hidden"
+              name="assetQuantities"
+              value={JSON.stringify(quantities)}
+            />
 
             <AlertDialog>
               <AlertDialogTrigger asChild>
@@ -396,7 +655,18 @@ export default function ManageAssetsInKit() {
                 </Button>
               </AlertDialogTrigger>
 
-              <AlertDialogContent>
+              <AlertDialogContent
+                // The dialog has no `AlertDialogDescription`, so Radix has
+                // nothing to announce beyond the heading. When the removal
+                // warning is present it IS the consequential part — point the
+                // dialog's description at it so it's read out on open.
+                aria-describedby={
+                  deselectedBookingImpact.reserved.bookings.length > 0 ||
+                  deselectedBookingImpact.checkedOut.bookings.length > 0
+                    ? REMOVAL_NOTICE_ID
+                    : undefined
+                }
+              >
                 <div className="flex items-center gap-4">
                   <div className="flex size-12 items-center justify-center rounded-full bg-blue-200/20">
                     <div className="flex size-10 items-center justify-center rounded-full bg-blue-200/50">
@@ -408,8 +678,7 @@ export default function ManageAssetsInKit() {
                 </div>
 
                 <div>
-                  {(kit.status === KitStatus.IN_CUSTODY ||
-                    kit.status === KitStatus.CHECKED_OUT) && (
+                  {kitIsInCustody && (
                     <p className="mb-3">
                       This kit is currently{" "}
                       {kit.status === KitStatus.IN_CUSTODY
@@ -418,6 +687,22 @@ export default function ManageAssetsInKit() {
                       . Any assets you add will automatically inherit the kit's
                       status.
                     </p>
+                  )}
+                  {/* Qty-edit warning: when the user changed a qty-tracked
+                      asset's quantity inside an in-custody kit, both
+                      AssetKit.quantity AND the kit-allocated Custody.quantity
+                      shift in the same tx. Make sure the user understands
+                      the cascade before they confirm. */}
+                  {showInCustodyQtyWarning && (
+                    <div className="mb-3 rounded-md border border-warning-200 bg-warning-50 px-3 py-2 text-sm text-warning-800">
+                      <strong>Quantity change notice:</strong> You changed the
+                      quantity for{" "}
+                      {qtyEditedInExistingKitRows.length === 1
+                        ? "1 asset"
+                        : `${qtyEditedInExistingKitRows.length} assets`}{" "}
+                      already in this kit. The custodian's allocation will be
+                      adjusted by the same amount when you confirm.
+                    </div>
                   )}
                   {kit.location ? (
                     <p className="mb-3">
@@ -432,6 +717,17 @@ export default function ManageAssetsInKit() {
                       has no location assigned.
                     </p>
                   )}
+                  {/* Removal notice: deselecting a row is destructive even
+                      though this dialog is titled "Add Assets to kit?" — the
+                      asset leaves the kit AND every reserved booking that
+                      holds it through this kit, while checked-out bookings
+                      keep it relabelled. Informs, never blocks. */}
+                  <BookingRemovalNotice
+                    id={REMOVAL_NOTICE_ID}
+                    className="mb-3"
+                    reserved={deselectedBookingImpact.reserved}
+                    checkedOut={deselectedBookingImpact.checkedOut}
+                  />
                   <p>Are you sure you want to continue?</p>
                 </div>
 
@@ -459,14 +755,28 @@ export default function ManageAssetsInKit() {
 
 const RowComponent = ({
   item,
-  extraProps: { kitAssetIds },
+  extraProps: {
+    kitAssetIds,
+    quantities,
+    onQuantityChange,
+    initialKitQuantities,
+  },
 }: {
-  item: AssetsFromViewItem;
-  extraProps: { kitAssetIds: string[] };
+  item: AssetsFromViewItem & { pickerMeta?: PickerAssetMeta | null };
+  extraProps: {
+    kitAssetIds: string[];
+    quantities: Record<string, number>;
+    onQuantityChange: (assetId: string, quantity: number) => void;
+    initialKitQuantities: Record<string, number>;
+  };
 }) => {
-  const { category, tags, location } = item;
-  const isCheckedOut = item.status === AssetStatus.CHECKED_OUT;
-  const isInCustody = item.status === AssetStatus.IN_CUSTODY;
+  const { category, tags } = item;
+  const location = getPrimaryLocation(item);
+  const isQty = isQuantityTracked(item);
+  // QUANTITY_TRACKED rows behave as "available" for the picker regardless
+  // of row-level status — Option B handles partial allocation on assign.
+  const isCheckedOut = !isQty && item.status === AssetStatus.CHECKED_OUT;
+  const isInCustody = !isQty && item.status === AssetStatus.IN_CUSTODY;
   const isParkOfCurrentKit = kitAssetIds.includes(item.id);
 
   const allowCursor =
@@ -474,12 +784,35 @@ const RowComponent = ({
       ? "cursor-not-allowed"
       : "";
 
+  const selectedBulkItems = useAtomValue(selectedBulkItemsAtom);
+  const isSelected = selectedBulkItems.some((a) => a.id === item.id);
+
+  /**
+   * Decide whether to render the per-row qty input. Only qty-tracked
+   * rows that are currently selected qualify — INDIVIDUAL stays a
+   * single-checkbox row, and qty-tracked rows that haven't been ticked
+   * yet shouldn't take vertical space for an input the user can't act
+   * on. `pickerMeta` is undefined-safe in case the loader missed a row
+   * (defensive — the loader fetches all qty-tracked ids on the page).
+   */
+  const showQtyInput = isQty && isSelected && !!item.pickerMeta;
+  const meta = item.pickerMeta;
+  const currentValue =
+    quantities[item.id] ?? meta?.maxAllowedForThisKit ?? item.quantity ?? 1;
+  const max = meta?.maxAllowedForThisKit ?? item.quantity ?? Infinity;
+  const initialInThisKit = initialKitQuantities[item.id] ?? 0;
+  const otherKits = meta?.inOtherKits ?? [];
+
   return (
     <>
       {/* Name */}
       <Td className={tw("w-full min-w-[330px] p-0 md:p-0", allowCursor)}>
-        <div className="flex items-center  gap-3 p-4 md:pr-6">
-          <div className="flex items-center gap-3">
+        <div className="flex items-center justify-between gap-3 p-4 md:pr-6">
+          {/* `min-w-0 flex-1` on the title block so its long text
+              (multi-kit "Also in: ..." line, long titles) wraps
+              cleanly instead of pushing the qty input off-screen.
+              The qty input keeps `shrink-0` and stays visible. */}
+          <div className="flex min-w-0 flex-1 items-center gap-3">
             <div className="flex size-14 shrink-0 items-center justify-center">
               <AssetImage
                 asset={{
@@ -487,26 +820,80 @@ const RowComponent = ({
                   mainImage: item.mainImage,
                   thumbnailImage: item.thumbnailImage,
                   mainImageExpiration: item.mainImageExpiration,
+                  assetModel: item.assetModel ?? null,
                 }}
                 alt={`Image of ${item.title}`}
                 className="size-full rounded-[4px] border object-cover"
               />
             </div>
-            <div className="flex flex-col gap-y-1">
+            <div className="flex min-w-0 flex-col gap-y-1">
               <p className="word-break whitespace-break-spaces font-medium">
                 {item.title}
+                {isQuantityTracked(item) && item.quantity != null ? (
+                  <span className="ml-2 text-xs font-normal text-gray-500">
+                    · {item.quantity} {item.unitOfMeasure || "units"}
+                    {/* Surface the strict-available pool when it's
+                        smaller than the asset's total — clarifies why
+                        the qty input's MAX may be lower than the
+                        total. Skipped when meta is missing (defensive)
+                        or when max equals the total (no constraint to
+                        flag). */}
+                    {meta && meta.maxAllowedForThisKit < item.quantity ? (
+                      <span className="ml-1 text-warning-700">
+                        · {meta.maxAllowedForThisKit} available
+                      </span>
+                    ) : null}
+                  </span>
+                ) : null}
               </p>
+              {/* "Also in Kit X (N)" indicator. Surfaces multi-kit
+                  membership so the user knows their picker MAX is
+                  capped by allocations elsewhere. Only renders when
+                  the asset is in another kit. */}
+              {otherKits.length > 0 && (
+                // Single-line + ellipsis so a multi-kit list doesn't
+                // overflow the Td and visually collide with the qty
+                // input on the right. The full list is available via
+                // the tooltip below and on the asset overview's
+                // "Included in kits" card.
+                <p
+                  className="truncate text-xs text-gray-500"
+                  title={otherKits
+                    .map((k) => `${k.kitName} (${k.quantity})`)
+                    .join(", ")}
+                >
+                  Also in:{" "}
+                  {otherKits
+                    .map((k) => `${k.kitName} (${k.quantity})`)
+                    .join(", ")}
+                </p>
+              )}
 
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 {/*
-                   When asset is available, show normal status badge 
-                   When asset is in custody, and not in other custody, show normal status badge
+                   When asset is available, show normal status badge.
+                   QUANTITY_TRACKED rows are treated as Available for the
+                   picker even when their row-level status is IN_CUSTODY /
+                   CHECKED_OUT — the row is selectable and Option B math
+                   will assign the remaining pool on save. Render the
+                   Available badge with a forced AVAILABLE status so the
+                   visual matches the actual selectability.
                 */}
-                <When truthy={item.status === AssetStatus.AVAILABLE}>
+                <When
+                  truthy={
+                    item.status === AssetStatus.AVAILABLE ||
+                    isQuantityTracked(item)
+                  }
+                >
                   <AssetStatusBadge
                     id={item.id}
-                    status={item.status}
+                    status={
+                      isQuantityTracked(item)
+                        ? AssetStatus.AVAILABLE
+                        : item.status
+                    }
                     availableToBook={item.availableToBook}
+                    asset={item}
                   />
                 </When>
 
@@ -593,16 +980,68 @@ const RowComponent = ({
               </div>
             </div>
           </div>
+          {/* Qty picker for QUANTITY_TRACKED rows. Bounded by the
+              strict-available pool (`pickerMeta.maxAllowedForThisKit`).
+              `e.stopPropagation()` on the wrapper keeps clicks inside
+              the input from toggling the row's selection state. */}
+          {showQtyInput ? (
+            <div
+              className="ml-auto flex shrink-0 flex-col items-end gap-1 pr-2"
+              role="presentation"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-2">
+                <label
+                  htmlFor={`kit-qty-${item.id}`}
+                  className="text-xs text-gray-500"
+                >
+                  Qty:
+                </label>
+                <input
+                  id={`kit-qty-${item.id}`}
+                  type="number"
+                  {...numberInputWheelGuard}
+                  min={1}
+                  max={Number.isFinite(max) ? max : undefined}
+                  value={currentValue}
+                  onChange={(e) => {
+                    const raw = Number(e.target.value);
+                    if (!Number.isFinite(raw)) return;
+                    const capped = Math.max(
+                      1,
+                      Math.min(
+                        Math.floor(raw),
+                        Number.isFinite(max) ? max : raw
+                      )
+                    );
+                    onQuantityChange(item.id, capped);
+                  }}
+                  className="h-8 w-16 rounded-md border border-gray-300 px-2 text-center text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  aria-label={`Quantity for ${item.title}`}
+                />
+                <span className="text-xs text-gray-400">/ {max}</span>
+              </div>
+              {initialInThisKit > 0 && initialInThisKit !== currentValue ? (
+                <span className="text-xs text-warning-700">
+                  was {initialInThisKit}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </Td>
 
       {/* Kit */}
       <Td className={allowCursor}>
-        {item.kit?.name ? (
-          <div className="flex w-max items-center justify-center rounded-full bg-gray-100 px-2 py-1 text-center text-xs font-medium">
-            {item.kit.name}
-          </div>
-        ) : null}
+        {(() => {
+          const kitName = item.assetKits?.[0]?.kit?.name;
+          if (!kitName) return null;
+          return (
+            <div className="flex w-max items-center justify-center rounded-full bg-gray-100 px-2 py-1 text-center text-xs font-medium">
+              {kitName}
+            </div>
+          );
+        })()}
       </Td>
 
       {/* Category */}

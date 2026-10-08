@@ -49,8 +49,11 @@ export default function UpcomingBookings() {
             {upcomingBookings.map((booking: BookingItem) => {
               const custodian = getBookingCustodianName(booking);
               const assetCount =
-                (booking as BookingItem & { _count?: { assets?: number } })
-                  ._count?.assets ?? 0;
+                (
+                  booking as BookingItem & {
+                    _count?: { bookingAssets?: number };
+                  }
+                )._count?.bookingAssets ?? 0;
 
               return (
                 <ClickableTr key={booking.id} to={`/bookings/${booking.id}`}>
@@ -79,15 +82,8 @@ export default function UpcomingBookings() {
                               {" · "}
                             </>
                           )}
-                          <DateS
-                            date={booking.from}
-                            options={{ month: "short", day: "numeric" }}
-                          />{" "}
-                          →{" "}
-                          <DateS
-                            date={booking.to}
-                            options={{ month: "short", day: "numeric" }}
-                          />
+                          <DateS date={booking.from} /> →{" "}
+                          <DateS date={booking.to} />
                         </span>
                       </div>
                     </div>

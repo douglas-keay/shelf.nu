@@ -9,9 +9,9 @@ import {
 import {
   BOOKING_EMAIL_ASSETS_DISPLAY_LIMIT,
   type ReservationEmailAsset,
+  type ReservationEmailModelRequest,
 } from "~/modules/booking/constants";
-import type { ClientHint } from "~/utils/client-hints";
-import { getDateTimeFormatFromHints } from "~/utils/client-hints";
+import { formatDate, type ResolvedFormatPrefs } from "~/utils/date-format";
 import { SERVER_URL } from "~/utils/env";
 import { resolveUserDisplayName } from "~/utils/user";
 import { CustomEmailFooter } from "./components/custom-footer";
@@ -28,13 +28,20 @@ interface Props {
   heading: string;
   booking: BookingForEmail;
   assetCount: number;
-  hints: ClientHint;
+  /** Resolved formatting prefs — the recipient's, for recipient-specific dates. */
+  prefs: ResolvedFormatPrefs;
   hideViewButton?: boolean;
   isAdminEmail?: boolean;
   cancellationReason?: string;
   changes?: string[];
   /** Only provided for reservation emails */
   assets?: ReservationEmailAsset[];
+  /**
+   * Outstanding model-level reservations (Phase 3d — Book-by-Model).
+   * Only provided for reservation emails. When absent or empty, the
+   * "Requested models" section is not rendered.
+   */
+  modelRequests?: ReservationEmailModelRequest[];
   /**
    * The reason why this recipient is receiving the notification
    * (e.g., "custodian", "creator", "admin"). When provided, the email
@@ -55,24 +62,30 @@ interface Props {
 export function BookingUpdatesEmailTemplate({
   booking,
   heading,
-  hints,
+  prefs,
   assetCount,
   hideViewButton = false,
   isAdminEmail = false,
   cancellationReason,
   changes,
   assets,
+  modelRequests,
   recipientReason,
   recipientEmail,
 }: Props) {
-  const fromDate = getDateTimeFormatFromHints(hints, {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(booking.from as Date);
-  const toDate = getDateTimeFormatFromHints(hints, {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(booking.to as Date);
+  // Phase 3d (Book-by-Model): only surface outstanding model-level
+  // reservations. Fulfilled rows carry a `fulfilledAt` timestamp and
+  // represent historical fulfilment — they shouldn't appear in a
+  // reservation notification email.
+  const outstandingModelRequests = (modelRequests ?? []).filter(
+    (req) => req.fulfilledAt === null
+  );
+  const fromDate = formatDate(booking.from as Date, prefs, {
+    includeTime: true,
+  });
+  const toDate = formatDate(booking.to as Date, prefs, {
+    includeTime: true,
+  });
   return (
     <Html>
       <Head>
@@ -145,9 +158,9 @@ export function BookingUpdatesEmailTemplate({
             </p>
             {assets
               .slice(0, BOOKING_EMAIL_ASSETS_DISPLAY_LIMIT)
-              .map((asset) => (
+              .map((bookingAsset) => (
                 <div
-                  key={asset.id}
+                  key={bookingAsset.id}
                   style={{
                     padding: "6px 0",
                     borderBottom: "1px solid #EAECF0",
@@ -161,9 +174,10 @@ export function BookingUpdatesEmailTemplate({
                       fontWeight: "500",
                     }}
                   >
-                    {asset.title}
+                    {bookingAsset.asset.title}
+                    {bookingAsset.quantity > 1 && ` × ${bookingAsset.quantity}`}
                   </span>
-                  {asset.category?.name && (
+                  {bookingAsset.asset.category?.name && (
                     <span
                       style={{
                         ...styles.p,
@@ -172,7 +186,7 @@ export function BookingUpdatesEmailTemplate({
                         fontSize: "13px",
                       }}
                     >
-                      · {asset.category.name}
+                      · {bookingAsset.asset.category.name}
                     </span>
                   )}
                 </div>
@@ -195,6 +209,52 @@ export function BookingUpdatesEmailTemplate({
                 </a>
               </p>
             )}
+          </div>
+        )}
+
+        {/*
+         * Phase 3d (Book-by-Model): outstanding model-level reservations
+         * that have yet to be fulfilled by scanning a concrete asset.
+         * Rendered as a sibling block after "Booked items" using the
+         * shared list style so the two sections read as a pair.
+         */}
+        {outstandingModelRequests.length > 0 && (
+          <div
+            style={{
+              textAlign: "left",
+              margin: "24px 32px",
+              backgroundColor: "#F9FAFB",
+              borderRadius: "8px",
+              border: "1px solid #EAECF0",
+              padding: "16px 20px",
+            }}
+          >
+            <p
+              style={{
+                ...styles.p,
+                fontWeight: "600",
+                color: "#101828",
+                marginBottom: "12px",
+              }}
+            >
+              Requested models:
+            </p>
+            <ul style={{ margin: "0", paddingLeft: "20px" }}>
+              {outstandingModelRequests.map((req) => (
+                <li
+                  key={req.id}
+                  style={{
+                    ...styles.li,
+                    marginBottom: "4px",
+                  }}
+                >
+                  <span style={{ fontWeight: 500, color: "#101828" }}>
+                    {req.quantity - req.fulfilledQuantity} ×
+                  </span>{" "}
+                  {req.assetModel.name}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 
@@ -306,12 +366,13 @@ export const bookingUpdatesTemplateString = ({
   booking,
   heading,
   assetCount,
-  hints,
+  prefs,
   hideViewButton = false,
   isAdminEmail = false,
   cancellationReason,
   changes,
   assets,
+  modelRequests,
   recipientReason,
   recipientEmail,
 }: Props) =>
@@ -320,12 +381,13 @@ export const bookingUpdatesTemplateString = ({
       booking={booking}
       heading={heading}
       assetCount={assetCount}
-      hints={hints}
+      prefs={prefs}
       hideViewButton={hideViewButton}
       isAdminEmail={isAdminEmail}
       cancellationReason={cancellationReason}
       changes={changes}
       assets={assets}
+      modelRequests={modelRequests}
       recipientReason={recipientReason}
       recipientEmail={recipientEmail}
     />
